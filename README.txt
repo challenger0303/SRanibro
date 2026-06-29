@@ -91,8 +91,10 @@ QUICK START
    (Optional: SRanibro can also send VRChat OSC directly -- set [output]
    osc = true in sranibro.toml. Use one output path or the other, not both.)
 
-Your avatar must expose VRCFaceTracking-compatible eye parameters, or a working
-pipeline won't move anything.
+Your avatar needs VRCFaceTracking eye parameters. SRanibro drives: eye gaze
+(EyeLeftX/Y, EyeRightX/Y, and combined EyeX/EyeY), eyelid openness
+(EyeLidLeft/Right), widen (EyeWideLeft/Right), squint (EyeSquintLeft/Right), and
+pupil dilation (PupilDilation).
 
 Eye mapping (Settings -> Eye mapping) is per-device and remembered
 automatically. Fix it by symptom:
