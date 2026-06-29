@@ -2,7 +2,7 @@ SRanibro  (v0.1.0-beta)
 =======================
 
 VR eye-tracking -> VRCFaceTracking bridge for Tobii-based eye-tracking VR
-headsets: Pimax Crystal / Crystal Super and StarVR One.
+headsets: Pimax Crystal / Crystal Super, StarVR One and Varjo.
 
 SRanibro reads your headset's eye cameras, runs eyelid + gaze inference
 locally, and serves the result over the BrokenEye protocol so VRCFaceTracking
