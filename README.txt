@@ -24,7 +24,7 @@ DOWNLOAD
 --------
 
 Grab the latest SRanibro.exe from the Releases page:
-  https://github.com/challenger0303/sranibro/releases
+  https://github.com/challenger0303/SRanibro/releases
 
 Each release lists a SHA-256 checksum -- verify your download against it. Only
 download from the link above, and don't disable Windows security to run it (the
