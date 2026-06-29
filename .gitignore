@@ -1,0 +1,2 @@
+# Binaries ship via GitHub Releases, not the repo tree.
+*.exe
