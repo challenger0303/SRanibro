@@ -1,4 +1,4 @@
-SRanibro  (v0.1.0-beta)
+SRanibro  (v0.1.1-beta)
 =======================
 
 VR eye-tracking -> VRCFaceTracking bridge for Tobii-based eye-tracking VR
@@ -73,9 +73,11 @@ QUICK START
 2. Settings -> Assets:
      - SRanipal folder       Browse to your SRanipal install directory.
      - Tobii DLL (required)  Browse to your Tobii stream-engine DLL.
-     - Device                pimax_vr4 (Pimax over WinUSB),
+     - Device                auto (default; auto-detects a connected Pimax
+                             eye-chip), pimax_vr4 (Pimax over WinUSB),
                              pimax_dll (Pimax via the Tobii stream engine),
-                             or starvr (StarVR One).
+                             or starvr (StarVR One). StarVR One users: pick
+                             "starvr" explicitly -- auto covers Pimax only.
      - Apply & reload (no app restart).
 
 3. On connect, SRanibro stops the Tobii runtime service to open the eye-camera
@@ -124,6 +126,27 @@ TROUBLESHOOTING
 The bottom log panel shows a live fault summary (what's broken + the fix) and
 the recent event history. Logs can contain local paths and your Windows
 username -- review them before sharing.
+
+
+UPDATE HISTORY
+--------------
+
+v0.1.1-beta
+  - New Console tab -- a live view of SRanibro's own log output, so you can watch
+    what the app is doing (device handoff, connection, ML) without opening the log
+    file.
+  - Device selection now defaults to "auto," which picks the right path for a
+    connected Pimax eye-chip. (StarVR One users: still select "starvr" -- see
+    Quick Start.)
+  - Smoother dashboard: fixed the stutter when dragging the window; the UI now
+    repaints more responsively.
+  - Assorted reliability and device-handling improvements under the hood.
+
+v0.1.0-beta
+  - First public beta. Local eyelid + gaze inference for Pimax Crystal / Crystal
+    Super and StarVR One, served over the BrokenEye protocol to VRCFaceTracking.
+    Portable single-exe; the asset paths (SRanipal weights, Tobii DLL) are yours
+    to supply and are editable live in Settings.
 
 
 LICENSE
