@@ -1,4 +1,4 @@
-SRanibro  (v0.1.1-beta)
+SRanibro  (v0.1.2-beta)
 =======================
 
 VR eye-tracking -> VRCFaceTracking bridge for Tobii-based eye-tracking VR
@@ -104,7 +104,10 @@ automatically. Fix it by symptom:
      - Left / right eyes look swapped        -> tick "Swap left / right"
      - The eye image is mirrored             -> tick "Flip image horizontally"
 
-Eye openness / wide / squeeze response is tuned in the Calibration tab.
+Eye openness / wide / squeeze response is tuned in the Calibration tab. The gear at
+the top-left of the eye cameras opens ML-input tools: crop / rotate / stretch the
+image the model sees, a reflection filter, an optional Brightness match, and a
+response heatmap that shows how the model reacts to each part of the eye image.
 
 
 TROUBLESHOOTING
@@ -130,6 +133,22 @@ username -- review them before sharing.
 
 UPDATE HISTORY
 --------------
+
+v0.1.2-beta
+  - Steadier openness: fixed a case where an eye could read stuck part-open at rest
+    (common on a noisier / dimmer eye camera).
+  - Reflection filter (on by default): removes the bright IR / glasses reflection
+    dots that were destabilizing the openness reading. Glasses wearers -- this is the
+    big one.
+  - A squinting / winking eye now follows your open eye instead of freezing where it
+    was.
+  - New ML-input tools on a gear at the top-left of the eye cameras: crop / rotate /
+    stretch the model input, an experimental Brightness match (opt-in, still being
+    tuned), and a response heatmap that shows how the model reacts to each region of
+    the eye image (a diagnostic).
+  - Optional wide / squeeze link (padlock in the ML parameters) so they don't both
+    fire at once.
+  - Assorted reliability fixes.
 
 v0.1.1-beta
   - New Console tab -- a live view of SRanibro's own log output, so you can watch
