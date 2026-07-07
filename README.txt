@@ -1,4 +1,4 @@
-SRanibro  (v0.1.2-beta)
+SRanibro  (v0.1.3-beta)
 =======================
 
 VR eye-tracking -> VRCFaceTracking bridge for Tobii-based eye-tracking VR
@@ -133,6 +133,26 @@ username -- review them before sharing.
 
 UPDATE HISTORY
 --------------
+
+v0.1.3-beta
+  - Calibration overhaul: expressions (long squints, held wide eyes) can no longer
+    corrupt the auto-calibration, anything that does drift self-recovers within
+    seconds, and Recenter now reliably fixes everything instantly. This also fixes
+    setups whose camera levels sit lower than usual (one eye could stop calibrating
+    entirely).
+  - Slow-blink calibration now STICKS: two or three deliberate slow blinks teach each
+    eye's true closed point and also equalize the left / right response while slowly
+    closing the eyes. Remembered across restarts.
+  - Fast-blink detection rebuilt: sensitivity is now per-eye (a weaker eye camera no
+    longer misses quick blinks), blinks no longer leave one eye half-open, and the
+    lids no longer "bounce" back open right after closing -- held winks stay fully
+    shut.
+  - Per-eye image settings: the gear's crop / rotate / stretch can target both /
+    left / right, with the sliders syncing to whichever eye is selected.
+  - NET view: a toggle on the eye-cameras card shows the exact image the model sees
+    (all filters applied, correct orientation).
+  - Diagnostic recorder: a REC button (Calibration tab) captures a CSV of raw +
+    processed tracking values -- attach it when reporting tracking issues.
 
 v0.1.2-beta
   - Steadier openness: fixed a case where an eye could read stuck part-open at rest
