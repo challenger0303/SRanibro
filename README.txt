@@ -151,6 +151,10 @@ v0.1.3-beta
     left / right, with the sliders syncing to whichever eye is selected.
   - NET view: a toggle on the eye-cameras card shows the exact image the model sees
     (all filters applied, correct orientation).
+  - Blink recovery slider (Tuning): sets a minimum reopen time after a blink so
+    the receiving avatar's animation has time to render it (0 = instant, as
+    before).
+  - Gaze-yoke fix: gaze no longer trembles with the yoke enabled.
   - Diagnostic recorder: a REC button (Calibration tab) captures a CSV of raw +
     processed tracking values -- attach it when reporting tracking issues.
 
