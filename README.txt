@@ -10,8 +10,11 @@ can drive your avatar's eyes -- openness, wide, squeeze, and gaze.
 
   BETA. Expect rough edges. Eyebrow tracking is not in this beta.
 
-This repository is documentation only. SRanibro is a closed-source, binary-only
-beta -- the app is on the Releases page; the source is not published.
+The SRanibro APP is a closed-source, binary-only beta -- it's on the Releases
+page. Its CORE is open, though: the HMD-agnostic eye-tracking post-processor
+(openness / wide / squeeze / gaze calibration + smoothing) and the ML front-end
+are MIT-licensed in the sranibro-core/ folder here. The device-access layer
+(camera capture, connection handling) stays in the app.
 
 SRanibro includes no third-party assets. The eye-model weights (from a SRanipal
 install) and the Tobii stream-engine DLL are NOT bundled and NOT distributed
@@ -195,9 +198,12 @@ v0.1.0-beta
 LICENSE
 -------
 
-Closed-source, binary-only beta. (c) 2026. No license is granted yet beyond
-running this beta as provided; redistribution is not permitted -- link to the
-Releases page instead. (Full terms to follow.)
+The APP is a closed-source, binary-only beta. (c) 2026. No license is granted
+beyond running this beta as provided; don't redistribute the exe -- link to the
+Releases page instead. (Full app terms to follow.)
+
+The sranibro-core/ SOURCE folder is separate and MIT-licensed -- see
+sranibro-core/LICENSE. Use, modify, and redistribute that under the MIT terms.
 
 SRanibro is an independent project, not affiliated with or endorsed by Tobii,
 HTC, Pimax, StarVR, Varjo, VRChat, or VRCFaceTracking. All trademarks belong to

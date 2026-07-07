@@ -1,0 +1,15 @@
+[package]
+name = "sranibro-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+readme = "README.txt"
+description = "HMD-agnostic VR eye-tracking post-processor (openness / wide / squeeze / gaze) and eyelid-model front-end from SRanibro."
+repository = "https://github.com/challenger0303/SRanibro"
+keywords = ["vr", "eye-tracking", "vrchat", "openxr"]
+categories = ["algorithms"]
+
+[dependencies]
+matrixmultiply = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
