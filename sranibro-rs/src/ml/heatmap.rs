@@ -10,6 +10,7 @@
 //! passes per eye (~1s), run once on demand — not a live per-frame overlay.
 
 use super::eye_net::EyeNet;
+use super::eyelid_model::{CanonicalStereoInput, EyelidModel};
 use super::preprocess::DST;
 
 /// Which perturbation the heatmap applies to each patch.
@@ -64,16 +65,15 @@ fn positions() -> Vec<usize> {
 /// the openness output to read (1 for L, 2 for R). The OTHER channel is left at its real
 /// value throughout (the net is dual-eye — perturbing it would move openness for reasons
 /// unrelated to the patch). Returns a `DST*DST` signed delta map.
-pub fn occlusion_map(
-    net: &mut EyeNet,
+fn occlusion_map_with(
     input: &[f32],
     eye_ch: usize,
-    out_idx: usize,
     mode: HeatMode,
-) -> Vec<f32> {
+    mut infer_openness: impl FnMut(&[f32]) -> Option<f32>,
+) -> Option<Vec<f32>> {
     let n = DST;
     let off = eye_ch * n * n;
-    let base = net.forward_one(input)[out_idx];
+    let base = infer_openness(input)?;
     let fill = match mode {
         HeatMode::OcclusionMean => {
             let sum: f32 = input[off..off + n * n].iter().sum();
@@ -95,7 +95,7 @@ pub fn occlusion_map(
                     work[idx] = fill;
                 }
             }
-            let o = net.forward_one(&work)[out_idx];
+            let o = infer_openness(&work)?;
             // OcclusionMean: base - o  (positive = erasing here LOWERED openness = relied on it).
             // GlintInject:   o - base  (signed shift a fake glint here induces in openness).
             let delta = match mode {
@@ -117,12 +117,27 @@ pub fn occlusion_map(
             heat[k] /= cover[k];
         }
     }
-    heat
+    Some(heat)
 }
 
-/// Compute both eyes' heatmaps for `mode` over the live `input` (2x100x100), and copy the
-/// grayscale model input per eye for the UI overlay base.
-pub fn compute(net: &mut EyeNet, input: &[f32], mode: HeatMode) -> HeatResult {
+pub fn occlusion_map(
+    net: &mut EyeNet,
+    input: &[f32],
+    eye_ch: usize,
+    out_idx: usize,
+    mode: HeatMode,
+) -> Vec<f32> {
+    occlusion_map_with(input, eye_ch, mode, |sample| {
+        Some(net.forward_one(sample)[out_idx])
+    })
+    .expect("the legacy EyeNet always provides openness")
+}
+
+fn compute_with(
+    input: &[f32],
+    mode: HeatMode,
+    mut infer_openness: impl FnMut(&[f32], usize) -> Option<f32>,
+) -> Option<HeatResult> {
     let n = DST;
     let gray = |ch: usize| -> Vec<u8> {
         input[ch * n * n..(ch + 1) * n * n]
@@ -130,18 +145,67 @@ pub fn compute(net: &mut EyeNet, input: &[f32], mode: HeatMode) -> HeatResult {
             .map(|&v| (v * 255.0).clamp(0.0, 255.0) as u8)
             .collect()
     };
-    let dl = occlusion_map(net, input, 0, 1, mode); // left eye:  input ch0 -> out[1]
-    let dr = occlusion_map(net, input, 1, 2, mode); // right eye: input ch1 -> out[2]
-    HeatResult {
+    let dl = occlusion_map_with(input, 0, mode, |sample| infer_openness(sample, 0))?;
+    let dr = occlusion_map_with(input, 1, mode, |sample| infer_openness(sample, 1))?;
+    Some(HeatResult {
         delta: [dl, dr],
         base: [gray(0), gray(1)],
         mode,
-    }
+    })
+}
+
+/// Compute both eyes' heatmaps for `mode` over the live `input` (2x100x100), and copy the
+/// grayscale model input per eye for the UI overlay base.
+pub fn compute(net: &mut EyeNet, input: &[f32], mode: HeatMode) -> HeatResult {
+    compute_with(input, mode, |sample, eye| {
+        // left eye: input ch0 -> out[1]; right eye: input ch1 -> out[2]
+        Some(net.forward_one(sample)[eye + 1])
+    })
+    .expect("the legacy EyeNet always provides openness")
+}
+
+fn model_openness(model: &mut dyn EyelidModel, input: &[f32], eye: usize) -> Option<f32> {
+    let input = CanonicalStereoInput::try_from(input).ok()?;
+    model.infer(input).ok()?.openness[eye]
+}
+
+/// Contract-backed heatmap used by the live runtime. The public legacy API above remains
+/// unchanged; both routes share the exact perturbation loop and arithmetic order.
+pub(crate) fn compute_model(
+    model: &mut dyn EyelidModel,
+    input: &[f32],
+    mode: HeatMode,
+) -> Option<HeatResult> {
+    compute_with(input, mode, |sample, eye| {
+        model_openness(model, sample, eye)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ml::eyelid_model::{ModelError, RawEyelidPrediction, EYELID_INPUT_LEN};
+
+    struct MeanModel;
+
+    fn mean_for_eye(input: &[f32], eye: usize) -> f32 {
+        let start = eye * DST * DST;
+        input[start..start + DST * DST].iter().sum::<f32>() / (DST * DST) as f32
+    }
+
+    impl EyelidModel for MeanModel {
+        fn infer(
+            &mut self,
+            input: CanonicalStereoInput<'_>,
+        ) -> Result<RawEyelidPrediction, ModelError> {
+            let input = input.as_slice();
+            Ok(RawEyelidPrediction {
+                presence: Some(1.0),
+                openness: [Some(mean_for_eye(input, 0)), Some(mean_for_eye(input, 1))],
+                squeeze: [None; 2],
+            })
+        }
+    }
 
     #[test]
     fn positions_cover_the_grid() {
@@ -164,5 +228,21 @@ mod tests {
         assert_eq!(HeatMode::from_u8(0), HeatMode::OcclusionMean);
         assert_eq!(HeatMode::from_u8(1), HeatMode::GlintInject);
         assert_eq!(HeatMode::from_u8(200), HeatMode::OcclusionMean);
+    }
+
+    #[test]
+    fn trait_heatmap_matches_the_same_direct_inference_seam() {
+        let mut input = vec![0.0f32; EYELID_INPUT_LEN];
+        for (index, value) in input.iter_mut().enumerate() {
+            *value = (index % 251) as f32 / 250.0;
+        }
+        for mode in [HeatMode::OcclusionMean, HeatMode::GlintInject] {
+            let direct =
+                compute_with(&input, mode, |sample, eye| Some(mean_for_eye(sample, eye))).unwrap();
+            let contract = compute_model(&mut MeanModel, &input, mode).unwrap();
+            assert_eq!(contract.delta, direct.delta);
+            assert_eq!(contract.base, direct.base);
+            assert_eq!(contract.mode, direct.mode);
+        }
     }
 }

@@ -24,3 +24,6 @@ pub mod theme;
 pub mod ui;
 pub mod wide_calib;
 pub mod wide_fitrun;
+
+#[cfg(test)]
+pub(crate) mod test_alloc;

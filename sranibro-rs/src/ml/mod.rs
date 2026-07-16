@@ -4,6 +4,7 @@ pub mod brow_calfit;
 pub mod brow_fit;
 pub mod brow_net;
 pub mod eye_net;
+pub(crate) mod eyelid_model;
 pub mod heatmap;
 pub mod preprocess;
 pub mod tvm_params;

@@ -13,9 +13,9 @@
 //!   output [5]: index 1 = openness (the value we use)
 //!
 //! Weights come from the user's SRanipal directory (tvm_params::parse). Convs run
-//! as im2col + GEMM (matrixmultiply, pure-Rust runtime-AVX). All intermediate
+//! as im2col + GEMM (matrixmultiply, pure-Rust runtime-AVX). Our intermediate
 //! buffers are preallocated and reused (ping-pong between two activation buffers),
-//! so steady-state inference does zero heap allocation — the point is low load.
+//! while the matrixmultiply backend may still allocate its internal packing buffers.
 
 use std::collections::HashMap;
 

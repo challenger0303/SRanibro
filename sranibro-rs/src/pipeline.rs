@@ -25,6 +25,9 @@ use crate::core::wide_state::WideState;
 use crate::device::HmdAdapter;
 use crate::ml::brow_net::BrowNet;
 use crate::ml::eye_net::EyeNet;
+use crate::ml::eyelid_model::{
+    CanonicalStereoInput, EyelidModel, LegacyEyelidModel, EYELID_INPUT_LEN,
+};
 use crate::ml::preprocess;
 use crate::ml::wide_net::WideNet;
 use crate::output::OutputSink;
@@ -44,9 +47,9 @@ pub struct Telemetry {
     /// therefore freshness-based instead of being cleared by one transient packet.
     gaze_last_valid: Mutex<[Option<Instant>; 2]>,
     pub ml_raw: Mutex<[f32; 2]>,
-    /// Full per-eye model output (all 5 channels) [L, R]. Channel roles (RE'd from
-    /// SRanipal EyePredictionModule.dll, 2026-06-26): ch0=presence/confidence gate,
-    /// ch1=openness (== `ml_raw`), ch2=closed/lower-openness ref, ch3/ch4=aux/blink.
+    /// Legacy per-eye post-processor input layout reconstructed from the stereo
+    /// EyeNet output. Only presence, openness, and squeeze are populated in Phase 1;
+    /// structural channels 2 and 4 remain zero exactly as in the previous path.
     pub ml5: Mutex<[[f32; 5]; 2]>,
     /// Native pupil diameter (mm, valid) per eye [L, R], from stream 1285 when available.
     pub pupil: Mutex<[(f32, bool); 2]>,
@@ -627,6 +630,7 @@ impl Pipeline {
         let bright_affine = Arc::new(Mutex::new([[1.0f32, 0.0]; 2]));
         let heatmap = Arc::new(HeatState::new());
         let ml_loaded = net.is_some();
+        let net = net.map(|net| Box::new(LegacyEyelidModel::new(net)) as Box<dyn EyelidModel>);
         let brow_loaded = brow.is_some();
         let wide_loaded = wide.is_some();
         // Brow lives behind a shared handle so a freshly trained model can be hot-swapped
@@ -731,6 +735,7 @@ impl Pipeline {
                 // Previous frame's raw model openness (s[1]/s[2]) — gates the brightness target
                 // capture to genuinely relaxed-OPEN frames.
                 let mut prev_open = [0.5f32; 2];
+                let mut model_error_reported = false;
                 while !ms.load(Ordering::Relaxed) {
                     let (l, r) = {
                         let f = t_ml.frames.lock().unwrap();
@@ -799,19 +804,35 @@ impl Pipeline {
                                         mi[e] = Some(px);
                                     }
                                 }
-                                let s = net.forward_one(&input);
-                                // Feed this frame's raw openness to next frame's brightness gate.
-                                prev_open = [s[1], s[2]];
-                                if let Ok(mut o) = t_ml.ml_raw.lock() {
-                                    *o = [s[1], s[2]];
+                                // Preprocessing is defined to produce exactly CHW [2, 100, 100].
+                                // The old EyeNet path also relied on this invariant and would fail
+                                // rather than silently retaining a stale sample if it were broken.
+                                debug_assert_eq!(input.len(), EYELID_INPUT_LEN);
+                                let canonical = CanonicalStereoInput::try_from(input.as_slice())
+                                    .expect("eyelid preprocessing must produce CHW [2, 100, 100]");
+                                let publish = match net.infer(canonical) {
+                                    Ok(prediction) => prediction.require_legacy_frame().ok(),
+                                    Err(_) => None,
+                                };
+                                if let Some(frame) = publish {
+                                    // Preserve the raw-openness feedback loop byte-for-byte:
+                                    // this gates next frame's brightness baseline capture.
+                                    prev_open = frame.ml_raw;
+                                    if let Ok(mut o) = t_ml.ml_raw.lock() {
+                                        *o = frame.ml_raw;
+                                    }
+                                    if let Ok(mut o5) = t_ml.ml5.lock() {
+                                        *o5 = frame.ml5;
+                                    }
+                                    t_ml.c_ml.fetch_add(1, Ordering::Relaxed);
+                                } else if !model_error_reported {
+                                    // Unreachable for the only Phase 1 backend. Do not invent
+                                    // zeroes for a missing capability or failed inference.
+                                    eprintln!(
+                                        "[ml] eyelid backend did not provide the required legacy frame; retaining the previous eyelid sample"
+                                    );
+                                    model_error_reported = true;
                                 }
-                                if let Ok(mut o5) = t_ml.ml5.lock() {
-                                    *o5 = [
-                                        [s[0], s[1], 0.0, s[3], 0.0],
-                                        [s[0], s[2], 0.0, s[4], 0.0],
-                                    ];
-                                }
-                                t_ml.c_ml.fetch_add(1, Ordering::Relaxed);
                                 // On-demand occlusion heatmap: reuse this frame's input +
                                 // net. Blocks the ML loop ~2s (openness freezes) — a manual
                                 // one-shot diagnostic, so that's acceptable.
@@ -820,8 +841,12 @@ impl Pipeline {
                                     let mode = crate::ml::heatmap::HeatMode::from_u8(
                                         hm.mode.load(Ordering::Relaxed),
                                     );
-                                    let res = crate::ml::heatmap::compute(net, &input, mode);
-                                    if let Ok(mut r) = hm.result.lock() {
+                                    let res = crate::ml::heatmap::compute_model(
+                                        net.as_mut(),
+                                        &input,
+                                        mode,
+                                    );
+                                    if let (Some(res), Ok(mut r)) = (res, hm.result.lock()) {
                                         *r = Some(res);
                                     }
                                     hm.computing.store(false, Ordering::Relaxed);
