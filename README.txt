@@ -1,6 +1,19 @@
 SRanibro  (v0.1.3-beta)
 =======================
 
+RESEARCH SOURCE SNAPSHOT
+------------------------
+
+This branch publishes the Rust application source immediately before the Phase 1
+eyelid-model contract refactor. The full application lives under sranibro-rs/
+for research review and reproducibility. It is source-only: no executable,
+model weights, Tobii/SRanipal DLLs, recordings, logs, user configuration, or
+private development history are included.
+
+sranibro-core/ remains available under its MIT license. sranibro-rs/ is covered
+by its separate SOURCE-LICENSE.md research-reference notice. That notice does
+not alter the licenses of third-party dependencies.
+
 VR eye-tracking -> VRCFaceTracking bridge for Tobii-based eye-tracking VR
 headsets: Pimax Crystal / Crystal Super, StarVR One and Varjo.
 
@@ -10,11 +23,10 @@ can drive your avatar's eyes -- openness, wide, squeeze, and gaze.
 
   BETA. Expect rough edges. Eyebrow tracking is not in this beta.
 
-The SRanibro APP is a closed-source, binary-only beta -- it's on the Releases
-page. Its CORE is open, though: the HMD-agnostic eye-tracking post-processor
-(openness / wide / squeeze / gaze calibration + smoothing) and the ML front-end
-are MIT-licensed in the sranibro-core/ folder here. The device-access layer
-(camera capture, connection handling) stays in the app.
+On the public main branch, the SRanibro APP is distributed as a binary beta and
+the MIT-licensed CORE lives in sranibro-core/. This research branch additionally
+contains a source snapshot of the full Rust application, including its device
+access, camera capture, connection handling, UI, and model pipeline.
 
 SRanibro includes no third-party assets. The eye-model weights (from a SRanipal
 install) and the Tobii stream-engine DLL are NOT bundled and NOT distributed

@@ -1,0 +1,12 @@
+/target
+# Generated at first run; contains user-specific asset paths.
+/sranibro.toml
+# Secondary cargo target dir + session debug dumps.
+/target_check
+/vr4_out*.txt
+/vr4_err*.txt
+/ui_out.txt
+/ui_err.txt
+/_*.txt
+/mlcheck*.txt
+/extracol.txt

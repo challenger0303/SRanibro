@@ -1,0 +1,69 @@
+[package]
+name = "sranibro-rs"
+version = "0.1.4-beta"
+edition = "2021"
+description = "SRanibro — all-Rust, distribution-safe eye/face tracker (rewrite)"
+
+# matrixmultiply: pure-Rust BLIS-style sgemm with runtime AVX/FMA detection.
+# No C/system deps -> distribution-safe, and turns the conv hot path from a
+# naive 2.6 GMAC/s loop into a vectorized GEMM. (egui/openvr come in later keystones.)
+[dependencies]
+matrixmultiply = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# EyeChip auth handshake (HMAC-MD5). Pure-Rust, tiny, runs once at startup.
+hmac = "0.12"
+md-5 = "0.10"
+# Pure-Rust JPEG decoder for the Varjo path: we consume the "Varjo Eye Streamer"
+# tool's MJPEG-over-HTTP eye-camera feed (no Varjo SDK FFI needed).
+jpeg-decoder = "0.3"
+# Pure-Rust PNG encoder/decoder — used by the eyebrow-calibration capture tab to write
+# RAW grayscale eye frames as training data (no opencv / image crate; distribution-safe).
+png = "0.17"
+# In-process egui dashboard (Fluent-dark). Reads pipeline telemetry directly.
+# wgpu backend (DX12->DX11->Vulkan->GL fallback) — far more robust than glow/OpenGL on
+# other Windows machines (VMs, RDP, weak/generic GPU drivers) where OpenGL 3 is missing.
+eframe = { version = "0.29", features = ["wgpu"] }
+# Native file/folder picker for the Settings asset paths (point at the user's
+# SRanipal weights / patched DLLs). Windows-native dialog; distribution-safe.
+rfd = "0.15"
+
+# WinUSB direct transport to the EyeChip — no libusb, no patched DLL. Windows-only.
+[target.'cfg(windows)'.dependencies]
+# Force the DX12 backend into wgpu (feature-unifies with eframe's wgpu). Without this
+# wgpu on Windows would only get Vulkan/GL — no better than glow. DX12 is present on
+# every Windows 10/11 machine, so this is the actual portability win.
+wgpu = { version = "22", features = ["dx12"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Usb",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+] }
+
+# Embeds the app icon resource into the exe (build-time, MSVC rc.exe). Host-gated so a
+# non-Windows host build doesn't pull it in. Best-effort — see build.rs.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# opt-level 3 (not "z"): the goal is low *runtime* load, not a small binary.
+# Measured: "z" -> 9.0 ms/inference (193 KB), 3 -> 5.95 ms (217 KB). The 24 KB
+# size cost buys 1.5x lower CPU on the ML hot path. lto + 1 codegen unit keep
+# the GEMM kernel inlined; panic=abort + strip trim the rest.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
