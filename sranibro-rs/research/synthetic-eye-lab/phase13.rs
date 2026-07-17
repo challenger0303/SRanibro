@@ -34,6 +34,8 @@ pub const ATLAS_IMPLEMENTATION_SOURCE_SHA256: &str =
     "d3cfd3a4669d30663bcbd4072e2a8584f979e9e5e5b6c789864f424dc1f1bdc8";
 pub const MODEL_SHA256: &str = "bac8013e0423068924f190a1de44afd5e1dd0c7c10d1d394926e46fc1b075ded";
 pub const MODEL_LENGTH: u64 = 51_423_934;
+pub const FROZEN_PLAN_SHA256: &str =
+    "d9312bd9434c25cab044977ffb96c3fea92fbdfa4beb12327f840f1b79552f42";
 
 const ATLAS_VERSION: &str = "synthetic-eye-moment-atlas-v1";
 const RENDERER_VERSION: &str = "synthetic-eye-renderer-100x100-4x-v1";
@@ -444,6 +446,9 @@ struct ParsedAtlas {
 pub fn validate_atlas_and_prepare(atlas_dir: &Path) -> Result<PreparedPlan, String> {
     let first = prepare_once(atlas_dir)?;
     let second = prepare_once(atlas_dir)?;
+    if first.plan_sha256 != FROZEN_PLAN_SHA256 {
+        return Err("Phase 1.3 renderer plan differed from the frozen complete identity".into());
+    }
     if first.plan_json != second.plan_json
         || first.plan_sha256 != second.plan_sha256
         || first.plan != second.plan
@@ -2298,6 +2303,7 @@ mod tests {
         let prepared = validate_atlas_and_prepare(atlas).unwrap();
         assert_eq!(prepared.plan.pair_plans.len(), 30);
         assert_eq!(prepared.plan.excluded_pairs, vec![[36, 40]]);
+        assert_eq!(prepared.plan_sha256, FROZEN_PLAN_SHA256);
         assert_eq!(prepared.decision_cases.len(), 77);
         assert_eq!(prepared.confirmation_cases.len(), 73);
     }

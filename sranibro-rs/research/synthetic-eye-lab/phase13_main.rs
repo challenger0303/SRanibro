@@ -23,8 +23,8 @@ use phase13::{
 use phase13_output::{
     repository_state, require_release_build, validate_atlas_dir, verify_decision_artifact,
     verify_preregistration, verify_runtime_identity, write_stage_artifact, RepositoryState,
-    ValidatedAtlas, VerifiedArtifact, AMENDMENT_COMMIT, BUILD_COMMIT, BUILD_PROFILE,
-    PREREGISTRATION_COMMIT,
+    ValidatedAtlas, VerifiedArtifact, AMENDMENT2_COMMIT, AMENDMENT_COMMIT, BUILD_COMMIT,
+    BUILD_PROFILE, PREREGISTRATION_COMMIT,
 };
 
 const FROZEN_MODEL_BYTES: usize = phase13::MODEL_LENGTH as usize;
@@ -204,6 +204,7 @@ fn validate_prepared_identity(prepared: &PreparedPlan) -> Result<(), Box<dyn Err
         || prepared.plan.renderer_decision != "go"
         || prepared.plan.excluded_pairs != vec![[36, 40]]
         || prepared.plan.preparation_repetitions != 2
+        || prepared.plan_sha256 != phase13::FROZEN_PLAN_SHA256
     {
         return Err("renderer plan identity did not match the frozen protocol".into());
     }
@@ -467,6 +468,7 @@ fn require_compatible_decision(
     require_manifest_string(manifest, "stage", "decision")?;
     require_manifest_string(manifest, "preregistration_commit", PREREGISTRATION_COMMIT)?;
     require_manifest_string(manifest, "amendment_commit", AMENDMENT_COMMIT)?;
+    require_manifest_string(manifest, "amendment2_commit", AMENDMENT2_COMMIT)?;
     require_manifest_string(manifest, "repository_commit", &repository.commit)?;
     require_manifest_string(manifest, "build_repository_commit", BUILD_COMMIT)?;
     require_manifest_string(
@@ -620,6 +622,7 @@ fn require_decision_payload_consistency(artifact: &VerifiedArtifact) -> Result<(
         .and_then(Value::as_str)
         .ok_or("decision analysis_file is missing")?;
     if analysis_file == "renderer_failure.json" {
+        require_exact_decision_files(artifact, &["renderer_failure.json"])?;
         if terminal != "RENDERER_NO_GO"
             || manifest.get("renderer_plan_sha256") != Some(&Value::Null)
             || manifest.get("model_loaded").and_then(Value::as_bool) != Some(false)
@@ -648,6 +651,15 @@ fn require_decision_payload_consistency(artifact: &VerifiedArtifact) -> Result<(
     if analysis_file != "analysis.json" {
         return Err(format!("unknown decision analysis file: {analysis_file}").into());
     }
+    require_exact_decision_files(
+        artifact,
+        &[
+            "analysis.json",
+            "raw_bits.json",
+            "renderer_plan.json",
+            "stage_cases.json",
+        ],
+    )?;
     if manifest.get("case_records_file").and_then(Value::as_str) != Some("stage_cases.json")
         || manifest.get("raw_bits_file").and_then(Value::as_str) != Some("raw_bits.json")
     {
@@ -693,9 +705,7 @@ fn require_decision_payload_consistency(artifact: &VerifiedArtifact) -> Result<(
         .get("renderer_plan_sha256")
         .and_then(Value::as_str)
         .ok_or("decision renderer_plan_sha256 is missing")?;
-    if phase13_plan_sha256(plan_bytes) != recorded_plan_hash {
-        return Err("decision renderer plan hash differs from its bytes".into());
-    }
+    require_frozen_renderer_plan_hash(plan_bytes, recorded_plan_hash)?;
     let plan: RendererPlan = serde_json::from_slice(plan_bytes)?;
     require_frozen_renderer_plan_identity(&plan, manifest)?;
     let cases: Vec<CaseRecord> = serde_json::from_slice(
@@ -713,6 +723,20 @@ fn require_decision_payload_consistency(artifact: &VerifiedArtifact) -> Result<(
         return Err("decision cases differ from manifest or renderer plan".into());
     }
     require_analysis_model_state(manifest, &analysis, &cases)?;
+    Ok(())
+}
+
+fn require_exact_decision_files(
+    artifact: &VerifiedArtifact,
+    expected: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    if artifact.files.len() != expected.len()
+        || expected
+            .iter()
+            .any(|name| !artifact.files.contains_key(*name))
+    {
+        return Err("decision payload file set differs from the frozen contract".into());
+    }
     Ok(())
 }
 
@@ -884,6 +908,18 @@ fn phase13_plan_sha256(bytes: &[u8]) -> String {
     out
 }
 
+fn require_frozen_renderer_plan_hash(
+    plan_bytes: &[u8],
+    recorded_hash: &str,
+) -> Result<(), Box<dyn Error>> {
+    if recorded_hash != phase13::FROZEN_PLAN_SHA256
+        || phase13_plan_sha256(plan_bytes) != phase13::FROZEN_PLAN_SHA256
+    {
+        return Err("decision renderer plan differs from the frozen complete identity".into());
+    }
+    Ok(())
+}
+
 fn require_decision_plan(
     artifact: &VerifiedArtifact,
     prepared: &PreparedPlan,
@@ -940,6 +976,7 @@ fn base_manifest(stage: Stage, repository: &RepositoryState, renderer_plan_sha25
         "stage": stage.as_str(),
         "preregistration_commit": PREREGISTRATION_COMMIT,
         "amendment_commit": AMENDMENT_COMMIT,
+        "amendment2_commit": AMENDMENT2_COMMIT,
         "repository_commit": repository.commit,
         "build_repository_commit": BUILD_COMMIT,
         "implementation_source_sha256": repository.implementation_source_sha256,
@@ -1643,6 +1680,24 @@ mod tests {
     }
 
     #[test]
+    fn decision_payload_file_allowlist_rejects_extra_renderer_plan() {
+        let mut renderer_failure = decision_artifact("RENDERER_NO_GO", Value::Null);
+        renderer_failure
+            .files
+            .insert("renderer_failure.json".into(), Vec::new());
+        assert!(
+            require_exact_decision_files(&renderer_failure, &["renderer_failure.json"],).is_ok()
+        );
+
+        renderer_failure
+            .files
+            .insert("renderer_plan.json".into(), Vec::new());
+        assert!(
+            require_exact_decision_files(&renderer_failure, &["renderer_failure.json"],).is_err()
+        );
+    }
+
+    #[test]
     fn pre_model_artifact_requires_null_model_fields_and_empty_results() {
         let manifest = json!({
             "model_loaded": false,
@@ -1721,13 +1776,24 @@ mod tests {
             manifest.as_object().unwrap(),
         )
         .is_ok());
+        assert!(
+            require_frozen_renderer_plan_hash(&prepared.plan_json, &prepared.plan_sha256,).is_ok()
+        );
 
-        let mut tampered = prepared.plan;
+        let mut tampered = prepared.plan.clone();
         tampered.global_axis = "per_pair_axis".into();
         assert!(
             require_frozen_renderer_plan_identity(&tampered, manifest.as_object().unwrap(),)
                 .is_err()
         );
+
+        let mut nested_tamper = prepared.plan.clone();
+        nested_tamper.pair_plans[0].selected.as_mut().unwrap().cells[0].tensor_sha256 =
+            "0".repeat(64);
+        let nested_bytes = serde_json::to_vec_pretty(&nested_tamper).unwrap();
+        let rewritten_self_hash = phase13_plan_sha256(&nested_bytes);
+        assert_ne!(rewritten_self_hash, phase13::FROZEN_PLAN_SHA256);
+        assert!(require_frozen_renderer_plan_hash(&nested_bytes, &rewritten_self_hash).is_err());
     }
 
     #[test]

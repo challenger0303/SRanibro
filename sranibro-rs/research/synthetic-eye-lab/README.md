@@ -168,12 +168,15 @@ classification is also sealed.
 The frozen decision and confirmation contract is in
 [`PHASE1_3_PREREG.md`](PHASE1_3_PREREG.md), with the pre-inference artifact
 sealing clarification in
-[`PHASE1_3_AMENDMENT1.md`](PHASE1_3_AMENDMENT1.md). Phase 1.3 uses the sealed
-D0 atlas to select two separated whole-image-mean targets for each retained
+[`PHASE1_3_AMENDMENT1.md`](PHASE1_3_AMENDMENT1.md), and the frozen complete
+renderer-plan identity in
+[`PHASE1_3_AMENDMENT2.md`](PHASE1_3_AMENDMENT2.md). Phase 1.3 uses the sealed D0
+atlas to select two separated whole-image-mean targets for each retained
 gap-four aperture pair. At each target, lower- and higher-aperture images are
 matched to the same post-u8 mean and population standard deviation within
 0.001 gray per component. Local moment controllability, canonical bytes,
-geometry fields, and mirroring are gated before model bytes are read.
+geometry fields, mirroring, and the complete domain-separated plan hash are
+gated before model bytes are read.
 
 The global mean axis retains 29 of 30 pairs. Pair 36--40 is a frozen
 renderer-only exclusion because its feasible mean range is below the 7-gray

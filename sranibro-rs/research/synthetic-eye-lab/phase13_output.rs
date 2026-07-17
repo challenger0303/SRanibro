@@ -15,6 +15,7 @@ pub const BUILD_PROFILE: &str = env!("SRANIBRO_BUILD_PROFILE");
 pub const BUILD_COMMIT: &str = env!("SRANIBRO_BUILD_COMMIT");
 pub const PREREGISTRATION_COMMIT: &str = "f7cf3686d8025631a8e83442a69c43858402cd6c";
 pub const AMENDMENT_COMMIT: &str = "d32c7349c6bf7fbfb8398dd804e4158c4a052db5";
+pub const AMENDMENT2_COMMIT: &str = "3fa96e76d7e02f3051644a72da219da3b9b9eba1";
 
 pub const ATLAS_REPOSITORY_COMMIT: &str = "49e13f0eb2b78f84a387de8a46e7309257c9304e";
 pub const ATLAS_PREREGISTRATION_COMMIT: &str = "c92dbb2411c13d2f055ee7c1a67ee2b956d1e1a1";
@@ -43,7 +44,7 @@ const EXPECTED_PAIRS: u64 = 1_683;
 const CANDIDATE_HEADER_LEN: usize = 24;
 const CANDIDATE_RECORD_LEN: usize = 28;
 
-const IMPLEMENTATION_SOURCES: [(&str, &[u8]); 15] = [
+const IMPLEMENTATION_SOURCES: [(&str, &[u8]); 16] = [
     ("Cargo.toml", include_bytes!("../../Cargo.toml")),
     ("Cargo.lock", include_bytes!("../../Cargo.lock")),
     ("build.rs", include_bytes!("../../build.rs")),
@@ -54,6 +55,10 @@ const IMPLEMENTATION_SOURCES: [(&str, &[u8]); 15] = [
     (
         "research/synthetic-eye-lab/PHASE1_3_AMENDMENT1.md",
         include_bytes!("PHASE1_3_AMENDMENT1.md"),
+    ),
+    (
+        "research/synthetic-eye-lab/PHASE1_3_AMENDMENT2.md",
+        include_bytes!("PHASE1_3_AMENDMENT2.md"),
     ),
     (
         "research/synthetic-eye-lab/phase13.rs",
@@ -181,6 +186,7 @@ pub fn verify_preregistration(repo: &Path) -> Result<(), Box<dyn Error>> {
     for (label, commit) in [
         ("preregistration", PREREGISTRATION_COMMIT),
         ("amendment", AMENDMENT_COMMIT),
+        ("amendment 2", AMENDMENT2_COMMIT),
     ] {
         let status = Command::new("git")
             .args(["merge-base", "--is-ancestor", commit, "HEAD"])
@@ -828,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn implementation_fingerprint_has_the_exact_amended_file_order() {
+    fn implementation_fingerprint_has_the_exact_twice_amended_file_order() {
         let names: Vec<_> = IMPLEMENTATION_SOURCES
             .iter()
             .map(|(name, _)| *name)
@@ -841,6 +847,7 @@ mod tests {
                 "build.rs",
                 "research/synthetic-eye-lab/PHASE1_3_PREREG.md",
                 "research/synthetic-eye-lab/PHASE1_3_AMENDMENT1.md",
+                "research/synthetic-eye-lab/PHASE1_3_AMENDMENT2.md",
                 "research/synthetic-eye-lab/phase13.rs",
                 "research/synthetic-eye-lab/phase13_main.rs",
                 "research/synthetic-eye-lab/phase13_output.rs",
