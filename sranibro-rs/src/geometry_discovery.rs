@@ -20,11 +20,18 @@ const MIN_EFFECTIVE_PIXELS: usize = 64;
 // the pupil centre and aperture axis repeated closely across both sessions. Geometry
 // below is expressed in the live, raw 200x200 camera coordinates.
 const APPEARANCE_PUPIL_REFERENCE: [[f64; 2]; 2] = [[71.0, 100.0], [127.0, 99.0]];
-const APPEARANCE_AXIS_REFERENCE_DEG: [f64; 2] = [13.1, -5.1];
+const APPEARANCE_AXIS_REFERENCE_DEG: [f64; 2] = [12.75, -6.05];
 const XR5_PRESET_CENTER_PX: [[f64; 2]; 2] = [[60.0, 100.0], [140.0, 100.0]];
 const XR5_PRESET_ROTATION_DEG: [f64; 2] = [-30.0, 30.0];
 const XR5_PRESET_WIDTH_PX: f64 = 120.0;
 const XR5_PRESET_HEIGHT_PX: f64 = 140.0;
+// The inner LED/lens stack is fixed hardware, not user geometry. Keep it out of
+// appearance and motion evidence before estimating any per-user transform. The mask is
+// deliberately a little stronger than the shipped 40% crop because flare extends past
+// the visibly saturated emitters.
+const XR5_LED_SAFE_LEFT_MAX_X: usize = 108;
+const XR5_LED_SAFE_RIGHT_MIN_X: usize = 91;
+const XR5_MIN_INNER_CROP: f64 = 0.35;
 
 /// Non-reconstructable aggregate blink-motion statistics in the 100x100 EyeNet input.
 ///
@@ -32,10 +39,10 @@ const XR5_PRESET_HEIGHT_PX: f64 = 140.0;
 /// XR5 preset over two development sessions.  No camera frame, template image, user
 /// identifier, or model output is embedded.  Keeping a per-eye target is intentional:
 /// the XR5 optical paths and the final right-eye handedness are not identical.
-const CANONICAL_MEAN: [[f64; 2]; 2] = [[63.679_659, 46.637_237], [62.605_610, 48.440_930]];
+const CANONICAL_MEAN: [[f64; 2]; 2] = [[64.837_784, 44.911_706], [63.288_729, 46.098_966]];
 const CANONICAL_COVARIANCE: [[[f64; 2]; 2]; 2] = [
-    [[373.458_056, -53.219_518], [-53.219_518, 299.571_816]],
-    [[388.544_749, -118.274_017], [-118.274_017, 374.585_227]],
+    [[247.287_843, 8.945_901], [8.945_901, 195.626_530]],
+    [[291.995_741, -51.798_716], [-51.798_716, 199.309_880]],
 ];
 
 #[derive(Clone, Copy)]
@@ -85,6 +92,9 @@ pub struct AppearanceDescriptor {
     pub block_center_spread_px: f32,
     pub block_angle_spread_deg: f32,
     pub blocks: usize,
+    /// One eye had an inconsistent block and was re-detected inside the physical
+    /// counterpart neighbourhood predicted by the stable eye.
+    pub stereo_recovered: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,7 +144,7 @@ pub fn estimate_motion_geometry(
     {
         return Err("motion geometry requires XR5 stereo 200x200 frames".into());
     }
-    let descriptors = [motion_descriptor(left)?, motion_descriptor(right)?];
+    let descriptors = [motion_descriptor(left, 0)?, motion_descriptor(right, 1)?];
     let solved = [
         solve_eye(descriptors[0], baseline[0], effective_mirrors[0], 0)?,
         solve_eye(descriptors[1], baseline[1], effective_mirrors[1], 1)?,
@@ -233,10 +243,31 @@ pub fn estimate_appearance_geometry(
     {
         return Err("appearance geometry requires XR5 stereo 200x200 frames".into());
     }
-    let descriptors = [
-        appearance_descriptor(left, 0)?,
-        appearance_descriptor(right, 1)?,
+    let mut descriptors = [
+        appearance_descriptor(left, 0, None)?,
+        appearance_descriptor(right, 1, None)?,
     ];
+    let unstable = descriptors.map(|descriptor| descriptor.block_center_spread_px > 10.0);
+    if unstable[0] != unstable[1] {
+        let unstable_eye = usize::from(unstable[1]);
+        let stable_eye = 1 - unstable_eye;
+        let stable = descriptors[stable_eye].pupil_center_px;
+        let anchor = if unstable_eye == 0 {
+            [198.0 - stable[0] as f64, stable[1] as f64 + 1.0]
+        } else {
+            [198.0 - stable[0] as f64, stable[1] as f64 - 1.0]
+        };
+        let frames = if unstable_eye == 0 { left } else { right };
+        if let Ok(mut recovered) = appearance_descriptor(frames, unstable_eye, Some(anchor)) {
+            if recovered.block_center_spread_px < descriptors[unstable_eye].block_center_spread_px
+                && recovered.pupil_contrast >= 18.0
+                && recovered.aperture_anisotropy >= 2.2
+            {
+                recovered.stereo_recovered = true;
+                descriptors[unstable_eye] = recovered;
+            }
+        }
+    }
     let geometry = std::array::from_fn(|eye| {
         appearance_geometry_from_descriptor(descriptors[eye], baseline[eye], eye)
     });
@@ -327,6 +358,7 @@ pub fn estimate_appearance_geometry(
 fn appearance_descriptor(
     frames: &[MotionFrame<'_>],
     eye: usize,
+    stereo_anchor: Option<[f64; 2]>,
 ) -> Result<AppearanceDescriptor, String> {
     if frames.len() < 2 * MIN_GROUP_FRAMES {
         return Err("not enough relaxed-neutral appearance frames".into());
@@ -353,8 +385,8 @@ fn appearance_descriptor(
             continue;
         }
         let median = median_frame(group, width, height);
-        let (center, contrast) = detect_pupil(&median, width, height, eye)?;
-        let (angle, anisotropy) = aperture_axis(&median, width, height, center)?;
+        let (center, contrast) = detect_pupil(&median, width, height, eye, stereo_anchor)?;
+        let (angle, anisotropy) = aperture_axis(&median, width, height, center, eye)?;
         blocks.push((center, contrast, angle, anisotropy));
     }
     if blocks.len() < 2 {
@@ -387,6 +419,7 @@ fn appearance_descriptor(
         block_center_spread_px: center_spread as f32,
         block_angle_spread_deg: angle_spread as f32,
         blocks: blocks.len(),
+        stereo_recovered: false,
     })
 }
 
@@ -407,6 +440,7 @@ fn detect_pupil(
     width: usize,
     height: usize,
     eye: usize,
+    stereo_anchor: Option<[f64; 2]>,
 ) -> Result<([f64; 2], f64), String> {
     if image.len() < width * height || width != 200 || height != 200 || eye > 1 {
         return Err("pupil detector received an unsupported frame".into());
@@ -422,6 +456,11 @@ fn detect_pupil(
     let mut best: Option<(f64, [f64; 2], f64)> = None;
     for cy in (65usize..=135).step_by(2) {
         for cx in (x_start..=x_end).step_by(2) {
+            if stereo_anchor.is_some_and(|anchor| {
+                (cx as f64 - anchor[0]).abs() > 28.0 || (cy as f64 - anchor[1]).abs() > 24.0
+            }) {
+                continue;
+            }
             let mut inner_sum = 0.0f64;
             let mut inner_squared = 0.0f64;
             let mut inner_count = 0usize;
@@ -473,13 +512,14 @@ fn aperture_axis(
     width: usize,
     height: usize,
     center: [f64; 2],
+    eye: usize,
 ) -> Result<(f64, f64), String> {
     let mut values = Vec::new();
     for y in 0..height {
         for x in 0..width {
             let nx = (x as f64 - center[0]) / 48.0;
             let ny = (y as f64 - center[1]) / 30.0;
-            if nx * nx + ny * ny <= 1.0 {
+            if nx * nx + ny * ny <= 1.0 && xr5_evidence_pixel(eye, x, width) {
                 values.push(image[y * width + x]);
             }
         }
@@ -496,7 +536,7 @@ fn aperture_axis(
         for x in 0..width {
             let nx = (x as f64 - center[0]) / 48.0;
             let ny = (y as f64 - center[1]) / 30.0;
-            if nx * nx + ny * ny > 1.0 {
+            if nx * nx + ny * ny > 1.0 || !xr5_evidence_pixel(eye, x, width) {
                 continue;
             }
             let weight = (threshold - image[y * width + x] as f64).max(0.0);
@@ -516,7 +556,7 @@ fn aperture_axis(
         for x in 0..width {
             let nx = (x as f64 - center[0]) / 48.0;
             let ny = (y as f64 - center[1]) / 30.0;
-            if nx * nx + ny * ny > 1.0 {
+            if nx * nx + ny * ny > 1.0 || !xr5_evidence_pixel(eye, x, width) {
                 continue;
             }
             let weight = (threshold - image[y * width + x] as f64).max(0.0);
@@ -551,8 +591,15 @@ fn appearance_geometry_from_descriptor(
         XR5_PRESET_CENTER_PX[eye][1] + descriptor.pupil_center_px[1] as f64
             - APPEARANCE_PUPIL_REFERENCE[eye][1],
     ];
+    let half_width = XR5_PRESET_WIDTH_PX * 0.5;
+    let frame_inner = XR5_MIN_INNER_CROP * 200.0;
+    let x_bounds = if eye == 0 {
+        [half_width, 200.0 - half_width - frame_inner]
+    } else {
+        [half_width + frame_inner, 200.0 - half_width]
+    };
     let center = [
-        center[0].clamp(XR5_PRESET_WIDTH_PX * 0.5, 200.0 - XR5_PRESET_WIDTH_PX * 0.5),
+        center[0].clamp(x_bounds[0], x_bounds[1]),
         center[1].clamp(
             XR5_PRESET_HEIGHT_PX * 0.5,
             200.0 - XR5_PRESET_HEIGHT_PX * 0.5,
@@ -609,7 +656,7 @@ fn descriptor_to_public(value: Descriptor64) -> MotionDescriptor {
     }
 }
 
-fn motion_descriptor(frames: &[MotionFrame<'_>]) -> Result<Descriptor64, String> {
+fn motion_descriptor(frames: &[MotionFrame<'_>], eye: usize) -> Result<Descriptor64, String> {
     if frames.len() < MIN_GROUP_FRAMES {
         return Err("not enough eyelid-motion frames".into());
     }
@@ -667,6 +714,9 @@ fn motion_descriptor(frames: &[MotionFrame<'_>]) -> Result<Descriptor64, String>
 
     let mut active = Vec::with_capacity(pixels);
     for pixel in 0..pixels {
+        if !xr5_evidence_pixel(eye, pixel % width, width) {
+            continue;
+        }
         let mean = intensity_sum[pixel] as f64 / intensity_frames as f64;
         if mean <= 245.0 && combined[pixel] > 0 {
             active.push(combined[pixel]);
@@ -684,6 +734,9 @@ fn motion_descriptor(frames: &[MotionFrame<'_>]) -> Result<Descriptor64, String>
     let mut effective_pixels = 0usize;
     for y in 0..height {
         for x in 0..width {
+            if !xr5_evidence_pixel(eye, x, width) {
+                continue;
+            }
             let index = y * width + x;
             if intensity_sum[index] as f64 / intensity_frames as f64 > 245.0 {
                 continue;
@@ -705,6 +758,9 @@ fn motion_descriptor(frames: &[MotionFrame<'_>]) -> Result<Descriptor64, String>
     let mut covariance = [[0.0f64; 2]; 2];
     for y in 0..height {
         for x in 0..width {
+            if !xr5_evidence_pixel(eye, x, width) {
+                continue;
+            }
             let index = y * width + x;
             if intensity_sum[index] as f64 / intensity_frames as f64 > 245.0 {
                 continue;
@@ -735,6 +791,17 @@ fn motion_descriptor(frames: &[MotionFrame<'_>]) -> Result<Descriptor64, String>
         effective_pixels,
         threshold,
     })
+}
+
+fn xr5_evidence_pixel(eye: usize, x: usize, width: usize) -> bool {
+    if width != 200 {
+        return true;
+    }
+    match eye {
+        0 => x <= XR5_LED_SAFE_LEFT_MAX_X,
+        1 => x >= XR5_LED_SAFE_RIGHT_MIN_X,
+        _ => false,
+    }
 }
 
 fn quantile_index(len: usize, numerator: usize, denominator: usize) -> usize {
@@ -1097,7 +1164,7 @@ mod tests {
                 pixels,
             })
             .collect();
-        let descriptor = motion_descriptor(&frames).unwrap();
+        let descriptor = motion_descriptor(&frames, 0).unwrap();
         assert!(
             (descriptor.mean[0] - 23.0).abs() < 2.0,
             "{:?}",
@@ -1113,6 +1180,45 @@ mod tests {
     }
 
     #[test]
+    fn xr5_motion_descriptor_ignores_the_fixed_inner_led_zone() {
+        let mut owned = Vec::new();
+        for frame in 0..40usize {
+            let mut image = vec![80u8; 200 * 200];
+            if frame % 2 == 1 {
+                for y in 88..113 {
+                    for x in 55..86 {
+                        let spatial = ((x - 55) * 3 + (y - 88) * 2).min(150) as u8;
+                        image[y * 200 + x] = 90u8.saturating_add(spatial);
+                    }
+                }
+                // Much stronger movement in the left camera's fixed inner LED zone.
+                for y in 60..141 {
+                    for x in 145..191 {
+                        image[y * 200 + x] = 240;
+                    }
+                }
+            }
+            owned.push(image);
+        }
+        let frames: Vec<_> = owned
+            .iter()
+            .map(|pixels| MotionFrame {
+                group: 0,
+                width: 200,
+                height: 200,
+                pixels,
+            })
+            .collect();
+        let descriptor = motion_descriptor(&frames, 0).unwrap();
+        assert!(descriptor.mean[0] < 100.0, "{:?}", descriptor.mean);
+        assert!(
+            (55.0..=90.0).contains(&descriptor.mean[0]),
+            "{:?}",
+            descriptor.mean
+        );
+    }
+
+    #[test]
     fn insufficient_temporal_evidence_is_rejected() {
         let pixels = vec![0u8; 200 * 200];
         let frames = [MotionFrame {
@@ -1121,7 +1227,7 @@ mod tests {
             height: 200,
             pixels: &pixels,
         }];
-        assert!(motion_descriptor(&frames).is_err());
+        assert!(motion_descriptor(&frames, 0).is_err());
     }
 
     fn synthetic_eye(center: [f64; 2], angle_deg: f64) -> Vec<u8> {
@@ -1149,15 +1255,75 @@ mod tests {
     fn neutral_detector_finds_pupil_and_aperture_axis() {
         for (eye, center, angle) in [(0usize, [72.0, 103.0], 14.0), (1usize, [128.0, 98.0], -6.0)] {
             let image = synthetic_eye(center, angle);
-            let (actual_center, contrast) = detect_pupil(&image, 200, 200, eye).unwrap();
+            let (actual_center, contrast) = detect_pupil(&image, 200, 200, eye, None).unwrap();
             let (actual_angle, anisotropy) =
-                aperture_axis(&image, 200, 200, actual_center).unwrap();
+                aperture_axis(&image, 200, 200, actual_center, eye).unwrap();
             assert!((actual_center[0] - center[0]).abs() <= 2.0);
             assert!((actual_center[1] - center[1]).abs() <= 2.0);
             assert!(contrast >= 40.0, "contrast={contrast}");
             assert!((actual_angle - angle).abs() <= 2.0, "angle={actual_angle}");
             assert!(anisotropy >= 3.0, "anisotropy={anisotropy}");
         }
+    }
+
+    #[test]
+    fn stable_eye_recovers_other_eye_from_a_reflection_false_circle() {
+        let mut left_owned = Vec::new();
+        let mut right_owned = Vec::new();
+        let mut groups = Vec::new();
+        for group in 0..2usize {
+            for _ in 0..8 {
+                left_owned.push(synthetic_eye([72.0, 103.0], 14.0));
+                let mut right = synthetic_eye([128.0, 98.0], -6.0);
+                if group == 1 {
+                    let false_center = [166.0f64, 72.0f64];
+                    for y in 0..200 {
+                        for x in 0..200 {
+                            let dx = x as f64 - false_center[0];
+                            let dy = y as f64 - false_center[1];
+                            let distance2 = dx * dx + dy * dy;
+                            if distance2 <= 49.0 {
+                                right[y * 200 + x] = 8;
+                            } else if (144.0..=324.0).contains(&distance2) {
+                                right[y * 200 + x] = 225;
+                            }
+                        }
+                    }
+                }
+                right_owned.push(right);
+                groups.push(group);
+            }
+        }
+        let left: Vec<_> = left_owned
+            .iter()
+            .zip(&groups)
+            .map(|(pixels, group)| MotionFrame {
+                group: *group,
+                width: 200,
+                height: 200,
+                pixels,
+            })
+            .collect();
+        let right: Vec<_> = right_owned
+            .iter()
+            .zip(&groups)
+            .map(|(pixels, group)| MotionFrame {
+                group: *group,
+                width: 200,
+                height: 200,
+                pixels,
+            })
+            .collect();
+        let unanchored = appearance_descriptor(&right, 1, None).unwrap();
+        assert!(unanchored.block_center_spread_px > 10.0, "{unanchored:?}");
+
+        let estimate =
+            estimate_appearance_geometry(&left, &right, default_ml_geometry("pimax_xr5")).unwrap();
+        let recovered = estimate.eyes[1].descriptor;
+        assert!(recovered.stereo_recovered, "{recovered:?}");
+        assert!((recovered.pupil_center_px[0] - 128.0).abs() <= 2.0);
+        assert!((recovered.pupil_center_px[1] - 98.0).abs() <= 2.0);
+        assert!(estimate.search_eligible, "{}", estimate.reason);
     }
 
     #[test]
@@ -1179,6 +1345,7 @@ mod tests {
                 block_center_spread_px: 0.0,
                 block_angle_spread_deg: 0.0,
                 blocks: 2,
+                stereo_recovered: false,
             };
             let actual = appearance_geometry_from_descriptor(descriptor, wrong, eye);
             assert_eq!(actual.crop_left, expected[eye].crop_left);

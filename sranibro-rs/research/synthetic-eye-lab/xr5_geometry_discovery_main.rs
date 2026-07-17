@@ -129,7 +129,7 @@ fn run() -> Result<(), String> {
             let descriptor = value.descriptor;
             let g = value.geometry;
             println!(
-                "  {name} pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} anisotropy {:.2} spread {:.1}px/{:.1}deg crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
+                "  {name} pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} anisotropy {:.2} spread {:.1}px/{:.1}deg{} crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
                 descriptor.pupil_center_px[0],
                 descriptor.pupil_center_px[1],
                 descriptor.pupil_contrast,
@@ -137,6 +137,11 @@ fn run() -> Result<(), String> {
                 descriptor.aperture_anisotropy,
                 descriptor.block_center_spread_px,
                 descriptor.block_angle_spread_deg,
+                if descriptor.stereo_recovered {
+                    " stereo-recovered"
+                } else {
+                    ""
+                },
                 g.crop_left,
                 g.crop_right,
                 g.crop_top,

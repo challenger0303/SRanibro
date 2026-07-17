@@ -1913,6 +1913,9 @@ impl App {
                     ui.label(label(
                         "This does not train a model, change Tobii gaze calibration, or use squeeze/Wide as geometry targets.",
                     ));
+                    ui.label(label(
+                        "The fixed inner XR5 IR-LED/lens region is excluded before extracting geometry evidence and search candidates cannot reduce the inner hardware crop below 35%.",
+                    ));
                     ui.add_space(SP2);
 
                     match capture_status {
@@ -2138,13 +2141,18 @@ impl App {
                                         let descriptor = value.descriptor;
                                         let g = value.geometry;
                                         ui.label(num(&format!(
-                                            "neutral {name} pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} spread {:.1}px/{:.1}deg   crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
+                                            "neutral {name} pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} spread {:.1}px/{:.1}deg{}   crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
                                             descriptor.pupil_center_px[0],
                                             descriptor.pupil_center_px[1],
                                             descriptor.pupil_contrast,
                                             descriptor.aperture_angle_deg,
                                             descriptor.block_center_spread_px,
                                             descriptor.block_angle_spread_deg,
+                                            if descriptor.stereo_recovered {
+                                                " stereo-recovered"
+                                            } else {
+                                                ""
+                                            },
                                             g.crop_left,
                                             g.crop_right,
                                             g.crop_top,

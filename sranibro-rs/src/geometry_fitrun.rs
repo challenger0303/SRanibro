@@ -27,6 +27,7 @@ const STAGE2_CANDIDATES: usize = 10;
 const STAGE2_FRAMES: usize = 280;
 const STAGE3_FRAMES: usize = 420;
 const HOLDOUT_FRAMES: usize = 420;
+const XR5_MIN_INNER_CROP: f32 = 0.35;
 const AUDIT_FOLDS: usize = 5;
 const AUDIT_BLOCK_FRAMES: usize = 12;
 const AUDIT_GUARD_FRAMES: usize = 1;
@@ -487,13 +488,18 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
                 log(
                         &shared,
                         format!(
-                            "[appearance seed {name}] pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} spread {:.1}px/{:.1}deg crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
+                            "[appearance seed {name}] pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} spread {:.1}px/{:.1}deg{} crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
                             descriptor.pupil_center_px[0],
                             descriptor.pupil_center_px[1],
                             descriptor.pupil_contrast,
                             descriptor.aperture_angle_deg,
                             descriptor.block_center_spread_px,
                             descriptor.block_angle_spread_deg,
+                            if descriptor.stereo_recovered {
+                                " stereo-recovered"
+                            } else {
+                                ""
+                            },
                             g.crop_left,
                             g.crop_right,
                             g.crop_top,
@@ -2367,14 +2373,26 @@ fn geometry_from_params(baseline: [MlGeometry; 2], params: SearchParams) -> [MlG
         let base_cy = base.crop_top + height * 0.5;
         let inward_sign = if eye == 0 { 1.0 } else { -1.0 };
         let scale = 1.0 + size * 0.15;
-        let width = (width * scale).clamp(0.20, 0.90);
+        // A wider window cannot coexist with the fixed inner LED exclusion while
+        // remaining inside the physical frame. Limit horizontal size accordingly.
+        let width = (width * scale).clamp(0.20, 1.0 - XR5_MIN_INNER_CROP);
         let height = (height * scale).clamp(0.20, 0.90);
         let requested_cx = base_cx + inward_sign * inward * 0.08;
         let requested_cy = base_cy + vertical * 0.08;
         // Intersect the physical frame bounds with the promised local neighbourhood.
         // Independent edge clamps would silently change window size near an edge.
-        let min_cx = (width * 0.5).max(base_cx - 0.08);
-        let max_cx = (1.0 - width * 0.5).min(base_cx + 0.08);
+        let hardware_min_cx = if eye == 0 {
+            width * 0.5
+        } else {
+            width * 0.5 + XR5_MIN_INNER_CROP
+        };
+        let hardware_max_cx = if eye == 0 {
+            1.0 - width * 0.5 - XR5_MIN_INNER_CROP
+        } else {
+            1.0 - width * 0.5
+        };
+        let min_cx = (width * 0.5).max(base_cx - 0.08).max(hardware_min_cx);
+        let max_cx = (1.0 - width * 0.5).min(base_cx + 0.08).min(hardware_max_cx);
         let min_cy = (height * 0.5).max(base_cy - 0.08);
         let max_cy = (1.0 - height * 0.5).min(base_cy + 0.08);
         let cx = if min_cx <= max_cx {
@@ -2683,6 +2701,8 @@ mod tests {
             assert!(geometry[eye].crop_bottom >= 0.0);
             assert!((geometry[eye].rotate_deg - baseline[eye].rotate_deg).abs() <= 8.01);
         }
+        assert!(geometry[0].crop_right + 1e-6 >= XR5_MIN_INNER_CROP);
+        assert!(geometry[1].crop_left + 1e-6 >= XR5_MIN_INNER_CROP);
     }
 
     #[test]

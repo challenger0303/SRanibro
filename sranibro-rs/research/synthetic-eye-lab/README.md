@@ -274,6 +274,9 @@ solves for the absolute crop window and rotation that map that envelope into the
 canonical XR5 EyeNet region.
 The canonical target consists of aggregate mean/covariance constants only; no eye
 image or reconstructable template is embedded.
+All XR5 evidence first excludes the fixed inner IR-LED/lens zone. The canonical motion
+statistics are defined in that masked coordinate system, and the ML search cannot
+reduce the physical inner crop below 35%. This hardware exclusion is not fitted per user.
 
 The same executable also evaluates the second, independent neutral-appearance
 hypothesis. Per-block median `neutral_center` frames are reduced to pupil centre,
@@ -281,6 +284,10 @@ pupil contrast, eye-aperture axis, anisotropy, and repeatability. The resulting 
 and angle do not inherit the active crop/rotation. Production requires two repeatable
 OPEN blocks, binocular plausibility, ordinary EyeNet training guards, and untouched
 holdout improvement before this hypothesis can be offered for manual application.
+If exactly one eye is inconsistent across the OPEN blocks, the detector may retry only
+that eye inside the physical counterpart neighbourhood predicted by the stable eye. The
+retry is marked `stereo-recovered`; it does not bypass any repeatability, binocular,
+EyeNet, or holdout gate.
 
 ```powershell
 cargo run --release --features research-synthetic-eye-lab `
