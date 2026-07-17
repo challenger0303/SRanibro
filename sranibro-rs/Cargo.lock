@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "sranibro-rs"
-version = "0.1.4-beta"
+version = "0.1.5-beta"
 dependencies = [
  "eframe",
  "hmac",

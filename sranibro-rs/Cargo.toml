@@ -1,6 +1,6 @@
 [package]
 name = "sranibro-rs"
-version = "0.1.4-beta"
+version = "0.1.5-beta"
 edition = "2021"
 description = "SRanibro — all-Rust, distribution-safe eye/face tracker (rewrite)"
 
