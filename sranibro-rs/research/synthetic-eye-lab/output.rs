@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::experiment::CaseDefinition;
 use crate::luminance::{aperture, LuminancePlan};
 use crate::model::sha256_hex;
+use crate::moments::{TwoMomentPlan, PREREGISTRATION_COMMIT};
 use crate::renderer::{RenderedStereo, SIDE};
 
 pub const PRODUCTION_PRESENCE_GATE: f32 = 0.05;
@@ -45,6 +46,8 @@ pub struct CaseResult {
     pub rendered: RenderedStereo,
     pub tensor_sha256: String,
     pub raw: [f32; 5],
+    pub inference_repeat_raw: Option<[f32; 5]>,
+    pub inference_repeat_bits_match: Option<bool>,
     pub recognition: Recognition,
 }
 
@@ -80,12 +83,67 @@ pub struct Manifest {
     pub suites_evaluated: Vec<&'static str>,
     pub luminance_plan: Option<LuminancePlan>,
     pub luminance_renderer_no_go_reason: Option<String>,
+    pub two_moment_plan: Option<TwoMomentPlan>,
+    pub two_moment_renderer_no_go_reason: Option<String>,
     pub phase0_decision: Phase0Decision,
     pub total_cases: usize,
     pub recognized_cases: usize,
     pub sanitized_cli: Vec<String>,
     pub deterministic_scope: &'static str,
     pub interpretation_limit: &'static str,
+}
+
+#[derive(Serialize)]
+struct RendererNoGoManifest<'a> {
+    tool: &'static str,
+    suite_version: &'static str,
+    generated_unix_s: u64,
+    repository_commit: &'a str,
+    repository_dirty: bool,
+    preregistration_commit: &'static str,
+    requested_experiment: &'static str,
+    renderer_decision: &'static str,
+    model_loaded: bool,
+    model_identity_sha256: Option<String>,
+    phase0_evaluated: bool,
+    reason: &'a str,
+    interpretation_limit: &'static str,
+}
+
+pub fn write_two_moment_renderer_no_go(
+    out_dir: &Path,
+    repository_commit: &str,
+    repository_dirty: bool,
+    reason: &str,
+) -> Result<(), Box<dyn Error>> {
+    if out_dir.exists() && std::fs::read_dir(out_dir)?.next().is_some() {
+        return Err(format!(
+            "output directory is not empty: {} (choose a new directory to avoid mixing runs)",
+            out_dir.display()
+        )
+        .into());
+    }
+    std::fs::create_dir_all(out_dir)?;
+    let manifest = RendererNoGoManifest {
+        tool: "SRanibro synthetic eye stimulus lab",
+        suite_version: crate::moments::VERSION,
+        generated_unix_s: generated_unix_s(),
+        repository_commit,
+        repository_dirty,
+        preregistration_commit: PREREGISTRATION_COMMIT,
+        requested_experiment: "two-moment-match",
+        renderer_decision: "no_go",
+        model_loaded: false,
+        model_identity_sha256: None,
+        phase0_evaluated: false,
+        reason,
+        interpretation_limit:
+            "instrument infeasibility only; no EyeNet output or geometry-effect claim",
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    std::fs::write(out_dir.join("manifest.json"), &bytes)?;
+    std::fs::write(out_dir.join("two_moment_renderer_no_go.json"), bytes)?;
+    Ok(())
 }
 
 pub fn classify(raw: [f32; 5], eye_like: bool) -> Recognition {
@@ -165,7 +223,401 @@ pub fn write_run(
             )?;
         }
     }
+    if let Some(plan) = manifest.two_moment_plan.as_ref().filter(|_| {
+        results
+            .iter()
+            .any(|result| result.definition.two_moment.is_some())
+    }) {
+        let analysis = two_moment_analysis(results, plan);
+        std::fs::write(
+            out_dir.join("two_moment_analysis.json"),
+            serde_json::to_vec_pretty(&analysis)?,
+        )?;
+    }
     Ok(())
+}
+
+const TWO_MOMENT_BASELINE_SPAN_FLOOR: f32 = 0.10;
+const TWO_MOMENT_MATCHED_SPAN_FLOOR: f32 = 0.05;
+const TWO_MOMENT_GO_RATIO: f32 = 0.20;
+const TWO_MOMENT_NO_EVIDENCE_RATIO: f32 = 0.10;
+const TWO_MOMENT_GO_RHO: f32 = 0.70;
+const TWO_MOMENT_CLEAN_RHO: f32 = 0.30;
+const TWO_MOMENT_DELTA_DEADBAND: f32 = 0.001;
+const TWO_MOMENT_GO_CONCORDANCE: f32 = 0.90;
+const TWO_MOMENT_MIN_ELIGIBLE_PAIRS: usize = 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TwoMomentDecision {
+    Go,
+    NoEvidence,
+    Inconclusive,
+    InconclusiveArtifact,
+    InconclusiveInsensitive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProvisionalEndpoint {
+    Go,
+    NoEvidence,
+    Inconclusive,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TwoMomentSeriesMetrics {
+    experiment: String,
+    eye: &'static str,
+    reference_index: Option<usize>,
+    cases: usize,
+    all_outputs_bit_identical: bool,
+    rho: Option<f32>,
+    rho_none_reason: Option<&'static str>,
+    span: Option<f32>,
+    span_ratio_to_s3: Option<f32>,
+    adjacent_candidates: usize,
+    adjacent_eligible: usize,
+    adjacent_ineligible_deadband: usize,
+    adjacent_concordant: usize,
+    adjacent_discordant: usize,
+    directional_concordance: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct TwoMomentReferenceAnalysis {
+    reference_index: usize,
+    reference_aperture: f32,
+    matched: [TwoMomentSeriesMetrics; 2],
+    replay: [TwoMomentSeriesMetrics; 2],
+}
+
+#[derive(Debug, Serialize)]
+struct TwoMomentAnalysis {
+    preregistration_commit: &'static str,
+    common_indices: Vec<usize>,
+    inference_repeat_all_bits_match: bool,
+    baseline: [TwoMomentSeriesMetrics; 2],
+    references: Vec<TwoMomentReferenceAnalysis>,
+    decision: TwoMomentDecision,
+    flags: Vec<&'static str>,
+    decision_order: [&'static str; 5],
+    interpretation_limit: &'static str,
+}
+
+fn two_moment_analysis(results: &[CaseResult], plan: &TwoMomentPlan) -> TwoMomentAnalysis {
+    let baseline = [
+        two_moment_series(
+            results,
+            "two_moment_baseline",
+            1,
+            None,
+            &plan.common_indices,
+            None,
+            false,
+        ),
+        two_moment_series(
+            results,
+            "two_moment_baseline",
+            2,
+            None,
+            &plan.common_indices,
+            None,
+            false,
+        ),
+    ];
+    let baseline_spans = [
+        baseline[0].span.unwrap_or(0.0),
+        baseline[1].span.unwrap_or(0.0),
+    ];
+    let mut references = Vec::new();
+    for &reference_index in &plan.reference_indices {
+        references.push(TwoMomentReferenceAnalysis {
+            reference_index,
+            reference_aperture: aperture(reference_index),
+            matched: [
+                two_moment_series(
+                    results,
+                    &format!("two_moment_match_ref{reference_index}"),
+                    1,
+                    Some(reference_index),
+                    &plan.common_indices,
+                    Some(baseline_spans[0]),
+                    false,
+                ),
+                two_moment_series(
+                    results,
+                    &format!("two_moment_match_ref{reference_index}"),
+                    2,
+                    Some(reference_index),
+                    &plan.common_indices,
+                    Some(baseline_spans[1]),
+                    false,
+                ),
+            ],
+            replay: [
+                two_moment_series(
+                    results,
+                    &format!("two_moment_replay_ref{reference_index}"),
+                    1,
+                    Some(reference_index),
+                    &plan.common_indices,
+                    Some(baseline_spans[0]),
+                    true,
+                ),
+                two_moment_series(
+                    results,
+                    &format!("two_moment_replay_ref{reference_index}"),
+                    2,
+                    Some(reference_index),
+                    &plan.common_indices,
+                    Some(baseline_spans[1]),
+                    true,
+                ),
+            ],
+        });
+    }
+
+    let inference_repeat_all_bits_match = results
+        .iter()
+        .filter(|result| result.definition.two_moment.is_some())
+        .all(|result| result.inference_repeat_bits_match == Some(true));
+    let insensitive = baseline_spans
+        .iter()
+        .any(|span| *span < TWO_MOMENT_BASELINE_SPAN_FLOOR);
+    let replay_clean = references
+        .iter()
+        .all(|reference| reference.replay.iter().all(replay_clean_series));
+    let every_go = references.iter().all(|reference| {
+        (0..2).all(|eye| {
+            let matched = &reference.matched[eye];
+            let replay = &reference.replay[eye];
+            go_like_series(matched)
+                && replay
+                    .span
+                    .zip(matched.span)
+                    .is_some_and(|(replay, matched)| replay <= 0.25 * matched)
+        })
+    });
+    let every_no_evidence = references
+        .iter()
+        .all(|reference| reference.matched.iter().all(no_evidence_like_series));
+
+    let decision = if !inference_repeat_all_bits_match {
+        TwoMomentDecision::InconclusiveArtifact
+    } else if insensitive {
+        TwoMomentDecision::InconclusiveInsensitive
+    } else if !replay_clean {
+        TwoMomentDecision::InconclusiveArtifact
+    } else if every_go {
+        TwoMomentDecision::Go
+    } else if every_no_evidence {
+        TwoMomentDecision::NoEvidence
+    } else {
+        TwoMomentDecision::Inconclusive
+    };
+    let mut flags = Vec::new();
+    let provisional: Vec<_> = references
+        .iter()
+        .map(|reference| {
+            [0, 1].map(|eye| provisional_endpoint(&reference.matched[eye], &reference.replay[eye]))
+        })
+        .collect();
+    if provisional.iter().any(|eyes| eyes[0] != eyes[1]) {
+        flags.push("eye_asymmetric");
+    }
+    if provisional.len() >= 2 {
+        let reference_endpoints: Vec<_> = provisional
+            .iter()
+            .map(|eyes| {
+                if eyes[0] == eyes[1] {
+                    eyes[0]
+                } else {
+                    ProvisionalEndpoint::Inconclusive
+                }
+            })
+            .collect();
+        if reference_endpoints
+            .iter()
+            .skip(1)
+            .any(|endpoint| *endpoint != reference_endpoints[0])
+        {
+            flags.push("reference_dependent");
+        }
+    }
+    if replay_clean
+        && references.iter().any(|reference| {
+            (0..2).any(|eye| {
+                let matched = &reference.matched[eye];
+                let replay = &reference.replay[eye];
+                go_like_series(matched)
+                    && replay
+                        .span
+                        .zip(matched.span)
+                        .is_some_and(|(control, matched)| control > 0.25 * matched)
+            })
+        })
+    {
+        flags.push("control_large");
+    }
+
+    TwoMomentAnalysis {
+        preregistration_commit: crate::moments::PREREGISTRATION_COMMIT,
+        common_indices: plan.common_indices.clone(),
+        inference_repeat_all_bits_match,
+        baseline,
+        references,
+        decision,
+        flags,
+        decision_order: [
+            "renderer_no_go_before_inference",
+            "duplicate_inference_bit_mismatch",
+            "baseline_span_below_0.10",
+            "generic_replay_not_clean",
+            "go_no_evidence_or_inconclusive",
+        ],
+        interpretation_limit: "two-moment-controlled synthetic renderer family only",
+    }
+}
+
+fn go_like_series(series: &TwoMomentSeriesMetrics) -> bool {
+    series.rho.is_some_and(|rho| rho >= TWO_MOMENT_GO_RHO)
+        && series
+            .span
+            .is_some_and(|span| span >= TWO_MOMENT_MATCHED_SPAN_FLOOR)
+        && series
+            .span_ratio_to_s3
+            .is_some_and(|ratio| ratio >= TWO_MOMENT_GO_RATIO)
+        && series.adjacent_eligible >= TWO_MOMENT_MIN_ELIGIBLE_PAIRS
+        && series
+            .directional_concordance
+            .is_some_and(|value| value >= TWO_MOMENT_GO_CONCORDANCE)
+}
+
+fn no_evidence_like_series(series: &TwoMomentSeriesMetrics) -> bool {
+    (series.all_outputs_bit_identical
+        || series
+            .rho
+            .is_some_and(|rho| rho.abs() <= TWO_MOMENT_CLEAN_RHO))
+        && series
+            .span
+            .is_some_and(|span| span < TWO_MOMENT_MATCHED_SPAN_FLOOR)
+        && series
+            .span_ratio_to_s3
+            .is_some_and(|ratio| ratio <= TWO_MOMENT_NO_EVIDENCE_RATIO)
+}
+
+fn replay_clean_series(series: &TwoMomentSeriesMetrics) -> bool {
+    (series.rho.is_none()
+        || series
+            .rho
+            .is_some_and(|rho| rho.abs() <= TWO_MOMENT_CLEAN_RHO))
+        && series
+            .span_ratio_to_s3
+            .is_some_and(|ratio| ratio <= TWO_MOMENT_NO_EVIDENCE_RATIO)
+}
+
+fn provisional_endpoint(
+    matched: &TwoMomentSeriesMetrics,
+    replay: &TwoMomentSeriesMetrics,
+) -> ProvisionalEndpoint {
+    if replay_clean_series(replay)
+        && go_like_series(matched)
+        && replay
+            .span
+            .zip(matched.span)
+            .is_some_and(|(control, matched)| control <= 0.25 * matched)
+    {
+        ProvisionalEndpoint::Go
+    } else if replay_clean_series(replay) && no_evidence_like_series(matched) {
+        ProvisionalEndpoint::NoEvidence
+    } else {
+        ProvisionalEndpoint::Inconclusive
+    }
+}
+
+fn two_moment_series(
+    results: &[CaseResult],
+    experiment: &str,
+    output_index: usize,
+    reference_index: Option<usize>,
+    common_indices: &[usize],
+    baseline_span: Option<f32>,
+    replay_deadband: bool,
+) -> TwoMomentSeriesMetrics {
+    let mut by_index = BTreeMap::new();
+    for result in results.iter().filter(|result| {
+        result.definition.experiment == experiment && result.definition.two_moment.is_some()
+    }) {
+        let record = result.definition.two_moment.as_ref().unwrap();
+        by_index.insert(record.source_aperture_index, result.raw[output_index]);
+    }
+    let ordered: Vec<_> = common_indices
+        .iter()
+        .filter_map(|index| by_index.get(index).map(|value| (*index, *value)))
+        .collect();
+    let values: Vec<_> = ordered.iter().map(|(_, value)| *value).collect();
+    let all_outputs_bit_identical = values.first().is_some_and(|first| {
+        values
+            .iter()
+            .all(|value| value.to_bits() == first.to_bits())
+    });
+    let series_span = span(&values);
+    let rho_none_reason =
+        if replay_deadband && series_span.is_some_and(|value| value <= TWO_MOMENT_DELTA_DEADBAND) {
+            Some("span_at_or_below_0.001_deadband")
+        } else if all_outputs_bit_identical {
+            Some("all_output_bits_identical")
+        } else {
+            None
+        };
+    let rho = if rho_none_reason.is_some() {
+        None
+    } else {
+        let x: Vec<_> = ordered.iter().map(|(index, _)| *index as f32).collect();
+        correlation(&ranks(&x), &ranks(&values))
+    };
+    let mut adjacent_candidates = 0usize;
+    let mut adjacent_eligible = 0usize;
+    let mut adjacent_ineligible_deadband = 0usize;
+    let mut adjacent_concordant = 0usize;
+    let mut adjacent_discordant = 0usize;
+    for pair in ordered.windows(2) {
+        if pair[1].0 != pair[0].0 + 1 {
+            continue;
+        }
+        adjacent_candidates += 1;
+        let delta = pair[1].1 - pair[0].1;
+        if delta.abs() <= TWO_MOMENT_DELTA_DEADBAND {
+            adjacent_ineligible_deadband += 1;
+        } else {
+            adjacent_eligible += 1;
+            if delta > 0.0 {
+                adjacent_concordant += 1;
+            } else {
+                adjacent_discordant += 1;
+            }
+        }
+    }
+    TwoMomentSeriesMetrics {
+        experiment: experiment.into(),
+        eye: if output_index == 1 { "left" } else { "right" },
+        reference_index,
+        cases: ordered.len(),
+        all_outputs_bit_identical,
+        rho,
+        rho_none_reason,
+        span: series_span,
+        span_ratio_to_s3: series_span
+            .zip(baseline_span)
+            .and_then(|(span, baseline)| (baseline > 0.0).then_some(span / baseline)),
+        adjacent_candidates,
+        adjacent_eligible,
+        adjacent_ineligible_deadband,
+        adjacent_concordant,
+        adjacent_discordant,
+        directional_concordance: (adjacent_eligible > 0)
+            .then_some(adjacent_concordant as f32 / adjacent_eligible as f32),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -651,7 +1103,7 @@ fn write_csv(path: &Path, results: &[CaseResult]) -> Result<(), Box<dyn Error>> 
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(
         writer,
-        "experiment,case_name,case_id,interpretation_scope,stereo_policy,photometric_json,mean_match_json,source_aperture_index,source_aperture,match_target_mean,match_achieved_mean,match_abs_error,match_sclera_level,match_at_bound,factor_x_name,factor_x,factor_y_name,factor_y,left_spec_json,right_spec_json,requested_aperture_l,requested_aperture_r,measured_aperture_geometry_l,measured_aperture_geometry_r,measured_aperture_raster_l,measured_aperture_raster_r,presence,open_l,open_r,squeeze_l,squeeze_r,raw_bits_hex,finite,recognition,eye_like,usable_for_interpretation,input_sha256,mean_l,mean_r,stddev_l,stddev_r,edge_energy_l,edge_energy_r,saturation_l,saturation_r,visible_area_l,visible_area_r,brightness_saturated,frame_truncated_l,frame_truncated_r"
+        "experiment,case_name,case_id,interpretation_scope,stereo_policy,photometric_json,mean_match_json,two_moment_json,source_aperture_index,source_aperture,match_target_mean,match_achieved_mean,match_abs_error,match_sclera_level,match_at_bound,factor_x_name,factor_x,factor_y_name,factor_y,left_spec_json,right_spec_json,requested_aperture_l,requested_aperture_r,measured_aperture_geometry_l,measured_aperture_geometry_r,measured_aperture_raster_l,measured_aperture_raster_r,presence,open_l,open_r,squeeze_l,squeeze_r,raw_bits_hex,repeat_raw_bits_hex,repeat_bits_match,finite,recognition,eye_like,usable_for_interpretation,input_sha256,mean_l,mean_r,stddev_l,stddev_r,edge_energy_l,edge_energy_r,saturation_l,saturation_r,visible_area_l,visible_area_r,brightness_saturated,frame_truncated_l,frame_truncated_r"
     )?;
     for result in results {
         let left_json = serde_json::to_string(&result.rendered.left_spec)?;
@@ -662,6 +1114,16 @@ fn write_csv(path: &Path, results: &[CaseResult]) -> Result<(), Box<dyn Error>> 
             .map(|value| format!("{:08x}", value.to_bits()))
             .collect::<Vec<_>>()
             .join(";");
+        let repeat_raw_bits = result
+            .inference_repeat_raw
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| format!("{:08x}", value.to_bits()))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .unwrap_or_default();
         let saturated = result.rendered.left.covariates.saturation_fraction > BRIGHTNESS_CLIP_FLAG
             || result.rendered.right.covariates.saturation_fraction > BRIGHTNESS_CLIP_FLAG;
         let mean_match = result.definition.mean_match.as_ref();
@@ -673,6 +1135,13 @@ fn write_csv(path: &Path, results: &[CaseResult]) -> Result<(), Box<dyn Error>> 
             serde_json::to_string(&result.definition.stereo_policy)?,
             serde_json::to_string(&result.definition.photometric)?,
             mean_match
+                .map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_default(),
+            result
+                .definition
+                .two_moment
+                .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?
                 .unwrap_or_default(),
@@ -717,6 +1186,11 @@ fn write_csv(path: &Path, results: &[CaseResult]) -> Result<(), Box<dyn Error>> 
             raw(result.raw[3]),
             raw(result.raw[4]),
             raw_bits,
+            repeat_raw_bits,
+            result
+                .inference_repeat_bits_match
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
             result.all_finite().to_string(),
             result.recognition.as_str().into(),
             (result.rendered.left.eye_like && result.rendered.right.eye_like).to_string(),
@@ -905,6 +1379,8 @@ mod tests {
             suites_evaluated: vec!["phase0"],
             luminance_plan: None,
             luminance_renderer_no_go_reason: None,
+            two_moment_plan: None,
+            two_moment_renderer_no_go_reason: None,
             phase0_decision: Phase0Decision::NoGo,
             total_cases: 0,
             recognized_cases: 0,
@@ -936,6 +1412,8 @@ mod tests {
                     rendered,
                     tensor_sha256: "test".into(),
                     raw: [0.5, 0.5, 0.5, 0.0, 0.0],
+                    inference_repeat_raw: None,
+                    inference_repeat_bits_match: None,
                     recognition: Recognition::RecognizedSynthetic,
                 }
             })
@@ -968,6 +1446,8 @@ mod tests {
                     rendered,
                     tensor_sha256: "test".into(),
                     raw: [0.7, aperture, aperture, 0.0, 0.0],
+                    inference_repeat_raw: None,
+                    inference_repeat_bits_match: None,
                     recognition: Recognition::RecognizedSynthetic,
                 }
             })
@@ -996,6 +1476,8 @@ mod tests {
                     rendered,
                     tensor_sha256: "test".into(),
                     raw: [0.7, 0.5, 0.5, 0.0, 0.0],
+                    inference_repeat_raw: None,
+                    inference_repeat_bits_match: None,
                     recognition: Recognition::RecognizedSynthetic,
                 }
             })
@@ -1007,5 +1489,213 @@ mod tests {
         assert!((summary.usable_coverage - plan.d_renderer_coverage).abs() < 1e-6);
         assert_eq!(summary.mean_match_cases, plan.d_matched_count);
         assert!(summary.mean_match_error_max.unwrap() <= crate::luminance::MAX_MEAN_ERROR);
+    }
+
+    #[test]
+    fn two_moment_rubric_distinguishes_go_and_flat_no_evidence() {
+        let plan = fake_two_moment_plan();
+        let go = two_moment_analysis(&fake_two_moment_results(true), &plan);
+        assert_eq!(go.decision, TwoMomentDecision::Go);
+        assert!(go.references.iter().all(|reference| {
+            reference.matched.iter().all(|series| {
+                series.adjacent_eligible == 33 && series.directional_concordance == Some(1.0)
+            })
+        }));
+
+        let no_evidence = two_moment_analysis(&fake_two_moment_results(false), &plan);
+        assert_eq!(no_evidence.decision, TwoMomentDecision::NoEvidence);
+        assert!(no_evidence.references.iter().all(|reference| {
+            reference
+                .matched
+                .iter()
+                .all(|series| series.adjacent_eligible == 0 && series.rho.is_none())
+        }));
+    }
+
+    #[test]
+    fn two_moment_flags_compare_full_provisional_endpoints() {
+        let plan = fake_two_moment_plan();
+        let mut reference_split = fake_two_moment_results(true);
+        for result in &mut reference_split {
+            if result.definition.experiment == "two_moment_match_ref31" {
+                set_test_openness(result, 0.5, 0.5);
+            }
+        }
+        let reference_analysis = two_moment_analysis(&reference_split, &plan);
+        assert!(reference_analysis.flags.contains(&"reference_dependent"));
+        assert!(!reference_analysis.flags.contains(&"eye_asymmetric"));
+
+        let mut eye_split = fake_two_moment_results(true);
+        for result in &mut eye_split {
+            if result.definition.experiment == "two_moment_match_ref15" {
+                set_test_openness(result, result.raw[1], 0.5);
+            }
+        }
+        let eye_analysis = two_moment_analysis(&eye_split, &plan);
+        assert!(eye_analysis.flags.contains(&"eye_asymmetric"));
+        assert!(eye_analysis.flags.contains(&"reference_dependent"));
+    }
+
+    #[test]
+    fn control_large_requires_generic_replay_cleanliness() {
+        let plan = fake_two_moment_plan();
+        let mut clean_but_paired_large = fake_two_moment_results(true);
+        for result in &mut clean_but_paired_large {
+            let index = result
+                .definition
+                .two_moment
+                .as_ref()
+                .unwrap()
+                .source_aperture_index;
+            let position = (index - 7) as f32;
+            if result.definition.experiment.contains("match_ref") {
+                let value = position * 0.003;
+                set_test_openness(result, value, value);
+            } else if result.definition.experiment.contains("replay_ref") {
+                let value = ((position - 16.5).abs() / 16.5) * 0.03;
+                set_test_openness(result, value, value);
+            }
+        }
+        let clean_analysis = two_moment_analysis(&clean_but_paired_large, &plan);
+        assert_eq!(clean_analysis.decision, TwoMomentDecision::Inconclusive);
+        assert!(clean_analysis.flags.contains(&"control_large"));
+
+        let mut dirty_replay = clean_but_paired_large;
+        for result in &mut dirty_replay {
+            if result.definition.experiment.contains("replay_ref") {
+                let index = result
+                    .definition
+                    .two_moment
+                    .as_ref()
+                    .unwrap()
+                    .source_aperture_index;
+                let value = (index - 7) as f32 * 0.0013;
+                set_test_openness(result, value, value);
+            }
+        }
+        let dirty_analysis = two_moment_analysis(&dirty_replay, &plan);
+        assert_eq!(
+            dirty_analysis.decision,
+            TwoMomentDecision::InconclusiveArtifact
+        );
+        assert!(!dirty_analysis.flags.contains(&"control_large"));
+    }
+
+    fn fake_two_moment_plan() -> TwoMomentPlan {
+        TwoMomentPlan {
+            version: crate::moments::VERSION,
+            preregistration_commit: crate::moments::PREREGISTRATION_COMMIT,
+            aperture_formula: "test",
+            frozen_universe: (7..=40).collect(),
+            reference_indices: [15, 31],
+            reference_apertures: [aperture(15), aperture(31)],
+            skin_bounds: crate::moments::SKIN_BOUNDS,
+            sclera_bounds: crate::moments::SCLERA_BOUNDS,
+            default_levels: [crate::moments::DEFAULT_SKIN, crate::moments::DEFAULT_SCLERA],
+            solver_version: "test",
+            coarse_grid_points: crate::moments::COARSE_GRID_POINTS,
+            refinement_levels: crate::moments::REFINEMENT_LEVELS,
+            maximum_moment_residual_gray: crate::moments::MAX_MOMENT_RESIDUAL_GRAY,
+            bound_margin_fraction: crate::moments::BOUND_MARGIN_FRACTION,
+            maximum_saturation: crate::moments::MAX_SATURATION,
+            maximum_saturation_range: crate::moments::MAX_SATURATION_RANGE,
+            trajectory_jump_multiplier: crate::moments::TRAJECTORY_JUMP_MULTIPLIER,
+            minimum_common_indices: crate::moments::MIN_COMMON_INDICES,
+            references: vec![],
+            invalid_indices: vec![],
+            common_indices: (7..=40).collect(),
+            preparation_repetitions: 2,
+            renderer_decision: "go",
+        }
+    }
+
+    fn fake_two_moment_results(matched_monotone: bool) -> Vec<CaseResult> {
+        let mut results = Vec::new();
+        for index in 7..=40 {
+            let baseline = (index - 7) as f32 * 0.01;
+            results.push(fake_two_moment_result(
+                "two_moment_baseline",
+                index,
+                None,
+                baseline,
+            ));
+            for reference in [15, 31] {
+                results.push(fake_two_moment_result(
+                    &format!("two_moment_match_ref{reference}"),
+                    index,
+                    Some(reference),
+                    if matched_monotone { baseline } else { 0.5 },
+                ));
+                results.push(fake_two_moment_result(
+                    &format!("two_moment_replay_ref{reference}"),
+                    index,
+                    Some(reference),
+                    0.5,
+                ));
+            }
+        }
+        results
+    }
+
+    fn fake_two_moment_result(
+        experiment: &str,
+        index: usize,
+        reference: Option<usize>,
+        openness: f32,
+    ) -> CaseResult {
+        let mut definition = crate::experiment::phase0_cases().remove(0);
+        definition.experiment = experiment.into();
+        definition.case_name = format!("source_aperture_{index:02}");
+        definition.left.aperture = aperture(index);
+        definition.right = definition.left.clone();
+        definition.two_moment = Some(crate::moments::TwoMomentRecord {
+            kind: if experiment == "two_moment_baseline" {
+                crate::moments::TwoMomentKind::Baseline
+            } else if experiment.contains("replay") {
+                crate::moments::TwoMomentKind::FixedGeometryReplay
+            } else {
+                crate::moments::TwoMomentKind::Matched
+            },
+            source_aperture_index: index,
+            source_aperture: aperture(index),
+            reference_index: reference,
+            reference_aperture: reference.map(aperture),
+            solver_skin_f64: None,
+            solver_sclera_f64: None,
+            applied_skin_f32: crate::moments::DEFAULT_SKIN,
+            applied_sclera_f32: crate::moments::DEFAULT_SCLERA,
+            target_mean_gray: None,
+            target_stddev_gray: None,
+            achieved_mean_gray: 0.0,
+            achieved_stddev_gray: 0.0,
+            absolute_mean_residual_gray: None,
+            absolute_stddev_residual_gray: None,
+            objective: None,
+            near_bound: false,
+            predicted_sha256: "test".into(),
+            canonical_sha256: "test".into(),
+            solver_version: "test".into(),
+        });
+        let rendered = render_stereo(
+            &definition.left,
+            &definition.right,
+            definition.stereo_policy,
+        );
+        CaseResult {
+            case_id: case_id(&definition).unwrap(),
+            definition,
+            rendered,
+            tensor_sha256: "test".into(),
+            raw: [0.7, openness, openness, 0.0, 0.0],
+            inference_repeat_raw: Some([0.7, openness, openness, 0.0, 0.0]),
+            inference_repeat_bits_match: Some(true),
+            recognition: Recognition::RecognizedSynthetic,
+        }
+    }
+
+    fn set_test_openness(result: &mut CaseResult, left: f32, right: f32) {
+        result.raw[1] = left;
+        result.raw[2] = right;
+        result.inference_repeat_raw = Some(result.raw);
     }
 }

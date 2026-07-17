@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const SIDE: usize = 100;
@@ -199,6 +201,142 @@ pub struct RenderedStereo {
     pub right: RenderedEye,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GrayMoments {
+    pub mean: f64,
+    pub stddev: f64,
+}
+
+/// Population moments in gray-level units, accumulated from the quantized bytes.
+/// This is also the canonical check used by the two-moment solver.
+pub fn gray_moments(pixels: &[u8]) -> GrayMoments {
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    for &pixel in pixels {
+        let value = pixel as f64;
+        sum += value;
+        sum_sq += value * value;
+    }
+    let n = pixels.len().max(1) as f64;
+    let mean = sum / n;
+    let variance = (sum_sq / n - mean * mean).max(0.0);
+    GrayMoments {
+        mean,
+        stddev: variance.sqrt(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PhotometricPixel {
+    terms: [u64; SUPERSAMPLE * SUPERSAMPLE],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PhotometricBin {
+    pixel: PhotometricPixel,
+    multiplicity: usize,
+}
+
+/// Exact fast path for searches that vary only `skin_level` and `sclera_level`.
+///
+/// Every output pixel retains the final material assignment of all 16 canonical
+/// supersamples after renderer layer precedence. Search moments use aggregated bins;
+/// the ordered coefficients reconstruct the complete byte image for the mandatory
+/// independent-canonical parity check.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhotometricBasis {
+    pixels: Vec<PhotometricPixel>,
+    bins: Vec<PhotometricBin>,
+}
+
+impl PhotometricBasis {
+    pub fn from_spec(spec: &SyntheticEyeSpec) -> Self {
+        let mut pixels = Vec::with_capacity(SIDE * SIDE);
+        let mut grouped = BTreeMap::<[u64; SUPERSAMPLE * SUPERSAMPLE], usize>::new();
+        for py in 0..SIDE {
+            for px in 0..SIDE {
+                let mut terms = [0u64; SUPERSAMPLE * SUPERSAMPLE];
+                let mut term_index = 0usize;
+                for sy in 0..SUPERSAMPLE {
+                    for sx in 0..SUPERSAMPLE {
+                        let x = px as f32 + (sx as f32 + 0.5) / SUPERSAMPLE as f32;
+                        let y = py as f32 + (sy as f32 + 0.5) / SUPERSAMPLE as f32;
+                        let sample = sample_at(spec, x, y);
+                        terms[term_index] = encode_term(sample);
+                        term_index += 1;
+                    }
+                }
+                let pixel = PhotometricPixel { terms };
+                *grouped.entry(terms).or_default() += 1;
+                pixels.push(pixel);
+            }
+        }
+        let bins = grouped
+            .into_iter()
+            .map(|(terms, multiplicity)| PhotometricBin {
+                pixel: PhotometricPixel { terms },
+                multiplicity,
+            })
+            .collect();
+        Self { pixels, bins }
+    }
+
+    pub fn predict_pixels(&self, skin_level: f32, sclera_level: f32) -> Vec<u8> {
+        self.pixels
+            .iter()
+            .map(|pixel| predict_pixel(*pixel, skin_level, sclera_level))
+            .collect()
+    }
+
+    /// Population moments in gray-level units 0..255, after exact u8 quantization.
+    pub fn moments(&self, skin_level: f32, sclera_level: f32) -> GrayMoments {
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        let mut count = 0usize;
+        for bin in &self.bins {
+            let value = predict_pixel(bin.pixel, skin_level, sclera_level) as f64;
+            let n = bin.multiplicity as f64;
+            sum += value * n;
+            sum_sq += value * value * n;
+            count += bin.multiplicity;
+        }
+        let n = count.max(1) as f64;
+        let mean = sum / n;
+        let variance = (sum_sq / n - mean * mean).max(0.0);
+        GrayMoments {
+            mean,
+            stddev: variance.sqrt(),
+        }
+    }
+}
+
+fn predict_pixel(pixel: PhotometricPixel, skin_level: f32, sclera_level: f32) -> u8 {
+    let mut sum = 0.0f32;
+    for term in pixel.terms {
+        sum += match term {
+            TERM_SKIN => skin_level,
+            TERM_SCLERA => sclera_level,
+            bits => f32::from_bits(bits as u32),
+        };
+    }
+    quantize_level(sum / (SUPERSAMPLE * SUPERSAMPLE) as f32)
+}
+
+const TERM_SKIN: u64 = 1u64 << 32;
+const TERM_SCLERA: u64 = 2u64 << 32;
+
+fn encode_term(sample: Sample) -> u64 {
+    match sample.material {
+        Material::Fixed => sample.level.to_bits() as u64,
+        Material::Skin => TERM_SKIN,
+        Material::Sclera => TERM_SCLERA,
+    }
+}
+
+fn quantize_level(level: f32) -> u8 {
+    (level.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 pub fn render_stereo(
     left: &SyntheticEyeSpec,
     right: &SyntheticEyeSpec,
@@ -243,7 +381,7 @@ pub fn render(spec: &SyntheticEyeSpec) -> RenderedEye {
                 }
             }
             let level = sum / (SUPERSAMPLE * SUPERSAMPLE) as f32;
-            pixels[py * SIDE + px] = (level.clamp(0.0, 1.0) * 255.0).round() as u8;
+            pixels[py * SIDE + px] = quantize_level(level);
         }
     }
 
@@ -295,10 +433,18 @@ pub fn apply_photometric(rendered: &mut RenderedEye, transform: PhotometricTrans
     rendered.covariates = updated;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Material {
+    Fixed,
+    Skin,
+    Sclera,
+}
+
 #[derive(Clone, Copy)]
 struct Sample {
     level: f32,
     inside_opening: bool,
+    material: Material,
 }
 
 fn sample_at(spec: &SyntheticEyeSpec, x: f32, y: f32) -> Sample {
@@ -313,16 +459,17 @@ fn sample_at(spec: &SyntheticEyeSpec, x: f32, y: f32) -> Sample {
     let skin = (local_x / (spec.eye_width_px * 0.62)).powi(2)
         + (local_y / (spec.eye_width_px * 0.42)).powi(2)
         <= 1.0;
-    let mut level = if spec.components.skin_region && skin {
-        spec.skin_level
+    let (mut level, mut material) = if spec.components.skin_region && skin {
+        (spec.skin_level, Material::Skin)
     } else {
-        spec.canvas_level
+        (spec.canvas_level, Material::Fixed)
     };
 
     let (upper, lower, in_width) = lid_bounds(spec, local_x);
     let inside_opening = in_width && local_y > upper && local_y < lower;
     if spec.components.sclera && inside_opening {
         level = spec.sclera_level;
+        material = Material::Sclera;
     }
 
     let iris_x = local_x - spec.iris_offset_px[0];
@@ -330,9 +477,11 @@ fn sample_at(spec: &SyntheticEyeSpec, x: f32, y: f32) -> Sample {
     let iris_d2 = iris_x * iris_x + iris_y * iris_y;
     if spec.components.iris && inside_opening && iris_d2 <= spec.iris_radius_px.powi(2) {
         level = spec.iris_level;
+        material = Material::Fixed;
     }
     if spec.components.pupil && inside_opening && iris_d2 <= spec.pupil_radius_px.powi(2) {
         level = spec.pupil_level;
+        material = Material::Fixed;
     }
 
     let half_line = spec.lid_thickness_px * 0.5;
@@ -341,6 +490,7 @@ fn sample_at(spec: &SyntheticEyeSpec, x: f32, y: f32) -> Sample {
             || (spec.components.lower_lid && (local_y - lower).abs() <= half_line))
     {
         level = spec.lid_level;
+        material = Material::Fixed;
     }
     if spec.components.canthi {
         let left_y = -spec.canthus_tilt_px * 0.5;
@@ -350,11 +500,13 @@ fn sample_at(spec: &SyntheticEyeSpec, x: f32, y: f32) -> Sample {
         let dr2 = (local_x - half_width).powi(2) + (local_y - right_y).powi(2);
         if dl2 <= radius * radius || dr2 <= radius * radius {
             level = spec.lid_level;
+            material = Material::Fixed;
         }
     }
     Sample {
         level: level.clamp(0.0, 1.0),
         inside_opening,
+        material,
     }
 }
 
@@ -528,5 +680,41 @@ mod tests {
         let rendered = render(&stretched);
         assert!(rendered.eye_like, "structure remains eye-like");
         assert!(rendered.covariates.frame_truncated);
+    }
+
+    #[test]
+    fn photometric_basis_is_byte_identical_to_canonical_renderer() {
+        for aperture in [0.2275, 0.4875, 1.0075, 1.3] {
+            let mut base = SyntheticEyeSpec::default();
+            base.aperture = aperture;
+            let basis = PhotometricBasis::from_spec(&base);
+            for (skin, sclera) in [(0.30, 0.65), (0.46, 0.78), (0.60, 0.95)] {
+                let mut candidate = base.clone();
+                candidate.skin_level = skin;
+                candidate.sclera_level = sclera;
+                assert_eq!(
+                    basis.predict_pixels(skin, sclera),
+                    render(&candidate).pixels,
+                    "aperture={aperture} skin={skin} sclera={sclera}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn photometric_basis_moments_are_post_quantization_population_moments() {
+        let mut spec = SyntheticEyeSpec::default();
+        spec.aperture = 0.73;
+        let basis = PhotometricBasis::from_spec(&spec);
+        let pixels = basis.predict_pixels(0.413, 0.887);
+        let moments = basis.moments(0.413, 0.887);
+        let mean = pixels.iter().map(|value| *value as f64).sum::<f64>() / pixels.len() as f64;
+        let variance = pixels
+            .iter()
+            .map(|value| (*value as f64 - mean).powi(2))
+            .sum::<f64>()
+            / pixels.len() as f64;
+        assert_eq!(moments.mean.to_bits(), mean.to_bits());
+        assert!((moments.stddev - variance.sqrt()).abs() <= 1e-12);
     }
 }

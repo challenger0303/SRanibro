@@ -6,18 +6,19 @@
 mod experiment;
 mod luminance;
 mod model;
+mod moments;
 mod output;
 mod renderer;
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use experiment::{luminance_match_cases, milestone1_cases, phase0_cases};
+use experiment::{luminance_match_cases, milestone1_cases, phase0_cases, two_moment_cases};
 use model::{canonical_tensor, load_exact, tensor_sha256};
 use output::{
-    case_id, classify, generated_unix_s, phase0_decision, repository_state, write_run, CaseResult,
-    Manifest, Phase0Decision, ANCHOR_PRESENCE_MARGIN, MIN_INTERPRETATION_COVERAGE,
-    PRODUCTION_PRESENCE_GATE,
+    case_id, classify, generated_unix_s, phase0_decision, repository_state, write_run,
+    write_two_moment_renderer_no_go, CaseResult, Manifest, Phase0Decision, ANCHOR_PRESENCE_MARGIN,
+    MIN_INTERPRETATION_COVERAGE, PRODUCTION_PRESENCE_GATE,
 };
 use renderer::{apply_photometric, render_stereo};
 
@@ -30,6 +31,36 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args = Args::parse(std::env::args().skip(1))?;
+    // Phase 1.2 is renderer-gated before model bytes are read. A NO-GO is a complete,
+    // reportable instrument result and must not fall through to Phase 0 or EyeNet.
+    let (two_moment_cases, two_moment_plan) = if args.experiment == Experiment::TwoMomentMatch {
+        match two_moment_cases() {
+            Ok((cases, plan)) => {
+                println!(
+                    "TWO-MOMENT RENDERER GO: {} common indices, refs {:?}",
+                    plan.common_indices.len(),
+                    plan.reference_indices
+                );
+                (cases, Some(plan))
+            }
+            Err(reason) => {
+                let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+                let (repository_commit, repository_dirty) = repository_state(manifest_dir);
+                write_two_moment_renderer_no_go(
+                    &args.out,
+                    &repository_commit,
+                    repository_dirty,
+                    &reason,
+                )?;
+                println!("TWO-MOMENT RENDERER NO-GO: {reason}");
+                println!("EyeNet model was not loaded.");
+                println!("Results: {}", args.out.display());
+                return Ok(());
+            }
+        }
+    } else {
+        (Vec::new(), None)
+    };
     // Complete Phase 1.1 renderer feasibility before model bytes are even loaded, so
     // model outcomes can never influence its selected aperture range.
     let (luminance_cases, luminance_plan, luminance_renderer_no_go_reason) = if args.experiment
@@ -71,6 +102,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 results.extend(evaluate_cases(&mut model.net, luminance_cases)?);
                 suites_evaluated.push("luminance_match");
             }
+            Experiment::TwoMomentMatch => {
+                results.extend(evaluate_cases_repeated(&mut model.net, two_moment_cases)?);
+                suites_evaluated.push("two_moment_match");
+            }
             _ => {}
         }
     } else if args.experiment != Experiment::Phase0 {
@@ -98,6 +133,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Experiment::Phase0 => experiment::SUITE_VERSION,
             Experiment::Milestone1 => experiment::MILESTONE1_VERSION,
             Experiment::LuminanceMatch => experiment::LUMINANCE_MATCH_VERSION,
+            Experiment::TwoMomentMatch => experiment::TWO_MOMENT_VERSION,
         },
         generated_unix_s: generated_unix_s(),
         repository_commit,
@@ -114,6 +150,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         suites_evaluated,
         luminance_plan,
         luminance_renderer_no_go_reason,
+        two_moment_plan,
+        two_moment_renderer_no_go_reason: None,
         phase0_decision: decision,
         total_cases: results.len(),
         recognized_cases,
@@ -148,6 +186,21 @@ fn evaluate_cases(
     net: &mut sranibro_rs::ml::eye_net::EyeNet,
     cases: Vec<experiment::CaseDefinition>,
 ) -> Result<Vec<CaseResult>, Box<dyn Error>> {
+    evaluate_cases_impl(net, cases, false)
+}
+
+fn evaluate_cases_repeated(
+    net: &mut sranibro_rs::ml::eye_net::EyeNet,
+    cases: Vec<experiment::CaseDefinition>,
+) -> Result<Vec<CaseResult>, Box<dyn Error>> {
+    evaluate_cases_impl(net, cases, true)
+}
+
+fn evaluate_cases_impl(
+    net: &mut sranibro_rs::ml::eye_net::EyeNet,
+    cases: Vec<experiment::CaseDefinition>,
+    repeat_inference: bool,
+) -> Result<Vec<CaseResult>, Box<dyn Error>> {
     let mut results = Vec::with_capacity(cases.len());
     for definition in cases {
         let mut rendered = render_stereo(
@@ -160,6 +213,12 @@ fn evaluate_cases(
         let tensor = canonical_tensor(&rendered);
         let tensor_sha256 = tensor_sha256(&tensor);
         let raw = net.forward_one(&tensor);
+        let inference_repeat_raw = repeat_inference.then(|| net.forward_one(&tensor));
+        let inference_repeat_bits_match = inference_repeat_raw.map(|repeat| {
+            raw.iter()
+                .zip(repeat)
+                .all(|(first, second)| first.to_bits() == second.to_bits())
+        });
         let recognition = classify(raw, rendered.left.eye_like && rendered.right.eye_like);
         let case_id = case_id(&definition)?;
         println!(
@@ -179,6 +238,8 @@ fn evaluate_cases(
             rendered,
             tensor_sha256,
             raw,
+            inference_repeat_raw,
+            inference_repeat_bits_match,
             recognition,
         });
     }
@@ -197,6 +258,7 @@ enum Experiment {
     Phase0,
     Milestone1,
     LuminanceMatch,
+    TwoMomentMatch,
 }
 
 impl Experiment {
@@ -205,6 +267,7 @@ impl Experiment {
             Self::Phase0 => "phase0",
             Self::Milestone1 => "milestone1",
             Self::LuminanceMatch => "luminance-match",
+            Self::TwoMomentMatch => "two-moment-match",
         }
     }
 }
@@ -224,6 +287,7 @@ impl Args {
                         "phase0" => Experiment::Phase0,
                         "milestone1" => Experiment::Milestone1,
                         "luminance-match" => Experiment::LuminanceMatch,
+                        "two-moment-match" => Experiment::TwoMomentMatch,
                         value => return Err(format!("unknown experiment: {value}").into()),
                     }
                 }
@@ -241,6 +305,7 @@ impl Args {
                     Experiment::Phase0 => "research-output/synthetic-eye-phase0",
                     Experiment::Milestone1 => "research-output/synthetic-eye-milestone1",
                     Experiment::LuminanceMatch => "research-output/synthetic-eye-luminance-match",
+                    Experiment::TwoMomentMatch => "research-output/synthetic-eye-two-moment-match",
                 })
             }),
             experiment,
@@ -259,7 +324,7 @@ fn next_value(
 fn print_help() {
     println!(
         "SRanibro synthetic eye lab (research only)\n\n\
-         cargo run --release --features research-synthetic-eye-lab --bin synthetic-eye-lab -- \\\n+           --experiment <phase0|milestone1|luminance-match> --model <EyePrediction params> --out <directory>\n\n\
+         cargo run --release --features research-synthetic-eye-lab --bin synthetic-eye-lab -- \\\n+           --experiment <phase0|milestone1|luminance-match|two-moment-match> --model <EyePrediction params> --out <directory>\n\n\
          The lab is observational and cannot modify production settings."
     );
 }
@@ -320,5 +385,21 @@ mod tests {
             PathBuf::from("research-output/synthetic-eye-luminance-match")
         );
         assert_eq!(args.experiment, Experiment::LuminanceMatch);
+    }
+
+    #[test]
+    fn two_moment_match_has_an_independent_safe_default_output_directory() {
+        let args = Args::parse([
+            "--model".into(),
+            "model.params".into(),
+            "--experiment".into(),
+            "two-moment-match".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            args.out,
+            PathBuf::from("research-output/synthetic-eye-two-moment-match")
+        );
+        assert_eq!(args.experiment, Experiment::TwoMomentMatch);
     }
 }

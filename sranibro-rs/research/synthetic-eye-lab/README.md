@@ -33,6 +33,11 @@ cargo run --features research-synthetic-eye-lab --bin synthetic-eye-lab --offlin
   --model C:\path\to\00-0000.params_opencl.params `
   --out research-output\luminance-match-run
 
+cargo run --features research-synthetic-eye-lab --bin synthetic-eye-lab --offline -- `
+  --experiment two-moment-match `
+  --model C:\path\to\00-0000.params_opencl.params `
+  --out research-output\two-moment-run
+
 python research\synthetic-eye-lab\plot_results.py `
   research-output\milestone1-run
 ```
@@ -112,6 +117,33 @@ whether the observed B/C signs matched the preregistered rubric, and explicitly 
 any conservative post-hoc demotion caused by the absence of a preregistered residual
 effect-size threshold. It also records the infeasible near-closed aperture range rather
 than generalising the matched result into that untested regime.
+
+## Phase 1.2: two-moment aperture isolation
+
+The complete frozen contract is in
+[`PHASE1_2_PREREG.md`](PHASE1_2_PREREG.md). It was committed separately before
+suite implementation or Phase 1.2 model inference.
+
+`--experiment two-moment-match` first attempts to match both whole-image mean
+and population standard deviation by solving bounded skin and sclera levels for
+aperture indices 7..40. It requires the same valid set to cover at least 30 of
+34 points and contain both semantic reference indices 15 (half open) and 31
+(normal open). Preparation is repeated twice, and the fast solver's complete
+ordered u8 prediction must match an independent canonical render exactly.
+
+The frozen dual-reference instrument is infeasible in the current renderer:
+only indices 18..26 survive both references, so the required common set is 9 of
+34. The executable therefore writes `RENDERER_NO_GO`, records the deterministic
+exclusion reasons, and exits before reading the model file or running Phase 0.
+This is an instrument-feasibility result, not evidence for or against an EyeNet
+geometry response. The bounds, references, and thresholds are not relaxed to
+manufacture a passing run.
+
+The implementation retains the hypothetical GO-path analysis contract for
+review and testing: duplicate bit-exact inference, same-phase baseline,
+same-reference replay controls, signed Spearman, true-adjacent concordance, and
+the frozen `GO` / `NO_EVIDENCE` / `INCONCLUSIVE` precedence. It is unreachable
+under the current renderer gate and must not be invoked by bypassing that gate.
 
 ## Limits
 

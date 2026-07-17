@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::luminance::{self, LuminancePlan, MeanMatchRecord, PreparedPoint};
+use crate::moments::{self, PreparedTwoMoment, TwoMomentPlan, TwoMomentRecord};
 use crate::renderer::{EyeComponents, PhotometricTransform, StereoPolicy, SyntheticEyeSpec};
 
 pub const SUITE_VERSION: &str = "synthetic-eye-phase0-v1";
 pub const MILESTONE1_VERSION: &str = "synthetic-eye-milestone1-v1";
 pub const LUMINANCE_MATCH_VERSION: &str = luminance::VERSION;
+pub const TWO_MOMENT_VERSION: &str = moments::VERSION;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CaseDefinition {
@@ -20,6 +22,8 @@ pub struct CaseDefinition {
     pub factor_y: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_match: Option<MeanMatchRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_moment: Option<TwoMomentRecord>,
     pub left: SyntheticEyeSpec,
     pub right: SyntheticEyeSpec,
 }
@@ -319,6 +323,68 @@ pub fn luminance_match_cases() -> Result<(Vec<CaseDefinition>, LuminancePlan), S
     Ok((cases, prepared.plan))
 }
 
+pub fn two_moment_cases() -> Result<(Vec<CaseDefinition>, TwoMomentPlan), String> {
+    let prepared = moments::prepare()?;
+    Ok(two_moment_cases_from_prepared(prepared))
+}
+
+fn two_moment_cases_from_prepared(
+    prepared: PreparedTwoMoment,
+) -> (Vec<CaseDefinition>, TwoMomentPlan) {
+    let common = &prepared.plan.common_indices;
+    let mut cases = Vec::with_capacity(common.len() * 5);
+    append_two_moment(
+        &mut cases,
+        prepared.baseline,
+        common,
+        "two_moment_baseline",
+        "same_phase_default_photometric_baseline_s3",
+    );
+    for reference in prepared.references {
+        append_two_moment(
+            &mut cases,
+            reference.matched,
+            common,
+            &format!("two_moment_match_ref{}", reference.reference_index),
+            "aperture_with_mean_and_stddev_matched_to_semantic_reference_s1",
+        );
+        append_two_moment(
+            &mut cases,
+            reference.replay,
+            common,
+            &format!("two_moment_replay_ref{}", reference.reference_index),
+            "fixed_reference_geometry_replaying_paired_skin_sclera_trajectory_s2",
+        );
+    }
+    (cases, prepared.plan)
+}
+
+fn append_two_moment(
+    cases: &mut Vec<CaseDefinition>,
+    points: Vec<moments::PreparedPoint>,
+    common_indices: &[usize],
+    experiment: &str,
+    interpretation_scope: &str,
+) {
+    for point in points {
+        let index = point.record.source_aperture_index;
+        if !common_indices.contains(&index) {
+            continue;
+        }
+        let source_aperture = point.record.source_aperture;
+        let mut definition = case(
+            experiment,
+            &format!("source_aperture_{index:02}"),
+            interpretation_scope,
+            point.spec,
+            StereoPolicy::AnatomicalMirror,
+        );
+        set_x(&mut definition, "source_aperture", source_aperture);
+        definition.two_moment = Some(point.record);
+        cases.push(definition);
+    }
+}
+
 fn aperture_geometry_case(step: usize) -> CaseDefinition {
     let aperture = luminance::aperture(step);
     let mut spec = SyntheticEyeSpec::default();
@@ -383,6 +449,7 @@ fn case(
         factor_y_name: None,
         factor_y: None,
         mean_match: None,
+        two_moment: None,
         right: left.clone(),
         left,
     }
