@@ -341,16 +341,19 @@ fn merge_gaze_sample(dst: &mut GazeSample, src: GazeSample) {
     merge_eye_sample(&mut dst.right, src.right);
 }
 
-/// Blend the legacy openness/squeeze pose toward fully open in proportion to Custom
-/// Wide. A hard openness=1 hold would hide the whole closing ramp and then snap to a
-/// blink when the Wide release tail finally reaches zero. When the bilateral Wide values
-/// match, use one shared base openness so gaze-dependent L/R dips cannot split the pose.
-fn apply_custom_wide_pose(results: &mut [EyeResult; 2], use_custom: bool) {
+/// Blend the legacy openness/squeeze pose toward fully open in proportion to an ACTIVE
+/// Custom Wide gesture. The output envelope has a short release tail for visual smoothness;
+/// that tail must not pull a genuinely narrowed lid back toward 1.0 after the Wide gesture
+/// has ended. When the bilateral Wide values match, use one shared base openness so
+/// gaze-dependent L/R dips cannot split the pose.
+fn apply_custom_wide_pose(results: &mut [EyeResult; 2], use_custom: bool, active: [bool; 2]) {
     if !use_custom {
         return;
     }
     let bilateral = !results[0].blink
         && !results[1].blink
+        && active[0]
+        && active[1]
         && results[0].wide > 0.002
         && results[1].wide > 0.002
         && (results[0].wide - results[1].wide).abs() < 1.0e-4;
@@ -365,8 +368,8 @@ fn apply_custom_wide_pose(results: &mut [EyeResult; 2], use_custom: bool) {
         }
         return;
     }
-    for result in results {
-        if !result.blink && result.wide > 0.002 {
+    for (i, result) in results.iter_mut().enumerate() {
+        if active[i] && !result.blink && result.wide > 0.002 {
             let wide = result.wide.clamp(0.0, 1.0);
             let natural = result.openness.clamp(0.0, 1.0);
             result.openness = natural + wide * (1.0 - natural);
@@ -507,7 +510,7 @@ mod merge_tests {
         results[0].wide = 0.7;
         results[1].wide = 0.7;
 
-        apply_custom_wide_pose(&mut results, true);
+        apply_custom_wide_pose(&mut results, true, [true; 2]);
 
         assert!((results[0].openness - 0.94).abs() < 1.0e-6);
         assert!((results[1].openness - 0.94).abs() < 1.0e-6);
@@ -516,17 +519,47 @@ mod merge_tests {
     }
 
     #[test]
-    fn custom_wide_release_tail_does_not_hold_openness_at_one() {
+    fn custom_wide_release_tail_does_not_pull_narrowed_lids_open() {
         let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
         results[0].openness = 0.30;
         results[1].openness = 0.40;
         results[0].wide = 0.20;
         results[1].wide = 0.20;
 
-        apply_custom_wide_pose(&mut results, true);
+        apply_custom_wide_pose(&mut results, true, [false; 2]);
 
-        assert!((results[0].openness - 0.44).abs() < 1.0e-6);
-        assert!((results[1].openness - 0.44).abs() < 1.0e-6);
+        assert!((results[0].openness - 0.30).abs() < 1.0e-6);
+        assert!((results[1].openness - 0.40).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn inactive_wide_tail_does_not_open_partner_during_a_blink() {
+        let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        results[0].openness = 0.0;
+        results[0].blink = true;
+        results[1].openness = 0.35;
+        results[0].wide = 0.20;
+        results[1].wide = 0.20;
+
+        apply_custom_wide_pose(&mut results, true, [false; 2]);
+
+        assert_eq!(results[0].openness, 0.0);
+        assert_eq!(results[1].openness, 0.35);
+    }
+
+    #[test]
+    fn active_wide_still_keeps_partner_open_during_a_blink() {
+        let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        results[0].openness = 0.0;
+        results[0].blink = true;
+        results[1].openness = 0.82;
+        results[0].wide = 0.0;
+        results[1].wide = 0.70;
+
+        apply_custom_wide_pose(&mut results, true, [true; 2]);
+
+        assert_eq!(results[0].openness, 0.0);
+        assert!((results[1].openness - 0.946).abs() < 1.0e-6);
     }
 }
 
@@ -992,6 +1025,7 @@ impl Pipeline {
                 // while SRanipal remains selected. This gives us same-frame A/B telemetry
                 // before the user entrusts VRCFT output to the new model.
                 let mut custom = [None, None];
+                let mut custom_pose_active = [false; 2];
                 let mut custom_fresh = false;
                 if t_em.wide_loaded.load(Ordering::Relaxed) {
                     let raw = *t_em.wide_raw.lock().unwrap();
@@ -1016,6 +1050,7 @@ impl Pipeline {
                         state.tuning.wide_requires_both,
                     );
                     let wide_diag = custom_wide_state.diag();
+                    custom_pose_active = wide_diag.active;
                     *t_em.wide_ready.lock().unwrap() = wide_diag.ready;
                     *t_em.wide_bootstrap_seen.lock().unwrap() = wide_diag.bootstrap_seen;
                     custom_fresh = now.duration_since(wide_fresh_at) <= Duration::from_millis(500)
@@ -1048,7 +1083,7 @@ impl Pipeline {
                         results[i].wide = 0.0;
                     }
                 }
-                apply_custom_wide_pose(&mut results, use_custom);
+                apply_custom_wide_pose(&mut results, use_custom, custom_pose_active);
                 // Brow: blink-gated EMA + baseline of the ML thread's raw brow, per eye.
                 // `is_new` advances the EMA once per inference (not per 120Hz tick); the
                 // result is None until the first open inference, so we never emit a
