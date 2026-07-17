@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tensor {
     pub name: String,
     pub shape: Vec<i64>,
@@ -85,10 +85,13 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parse a TVM params file into ordered tensors.
-pub fn parse(path: &str) -> io::Result<Vec<Tensor>> {
-    let data = std::fs::read(path)?;
-    let mut r = Reader { b: &data, p: 0 };
+/// Parse an already-read TVM params buffer into ordered tensors.
+///
+/// The byte-oriented seam lets offline research tools fingerprint the exact bytes they
+/// parse. Runtime callers may keep using [`parse`], which remains one file read followed
+/// by this function.
+pub fn parse_bytes(data: &[u8]) -> io::Result<Vec<Tensor>> {
+    let mut r = Reader { b: data, p: 0 };
 
     let dbg = std::env::var("TVM_DEBUG").is_ok();
     let magic = r.u64()?;
@@ -166,10 +169,91 @@ pub fn parse(path: &str) -> io::Result<Vec<Tensor>> {
     Ok(out)
 }
 
+/// Parse a TVM params file into ordered tensors.
+pub fn parse(path: &str) -> io::Result<Vec<Tensor>> {
+    let data = std::fs::read(path)?;
+    parse_bytes(&data)
+}
+
+/// Parse an already-read buffer into a name -> tensor map.
+pub fn parse_map_bytes(data: &[u8]) -> io::Result<HashMap<String, Tensor>> {
+    Ok(parse_bytes(data)?
+        .into_iter()
+        .map(|t| (t.name.clone(), t))
+        .collect())
+}
+
 /// Parse into a name -> tensor map.
 pub fn parse_map(path: &str) -> io::Result<HashMap<String, Tensor>> {
     Ok(parse(path)?
         .into_iter()
         .map(|t| (t.name.clone(), t))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_u64(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn fixture() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u64(&mut out, 0xF7E5_8D4F_0504_9CB7);
+        push_u64(&mut out, 0);
+        push_u64(&mut out, 1);
+        push_u64(&mut out, 6);
+        out.extend_from_slice(b"weight");
+        push_u64(&mut out, 1);
+        push_u64(&mut out, 0xDD5E_40F0_96B4_A13F);
+        push_u64(&mut out, 0);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 1);
+        out.push(2);
+        out.push(32);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        push_u64(&mut out, 2);
+        push_u64(&mut out, 8);
+        out.extend_from_slice(&0.25f32.to_le_bytes());
+        out.extend_from_slice(&(-0.5f32).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn byte_parser_reads_a_deterministic_synthetic_fixture() {
+        let tensors = parse_bytes(&fixture()).expect("parse fixture");
+        assert_eq!(
+            tensors,
+            vec![Tensor {
+                name: "weight".into(),
+                shape: vec![2],
+                data: vec![0.25, -0.5],
+            }]
+        );
+    }
+
+    #[test]
+    fn path_and_exact_byte_parse_are_identical() {
+        let bytes = fixture();
+        let path = std::env::temp_dir().join(format!(
+            "sranibro-tvm-parse-parity-{}-{}.params",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &bytes).expect("write fixture");
+        let from_path = parse(path.to_str().unwrap()).expect("path parse");
+        let from_bytes = parse_bytes(&bytes).expect("byte parse");
+        let _ = std::fs::remove_file(path);
+        assert_eq!(from_path, from_bytes);
+    }
 }

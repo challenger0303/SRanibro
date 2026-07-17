@@ -7,9 +7,22 @@ description = "SRanibro — all-Rust, distribution-safe eye/face tracker (rewrit
 # matrixmultiply: pure-Rust BLIS-style sgemm with runtime AVX/FMA detection.
 # No C/system deps -> distribution-safe, and turns the conv hot path from a
 # naive 2.6 GMAC/s loop into a vectorized GEMM. (egui/openvr come in later keystones.)
+[features]
+default = []
+# Offline research tooling only. The normal application does not build this target or
+# activate its JSON / model-fingerprint dependencies.
+research-synthetic-eye-lab = ["dep:serde_json", "dep:sha2"]
+
+[[bin]]
+name = "synthetic-eye-lab"
+path = "research/synthetic-eye-lab/main.rs"
+required-features = ["research-synthetic-eye-lab"]
+
 [dependencies]
 matrixmultiply = "0.3"
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
 toml = "0.8"
 # EyeChip auth handshake (HMAC-MD5). Pure-Rust, tiny, runs once at startup.
 hmac = "0.12"
