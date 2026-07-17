@@ -121,7 +121,7 @@ The search is finite and deterministic:
    ```text
    skin    = best_skin    + k_skin    * d_skin    / 4
    sclera = best_sclera + k_sclera * d_sclera / 4
-   k_skin, k_sclera in -8..8
+   k_skin, k_sclera in -8..=8 (both endpoints inclusive)
    ```
 
    Out-of-bound candidates are discarded. The previous winner and exact default
@@ -143,6 +143,20 @@ definitions, predicted hashes, and canonical hashes must be identical.
 Renderer checks run before the model is loaded. They are divided into global
 failures and per-index exclusions so no implementation judgment can alter the
 denominator.
+
+The decisional renderer predicates are pinned to the existing implementation in
+the preregistration tree and may not be redefined for Phase 1.2:
+
+- eye-like means `SyntheticEyeSpec::validate()` in `renderer.rs`;
+- frame contact means `ImageCovariates::frame_truncated` as produced by
+  `renderer::frame_truncated()`;
+- saturation fraction means the number of canonical u8 pixels exactly equal to
+  either `0` or `255`, divided by the 10,000 image pixels, as implemented by
+  `renderer::pixel_covariates()`;
+- finite covariates means that `mean`, `stddev`, `edge_energy`,
+  `saturation_fraction`, `visible_area_fraction`,
+  `measured_aperture_geometry`, and `measured_aperture_raster` are all finite,
+  matching the existing Phase 1.1 renderer guard.
 
 ### Global `RENDERER_NO_GO`
 
@@ -184,11 +198,13 @@ An original index is marked renderer-invalid if any paired relevant case in
   step.
 
 Trajectory discontinuity is computed independently for skin and sclera for
-each `S1_r` over all 33 original consecutive steps before any exclusion. Exact
-zero steps are removed. If none remain, the trajectory passes. Otherwise the
-median is computed once; for an even count it is the arithmetic mean of the two
-middle sorted values. A step strictly greater than five times that median
-invalidates only its higher-index endpoint. The median is never recomputed.
+each `S1_r` over all 33 original consecutive absolute step magnitudes
+`abs(p(i+1) - p(i))` before any exclusion. Exact zero magnitudes are removed. If
+none remain, the trajectory passes. Otherwise the median is computed once over
+the remaining absolute magnitudes; for an even count it is the arithmetic mean
+of the two middle sorted values. An absolute step magnitude strictly greater
+than five times that median invalidates only its higher-index endpoint. The
+median is never recomputed.
 `S3` has constant default parameters and therefore passes trivially. `S2`
 replays the paired `S1` trajectory and is exempt from duplicate trajectory
 invalidation.
