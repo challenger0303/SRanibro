@@ -159,9 +159,54 @@ polarity-preserving, and unrestricted mathematical domains.
 
 Phase 1.3A has no model-facing pass threshold. Its distances and conditioning
 are instrument diagnostics only. A later, separately preregistered symmetric
-2x2 model study may use D0 adjacent-pair summaries after the atlas artifact is
-sealed. XR5/VR4 recordings remain excluded until that synthetic classification
-is also sealed.
+2x2 model study may use the sealed D0 candidate stream after the atlas artifact
+is sealed. XR5/VR4 recordings remain excluded until that synthetic
+classification is also sealed.
+
+## Phase 1.3: two-target geometry study
+
+The frozen decision and confirmation contract is in
+[`PHASE1_3_PREREG.md`](PHASE1_3_PREREG.md), with the pre-inference artifact
+sealing clarification in
+[`PHASE1_3_AMENDMENT1.md`](PHASE1_3_AMENDMENT1.md). Phase 1.3 uses the sealed
+D0 atlas to select two separated whole-image-mean targets for each retained
+gap-four aperture pair. At each target, lower- and higher-aperture images are
+matched to the same post-u8 mean and population standard deviation within
+0.001 gray per component. Local moment controllability, canonical bytes,
+geometry fields, and mirroring are gated before model bytes are read.
+
+The global mean axis retains 29 of 30 pairs. Pair 36--40 is a frozen
+renderer-only exclusion because its feasible mean range is below the 7-gray
+instrument gate. Odd-index pairs form the 15-pair decision set; retained
+even-index pairs form the independent 14-pair confirmation set. Both stages
+rebuild the complete renderer plan twice and use the same pinned EyeNet model.
+
+Recorded runs use the standalone binary:
+
+```powershell
+cargo run --release --features research-synthetic-eye-lab `
+  --bin synthetic-eye-phase13 -- decision `
+  --atlas research-output\moment-atlas-49e13f0 `
+  --model C:\path\to\00-0000.params_opencl.params `
+  --out research-output\phase13-decision
+
+cargo run --release --features research-synthetic-eye-lab `
+  --bin synthetic-eye-phase13 -- confirmation `
+  --atlas research-output\moment-atlas-49e13f0 `
+  --model C:\path\to\00-0000.params_opencl.params `
+  --decision research-output\phase13-decision `
+  --decision-seal <decision-manifest-sha256> `
+  --out research-output\phase13-confirmation
+```
+
+Preserve the decision manifest SHA-256 printed by the first command and pass it
+unchanged as `--decision-seal`. Confirmation rejects a decision whose current
+manifest no longer matches that external seal.
+
+The primary result asks whether both within-target geometry effects are
+positive while their target-dependent modulation is flat. It remains a
+synthetic renderer-family result. Real XR5 or VR4 frames enter only under a
+later transfer-audit preregistration.
 
 ## Limits
 

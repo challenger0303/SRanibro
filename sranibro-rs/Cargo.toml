@@ -23,6 +23,11 @@ name = "synthetic-eye-atlas"
 path = "research/synthetic-eye-lab/atlas_main.rs"
 required-features = ["research-synthetic-eye-lab"]
 
+[[bin]]
+name = "synthetic-eye-phase13"
+path = "research/synthetic-eye-lab/phase13_main.rs"
+required-features = ["research-synthetic-eye-lab"]
+
 [dependencies]
 matrixmultiply = "0.3"
 serde = { version = "1", features = ["derive"] }
