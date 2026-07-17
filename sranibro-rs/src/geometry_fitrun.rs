@@ -14,7 +14,10 @@ use std::thread::JoinHandle;
 
 use crate::core::types::{DespeckleParams, FlattenParams, MlGeometry};
 use crate::geometry_calib::{GeometryDataset, SampleFamily, SampleKind};
-use crate::geometry_discovery::{estimate_motion_geometry, MotionFrame, MotionGeometryEstimate};
+use crate::geometry_discovery::{
+    estimate_appearance_geometry, estimate_motion_geometry, AppearanceGeometryEstimate,
+    MotionFrame, MotionGeometryEstimate,
+};
 use crate::ml::{brightness, eye_net::EyeNet, preprocess, tvm_params};
 
 const LOG_CAP: usize = 80;
@@ -82,6 +85,10 @@ pub struct GeometryFitResult {
     /// search, and it never sees the untouched holdout.
     pub motion_seed: Option<MotionGeometryEstimate>,
     pub candidate_from_motion_seed: bool,
+    /// EyeNet-independent absolute seed derived from repeated relaxed-neutral pupil
+    /// centres and aperture axes. Like the motion seed, it never sees the holdout.
+    pub appearance_seed: Option<AppearanceGeometryEstimate>,
+    pub candidate_from_appearance_seed: bool,
     pub accepted: bool,
     pub reason: String,
 }
@@ -390,6 +397,7 @@ struct Scored {
     geometry: [MlGeometry; 2],
     metrics: GeometryMetrics,
     motion_seed: bool,
+    appearance_seed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -468,6 +476,42 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
                 None
             }
         };
+
+    let appearance_seed = match estimate_dataset_appearance_seed(&inputs.dataset, inputs.baseline) {
+        Ok(estimate) => {
+            log(&shared, format!("[appearance seed] {}", estimate.reason));
+            for (eye, name) in [(0usize, "L"), (1usize, "R")] {
+                let value = &estimate.eyes[eye];
+                let descriptor = value.descriptor;
+                let g = value.geometry;
+                log(
+                        &shared,
+                        format!(
+                            "[appearance seed {name}] pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} spread {:.1}px/{:.1}deg crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
+                            descriptor.pupil_center_px[0],
+                            descriptor.pupil_center_px[1],
+                            descriptor.pupil_contrast,
+                            descriptor.aperture_angle_deg,
+                            descriptor.block_center_spread_px,
+                            descriptor.block_angle_spread_deg,
+                            g.crop_left,
+                            g.crop_right,
+                            g.crop_top,
+                            g.crop_bottom,
+                            g.rotate_deg,
+                        ),
+                    );
+            }
+            Some(estimate)
+        }
+        Err(message) => {
+            log(
+                &shared,
+                format!("[appearance seed skipped] {message}; local ML search remains available"),
+            );
+            None
+        }
+    };
 
     log(
         &shared,
@@ -646,6 +690,13 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
     if motion_seed_geometry.is_some() {
         work_total += train3.len();
     }
+    let appearance_seed_geometry = appearance_seed
+        .as_ref()
+        .filter(|estimate| estimate.search_eligible && estimate.geometry != inputs.baseline)
+        .map(|estimate| estimate.geometry);
+    if appearance_seed_geometry.is_some() {
+        work_total += train3.len();
+    }
     let mut stage3 = evaluate_set(
         &shared,
         &cancel,
@@ -685,6 +736,37 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
                 geometry,
                 metrics,
                 motion_seed: true,
+                appearance_seed: false,
+            });
+        }
+    }
+    if let Some(geometry) = appearance_seed_geometry {
+        log(
+            &shared,
+            "[search 3/3] evaluating the independent neutral-appearance seed",
+        );
+        let metrics = evaluate_candidate(
+            &mut net,
+            &prepared,
+            &train3,
+            geometry,
+            inputs.mirrors,
+            &cancel,
+        );
+        work_done += train3.len();
+        progress(
+            &shared,
+            "appearance-seed validation",
+            work_done.min(work_total),
+            work_total,
+        );
+        if metrics.score.is_finite() {
+            stage3.push(Scored {
+                params: SearchParams::default(),
+                geometry,
+                metrics,
+                motion_seed: false,
+                appearance_seed: true,
             });
         }
     }
@@ -693,7 +775,9 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
     }
     let baseline_train = stage3
         .iter()
-        .find(|entry| entry.params == SearchParams::default() && !entry.motion_seed)
+        .find(|entry| {
+            entry.params == SearchParams::default() && !entry.motion_seed && !entry.appearance_seed
+        })
         .map(|entry| entry.metrics.clone())
         .unwrap_or_else(|| baseline2.clone());
     stage3.retain(|entry| admissible(&entry.metrics, &baseline_train));
@@ -745,7 +829,7 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         &best.metrics,
         &baseline_holdout,
         &candidate_holdout,
-        best.params == SearchParams::default() && !best.motion_seed,
+        best.params == SearchParams::default() && !best.motion_seed && !best.appearance_seed,
         flat_objective,
     );
     let improvement = candidate_holdout.score - baseline_holdout.score;
@@ -759,6 +843,8 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         holdout_improvement: improvement,
         motion_seed,
         candidate_from_motion_seed: best.motion_seed,
+        appearance_seed,
+        candidate_from_appearance_seed: best.appearance_seed,
         accepted,
         reason,
     };
@@ -1688,6 +1774,60 @@ fn best_audit_case(
         .unwrap_or(0)
 }
 
+fn estimate_dataset_appearance_seed(
+    dataset: &GeometryDataset,
+    baseline: [MlGeometry; 2],
+) -> Result<AppearanceGeometryEstimate, String> {
+    // Keep the spatial detector independent from adaptive brightness and user filter
+    // tuning. The normal ML evaluation below still uses the captured live pipeline.
+    let despeckle = DespeckleParams::default();
+    let flatten = FlattenParams::default();
+    let selected = dataset
+        .samples
+        .iter()
+        .filter(|sample| !sample.kind.is_holdout() && sample.kind == SampleKind::Neutral)
+        .collect::<Vec<_>>();
+    let left_owned = selected
+        .iter()
+        .map(|sample| {
+            let (width, height) = sample.left_size;
+            let pixels =
+                preprocess::despeckle(&sample.left, width as usize, height as usize, &despeckle);
+            let pixels = preprocess::flatten(&pixels, width as usize, height as usize, &flatten);
+            (sample.phase_index, width, height, pixels)
+        })
+        .collect::<Vec<_>>();
+    let right_owned = selected
+        .iter()
+        .map(|sample| {
+            let (width, height) = sample.right_size;
+            let pixels =
+                preprocess::despeckle(&sample.right, width as usize, height as usize, &despeckle);
+            let pixels = preprocess::flatten(&pixels, width as usize, height as usize, &flatten);
+            (sample.phase_index, width, height, pixels)
+        })
+        .collect::<Vec<_>>();
+    let left = left_owned
+        .iter()
+        .map(|(group, width, height, pixels)| MotionFrame {
+            group: *group,
+            width: *width,
+            height: *height,
+            pixels,
+        })
+        .collect::<Vec<_>>();
+    let right = right_owned
+        .iter()
+        .map(|(group, width, height, pixels)| MotionFrame {
+            group: *group,
+            width: *width,
+            height: *height,
+            pixels,
+        })
+        .collect::<Vec<_>>();
+    estimate_appearance_geometry(&left, &right, baseline)
+}
+
 fn estimate_dataset_motion_seed(
     dataset: &GeometryDataset,
     baseline: [MlGeometry; 2],
@@ -1747,7 +1887,7 @@ fn estimate_dataset_motion_seed(
 }
 
 fn scored_distance(left: &Scored, right: &Scored) -> f32 {
-    if !left.motion_seed && !right.motion_seed {
+    if !left.motion_seed && !right.motion_seed && !left.appearance_seed && !right.appearance_seed {
         return left.params.distance(right.params);
     }
     let mut squared = 0.0f32;
@@ -1811,6 +1951,7 @@ fn evaluate_set(
                 geometry,
                 metrics,
                 motion_seed: false,
+                appearance_seed: false,
             });
         }
     }

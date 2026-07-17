@@ -1,4 +1,4 @@
-//! Development-only positive control for the XR5 motion-geometry initializer.
+//! Development-only positive control for the XR5 absolute-geometry initializers.
 //!
 //! It reads the already-authorized local `blink_negative` recordings, reverses the
 //! capture writer's right-eye storage mirror, and reports only aggregate geometry.  It
@@ -10,7 +10,9 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use sranibro_rs::core::types::{DespeckleParams, FlattenParams};
-use sranibro_rs::geometry_discovery::{estimate_motion_geometry, MotionFrame};
+use sranibro_rs::geometry_discovery::{
+    estimate_appearance_geometry, estimate_motion_geometry, MotionFrame,
+};
 use sranibro_rs::ml::preprocess;
 
 struct GrayFrame {
@@ -45,8 +47,8 @@ fn run() -> Result<(), String> {
     println!("sessions={}", sessions.len());
     println!("production_config_changed=false");
     for (session_index, session) in sessions.iter().enumerate() {
-        let mut left = load_blink_side(session, 'l')?;
-        let mut right = load_blink_side(session, 'r')?;
+        let mut left = load_label_side(session, "blink_negative", 'l')?;
+        let mut right = load_label_side(session, "blink_negative", 'r')?;
         // `wide_calib` mirrors right PNGs only for storage. The live geometry capture
         // sees the original camera orientation, so reverse that exact operation here.
         for frame in &mut right {
@@ -100,6 +102,48 @@ fn run() -> Result<(), String> {
                 );
             }
         }
+
+        let mut neutral_left = load_label_side(session, "neutral_center", 'l')?;
+        let mut neutral_right = load_label_side(session, "neutral_center", 'r')?;
+        for frame in &mut neutral_right {
+            mirror_horizontal(
+                &mut frame.pixels,
+                frame.width as usize,
+                frame.height as usize,
+            );
+        }
+        preprocess_frames(&mut neutral_left);
+        preprocess_frames(&mut neutral_right);
+        let neutral_left_refs = blocked_frame_refs(&neutral_left, 4);
+        let neutral_right_refs = blocked_frame_refs(&neutral_right, 4);
+        let estimate =
+            estimate_appearance_geometry(&neutral_left_refs, &neutral_right_refs, baseline)?;
+        println!(
+            "session_{session_index:04} neutral appearance confidence {:.1}% eligible={} {}",
+            estimate.confidence * 100.0,
+            estimate.search_eligible,
+            estimate.reason
+        );
+        for (eye, name) in [(0usize, "L"), (1usize, "R")] {
+            let value = &estimate.eyes[eye];
+            let descriptor = value.descriptor;
+            let g = value.geometry;
+            println!(
+                "  {name} pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} anisotropy {:.2} spread {:.1}px/{:.1}deg crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
+                descriptor.pupil_center_px[0],
+                descriptor.pupil_center_px[1],
+                descriptor.pupil_contrast,
+                descriptor.aperture_angle_deg,
+                descriptor.aperture_anisotropy,
+                descriptor.block_center_spread_px,
+                descriptor.block_angle_spread_deg,
+                g.crop_left,
+                g.crop_right,
+                g.crop_top,
+                g.crop_bottom,
+                g.rotate_deg,
+            );
+        }
     }
     Ok(())
 }
@@ -137,8 +181,8 @@ fn parse_wide_data() -> Result<PathBuf, String> {
     wide_data.ok_or_else(|| "missing --wide-data <path>".into())
 }
 
-fn load_blink_side(session: &Path, side: char) -> Result<Vec<GrayFrame>, String> {
-    let directory = session.join("images").join("blink_negative");
+fn load_label_side(session: &Path, label: &str, side: char) -> Result<Vec<GrayFrame>, String> {
+    let directory = session.join("images").join(label);
     let needle = format!("_{side}_");
     let mut paths = std::fs::read_dir(&directory)
         .map_err(|error| format!("read {}: {error}", directory.display()))?
@@ -154,12 +198,26 @@ fn load_blink_side(session: &Path, side: char) -> Result<Vec<GrayFrame>, String>
     paths.sort();
     if paths.len() < 8 {
         return Err(format!(
-            "{} contains only {} {side}-eye blink frames",
+            "{} contains only {} {side}-eye frames",
             directory.display(),
             paths.len()
         ));
     }
     paths.iter().map(|path| decode_gray_png(path)).collect()
+}
+
+fn blocked_frame_refs<'a>(frames: &'a [GrayFrame], blocks: usize) -> Vec<MotionFrame<'a>> {
+    let chunk = frames.len().div_ceil(blocks.max(1)).max(1);
+    frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| MotionFrame {
+            group: index / chunk,
+            width: frame.width,
+            height: frame.height,
+            pixels: &frame.pixels,
+        })
+        .collect()
 }
 
 fn decode_gray_png(path: &Path) -> Result<GrayFrame, String> {

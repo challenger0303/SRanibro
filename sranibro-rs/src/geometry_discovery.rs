@@ -15,6 +15,17 @@ const MIN_GROUP_FRAMES: usize = 8;
 const MIN_MOTION_PAIRS: usize = 20;
 const MIN_EFFECTIVE_PIXELS: usize = 64;
 
+// Absolute appearance references measured from two independent XR5 recordings after
+// undoing the capture writer's storage-only right mirror. Unlike the blink envelope,
+// the pupil centre and aperture axis repeated closely across both sessions. Geometry
+// below is expressed in the live, raw 200x200 camera coordinates.
+const APPEARANCE_PUPIL_REFERENCE: [[f64; 2]; 2] = [[71.0, 100.0], [127.0, 99.0]];
+const APPEARANCE_AXIS_REFERENCE_DEG: [f64; 2] = [13.1, -5.1];
+const XR5_PRESET_CENTER_PX: [[f64; 2]; 2] = [[60.0, 100.0], [140.0, 100.0]];
+const XR5_PRESET_ROTATION_DEG: [f64; 2] = [-30.0, 30.0];
+const XR5_PRESET_WIDTH_PX: f64 = 120.0;
+const XR5_PRESET_HEIGHT_PX: f64 = 140.0;
+
 /// Non-reconstructable aggregate blink-motion statistics in the 100x100 EyeNet input.
 ///
 /// These are the mean and covariance of the motion envelope produced by the validated
@@ -59,6 +70,37 @@ pub struct MotionGeometryEstimate {
     pub confidence: f32,
     /// A seed can enter the ML search only when the raw motion evidence and binocular
     /// symmetry are plausible.  It is still never applied without the normal holdout.
+    pub search_eligible: bool,
+    pub reason: String,
+}
+
+/// Aggregate, non-reconstructable neutral-eye appearance measurements. The detector
+/// operates on per-block median frames; no raw image is retained in this result.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AppearanceDescriptor {
+    pub pupil_center_px: [f32; 2],
+    pub pupil_contrast: f32,
+    pub aperture_angle_deg: f32,
+    pub aperture_anisotropy: f32,
+    pub block_center_spread_px: f32,
+    pub block_angle_spread_deg: f32,
+    pub blocks: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EyeAppearanceGeometry {
+    pub descriptor: AppearanceDescriptor,
+    pub geometry: MlGeometry,
+}
+
+/// Absolute XR5 crop/rotation hypothesis derived from the pupil and eye-aperture axis
+/// in labelled relaxed-neutral frames. It is independent of EyeNet and of the active
+/// crop/rotation; the active geometry contributes only its explicit mirror state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppearanceGeometryEstimate {
+    pub eyes: [EyeAppearanceGeometry; 2],
+    pub geometry: [MlGeometry; 2],
+    pub confidence: f32,
     pub search_eligible: bool,
     pub reason: String,
 }
@@ -176,6 +218,369 @@ pub fn estimate_motion_geometry(
         search_eligible,
         reason,
     })
+}
+
+/// Estimate an absolute XR5 geometry seed from labelled relaxed-neutral frames.
+/// Frames must retain phase indices in `group`; at least two independent OPEN blocks
+/// are required so a transient gaze or glint cannot silently become geometry.
+pub fn estimate_appearance_geometry(
+    left: &[MotionFrame<'_>],
+    right: &[MotionFrame<'_>],
+    baseline: [MlGeometry; 2],
+) -> Result<AppearanceGeometryEstimate, String> {
+    if left.first().map(|frame| (frame.width, frame.height)) != Some((200, 200))
+        || right.first().map(|frame| (frame.width, frame.height)) != Some((200, 200))
+    {
+        return Err("appearance geometry requires XR5 stereo 200x200 frames".into());
+    }
+    let descriptors = [
+        appearance_descriptor(left, 0)?,
+        appearance_descriptor(right, 1)?,
+    ];
+    let geometry = std::array::from_fn(|eye| {
+        appearance_geometry_from_descriptor(descriptors[eye], baseline[eye], eye)
+    });
+
+    let min_contrast = descriptors
+        .iter()
+        .map(|descriptor| descriptor.pupil_contrast)
+        .reduce(f32::min)
+        .unwrap_or(0.0);
+    let max_center_spread = descriptors
+        .iter()
+        .map(|descriptor| descriptor.block_center_spread_px)
+        .reduce(f32::max)
+        .unwrap_or(f32::INFINITY);
+    let max_angle_spread = descriptors
+        .iter()
+        .map(|descriptor| descriptor.block_angle_spread_deg)
+        .reduce(f32::max)
+        .unwrap_or(f32::INFINITY);
+    let min_anisotropy = descriptors
+        .iter()
+        .map(|descriptor| descriptor.aperture_anisotropy)
+        .reduce(f32::min)
+        .unwrap_or(0.0);
+    let rotation_symmetry = (geometry[0].rotate_deg + geometry[1].rotate_deg).abs();
+    let max_reference_shift = descriptors
+        .iter()
+        .enumerate()
+        .map(|(eye, descriptor)| {
+            let dx = descriptor.pupil_center_px[0] as f64 - APPEARANCE_PUPIL_REFERENCE[eye][0];
+            let dy = descriptor.pupil_center_px[1] as f64 - APPEARANCE_PUPIL_REFERENCE[eye][1];
+            dx.hypot(dy) as f32
+        })
+        .reduce(f32::max)
+        .unwrap_or(f32::INFINITY);
+
+    let contrast_confidence = (min_contrast / 35.0).clamp(0.0, 1.0);
+    let repeat_confidence = (1.0 - max_center_spread / 12.0)
+        .clamp(0.0, 1.0)
+        .min((1.0 - max_angle_spread / 10.0).clamp(0.0, 1.0));
+    let shape_confidence = ((min_anisotropy - 1.5) / 2.5).clamp(0.0, 1.0);
+    let stereo_confidence = (1.0 - rotation_symmetry / 15.0)
+        .clamp(0.0, 1.0)
+        .min((1.0 - max_reference_shift / 40.0).clamp(0.0, 1.0));
+    let confidence = (contrast_confidence
+        * repeat_confidence.sqrt()
+        * shape_confidence.sqrt()
+        * stereo_confidence.sqrt())
+    .clamp(0.0, 1.0);
+    let search_eligible = descriptors.iter().all(|descriptor| descriptor.blocks >= 2)
+        && min_contrast >= 18.0
+        && max_center_spread <= 10.0
+        && max_angle_spread <= 8.0
+        && min_anisotropy >= 2.2
+        && rotation_symmetry <= 12.0
+        && max_reference_shift <= 30.0
+        && confidence >= 0.45;
+    let reason = if search_eligible {
+        format!(
+            "neutral appearance seed ready (confidence {:.0}%, pupil contrast {:.1}, block spread {:.1}px/{:.1}deg)",
+            confidence * 100.0,
+            min_contrast,
+            max_center_spread,
+            max_angle_spread
+        )
+    } else {
+        format!(
+            "neutral appearance seed is diagnostic only (confidence {:.0}%, pupil contrast {:.1}, block spread {:.1}px/{:.1}deg, rotation symmetry {:.1}deg)",
+            confidence * 100.0,
+            min_contrast,
+            max_center_spread,
+            max_angle_spread,
+            rotation_symmetry
+        )
+    };
+    Ok(AppearanceGeometryEstimate {
+        eyes: std::array::from_fn(|eye| EyeAppearanceGeometry {
+            descriptor: descriptors[eye],
+            geometry: geometry[eye],
+        }),
+        geometry,
+        confidence,
+        search_eligible,
+        reason,
+    })
+}
+
+fn appearance_descriptor(
+    frames: &[MotionFrame<'_>],
+    eye: usize,
+) -> Result<AppearanceDescriptor, String> {
+    if frames.len() < 2 * MIN_GROUP_FRAMES {
+        return Err("not enough relaxed-neutral appearance frames".into());
+    }
+    let width = frames[0].width as usize;
+    let height = frames[0].height as usize;
+    if width != 200 || height != 200 {
+        return Err("neutral appearance frames are not 200x200".into());
+    }
+    if frames.iter().any(|frame| {
+        frame.width as usize != width
+            || frame.height as usize != height
+            || frame.pixels.len() < width * height
+    }) {
+        return Err("neutral appearance frames do not share one complete image shape".into());
+    }
+    let mut groups = std::collections::BTreeMap::<usize, Vec<&MotionFrame<'_>>>::new();
+    for frame in frames {
+        groups.entry(frame.group).or_default().push(frame);
+    }
+    let mut blocks = Vec::new();
+    for group in groups.values() {
+        if group.len() < MIN_GROUP_FRAMES {
+            continue;
+        }
+        let median = median_frame(group, width, height);
+        let (center, contrast) = detect_pupil(&median, width, height, eye)?;
+        let (angle, anisotropy) = aperture_axis(&median, width, height, center)?;
+        blocks.push((center, contrast, angle, anisotropy));
+    }
+    if blocks.len() < 2 {
+        return Err("fewer than two independent relaxed-neutral blocks were available".into());
+    }
+    let center = [
+        median_f64(blocks.iter().map(|block| block.0[0]).collect()),
+        median_f64(blocks.iter().map(|block| block.0[1]).collect()),
+    ];
+    let angle = median_f64(blocks.iter().map(|block| block.2).collect());
+    let center_spread = blocks
+        .iter()
+        .map(|block| (block.0[0] - center[0]).hypot(block.0[1] - center[1]))
+        .fold(0.0f64, f64::max);
+    let angle_spread = blocks
+        .iter()
+        .map(|block| (block.2 - angle).abs())
+        .fold(0.0f64, f64::max);
+    Ok(AppearanceDescriptor {
+        pupil_center_px: center.map(|value| value as f32),
+        pupil_contrast: blocks
+            .iter()
+            .map(|block| block.1)
+            .fold(f64::INFINITY, f64::min) as f32,
+        aperture_angle_deg: angle as f32,
+        aperture_anisotropy: blocks
+            .iter()
+            .map(|block| block.3)
+            .fold(f64::INFINITY, f64::min) as f32,
+        block_center_spread_px: center_spread as f32,
+        block_angle_spread_deg: angle_spread as f32,
+        blocks: blocks.len(),
+    })
+}
+
+fn median_frame(frames: &[&MotionFrame<'_>], width: usize, height: usize) -> Vec<u8> {
+    let mut output = vec![0u8; width * height];
+    let mut scratch = Vec::with_capacity(frames.len());
+    for (pixel, value) in output.iter_mut().enumerate() {
+        scratch.clear();
+        scratch.extend(frames.iter().map(|frame| frame.pixels[pixel]));
+        scratch.sort_unstable();
+        *value = scratch[quantile_index(scratch.len(), 1, 2)];
+    }
+    output
+}
+
+fn detect_pupil(
+    image: &[u8],
+    width: usize,
+    height: usize,
+    eye: usize,
+) -> Result<([f64; 2], f64), String> {
+    if image.len() < width * height || width != 200 || height != 200 || eye > 1 {
+        return Err("pupil detector received an unsupported frame".into());
+    }
+    let mut values = image[..width * height].to_vec();
+    values.sort_unstable();
+    let global_median = values[quantile_index(values.len(), 1, 2)] as f64;
+    let (x_start, x_end) = if eye == 0 {
+        (30usize, 110usize)
+    } else {
+        (90usize, 170usize)
+    };
+    let mut best: Option<(f64, [f64; 2], f64)> = None;
+    for cy in (65usize..=135).step_by(2) {
+        for cx in (x_start..=x_end).step_by(2) {
+            let mut inner_sum = 0.0f64;
+            let mut inner_squared = 0.0f64;
+            let mut inner_count = 0usize;
+            let mut ring_sum = 0.0f64;
+            let mut ring_count = 0usize;
+            for dy in -18isize..=18 {
+                for dx in -18isize..=18 {
+                    let distance2 = dx * dx + dy * dy;
+                    let x = (cx as isize + dx) as usize;
+                    let y = (cy as isize + dy) as usize;
+                    let value = image[y * width + x] as f64;
+                    if distance2 <= 49 {
+                        inner_sum += value;
+                        inner_squared += value * value;
+                        inner_count += 1;
+                    } else if (144..=324).contains(&distance2) {
+                        ring_sum += value;
+                        ring_count += 1;
+                    }
+                }
+            }
+            if inner_count == 0 || ring_count == 0 {
+                continue;
+            }
+            let inner_mean = inner_sum / inner_count as f64;
+            let ring_mean = ring_sum / ring_count as f64;
+            let inner_variance =
+                (inner_squared / inner_count as f64 - inner_mean * inner_mean).max(0.0);
+            let contrast = ring_mean - inner_mean;
+            let score = contrast + 0.15 * (global_median - inner_mean)
+                - 0.5 * (inner_variance.sqrt() - 25.0).max(0.0);
+            let candidate = (score, [cx as f64, cy as f64], contrast);
+            if best.as_ref().is_none_or(|current| score > current.0) {
+                best = Some(candidate);
+            }
+        }
+    }
+    let Some((score, center, contrast)) = best else {
+        return Err("no pupil candidate was found in the XR5 eye region".into());
+    };
+    if !score.is_finite() || !contrast.is_finite() {
+        return Err("pupil detector produced a non-finite score".into());
+    }
+    Ok((center, contrast))
+}
+
+fn aperture_axis(
+    image: &[u8],
+    width: usize,
+    height: usize,
+    center: [f64; 2],
+) -> Result<(f64, f64), String> {
+    let mut values = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let nx = (x as f64 - center[0]) / 48.0;
+            let ny = (y as f64 - center[1]) / 30.0;
+            if nx * nx + ny * ny <= 1.0 {
+                values.push(image[y * width + x]);
+            }
+        }
+    }
+    if values.len() < MIN_EFFECTIVE_PIXELS {
+        return Err("eye aperture region was empty".into());
+    }
+    values.sort_unstable();
+    let threshold = values[quantile_index(values.len(), 48, 100)] as f64;
+    let mut mass = 0.0f64;
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    for y in 0..height {
+        for x in 0..width {
+            let nx = (x as f64 - center[0]) / 48.0;
+            let ny = (y as f64 - center[1]) / 30.0;
+            if nx * nx + ny * ny > 1.0 {
+                continue;
+            }
+            let weight = (threshold - image[y * width + x] as f64).max(0.0);
+            mass += weight;
+            sx += weight * x as f64;
+            sy += weight * y as f64;
+        }
+    }
+    if mass <= 1e-6 {
+        return Err("eye aperture contrast was empty".into());
+    }
+    let mean = [sx / mass, sy / mass];
+    let mut a = 0.0f64;
+    let mut b = 0.0f64;
+    let mut d = 0.0f64;
+    for y in 0..height {
+        for x in 0..width {
+            let nx = (x as f64 - center[0]) / 48.0;
+            let ny = (y as f64 - center[1]) / 30.0;
+            if nx * nx + ny * ny > 1.0 {
+                continue;
+            }
+            let weight = (threshold - image[y * width + x] as f64).max(0.0);
+            let dx = x as f64 - mean[0];
+            let dy = y as f64 - mean[1];
+            a += weight * dx * dx;
+            b += weight * dx * dy;
+            d += weight * dy * dy;
+        }
+    }
+    a /= mass;
+    b /= mass;
+    d /= mass;
+    let discriminant = ((a - d).powi(2) + 4.0 * b.powi(2)).sqrt();
+    let low = ((a + d - discriminant) * 0.5).max(1e-6);
+    let high = ((a + d + discriminant) * 0.5).max(low);
+    let angle = 0.5 * (2.0 * b).atan2(a - d).to_degrees();
+    if !angle.is_finite() || !high.is_finite() {
+        return Err("eye aperture axis was not finite".into());
+    }
+    Ok((angle, high / low))
+}
+
+fn appearance_geometry_from_descriptor(
+    descriptor: AppearanceDescriptor,
+    baseline: MlGeometry,
+    eye: usize,
+) -> MlGeometry {
+    let center = [
+        XR5_PRESET_CENTER_PX[eye][0] + descriptor.pupil_center_px[0] as f64
+            - APPEARANCE_PUPIL_REFERENCE[eye][0],
+        XR5_PRESET_CENTER_PX[eye][1] + descriptor.pupil_center_px[1] as f64
+            - APPEARANCE_PUPIL_REFERENCE[eye][1],
+    ];
+    let center = [
+        center[0].clamp(XR5_PRESET_WIDTH_PX * 0.5, 200.0 - XR5_PRESET_WIDTH_PX * 0.5),
+        center[1].clamp(
+            XR5_PRESET_HEIGHT_PX * 0.5,
+            200.0 - XR5_PRESET_HEIGHT_PX * 0.5,
+        ),
+    ];
+    let rotate_deg = (XR5_PRESET_ROTATION_DEG[eye]
+        - (descriptor.aperture_angle_deg as f64 - APPEARANCE_AXIS_REFERENCE_DEG[eye]))
+        .clamp(-45.0, 45.0);
+    MlGeometry {
+        crop_left: ((center[0] - XR5_PRESET_WIDTH_PX * 0.5) / 200.0) as f32,
+        crop_right: ((200.0 - center[0] - XR5_PRESET_WIDTH_PX * 0.5) / 200.0) as f32,
+        crop_top: ((center[1] - XR5_PRESET_HEIGHT_PX * 0.5) / 200.0) as f32,
+        crop_bottom: ((200.0 - center[1] - XR5_PRESET_HEIGHT_PX * 0.5) / 200.0) as f32,
+        scale_x: 1.0,
+        scale_y: 1.2,
+        rotate_deg: rotate_deg as f32,
+        mirror_h: baseline.mirror_h,
+    }
+}
+
+fn median_f64(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|left, right| left.total_cmp(right));
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    }
 }
 
 fn descriptor_is_plausible(descriptor: &Descriptor64) -> bool {
@@ -717,5 +1122,72 @@ mod tests {
             pixels: &pixels,
         }];
         assert!(motion_descriptor(&frames).is_err());
+    }
+
+    fn synthetic_eye(center: [f64; 2], angle_deg: f64) -> Vec<u8> {
+        let mut image = vec![160u8; 200 * 200];
+        let radians = angle_deg.to_radians();
+        let (sin, cos) = radians.sin_cos();
+        for y in 0..200 {
+            for x in 0..200 {
+                let dx = x as f64 - center[0];
+                let dy = y as f64 - center[1];
+                let major = dx * cos + dy * sin;
+                let minor = -dx * sin + dy * cos;
+                if (major / 45.0).powi(2) + (minor / 13.0).powi(2) <= 1.0 {
+                    image[y * 200 + x] = 82;
+                }
+                if dx * dx + dy * dy <= 7.0f64.powi(2) {
+                    image[y * 200 + x] = 28;
+                }
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn neutral_detector_finds_pupil_and_aperture_axis() {
+        for (eye, center, angle) in [(0usize, [72.0, 103.0], 14.0), (1usize, [128.0, 98.0], -6.0)] {
+            let image = synthetic_eye(center, angle);
+            let (actual_center, contrast) = detect_pupil(&image, 200, 200, eye).unwrap();
+            let (actual_angle, anisotropy) =
+                aperture_axis(&image, 200, 200, actual_center).unwrap();
+            assert!((actual_center[0] - center[0]).abs() <= 2.0);
+            assert!((actual_center[1] - center[1]).abs() <= 2.0);
+            assert!(contrast >= 40.0, "contrast={contrast}");
+            assert!((actual_angle - angle).abs() <= 2.0, "angle={actual_angle}");
+            assert!(anisotropy >= 3.0, "anisotropy={anisotropy}");
+        }
+    }
+
+    #[test]
+    fn appearance_seed_is_absolute_not_inherited_from_active_crop() {
+        let expected = default_ml_geometry("pimax_xr5");
+        for eye in 0..2 {
+            let mut wrong = expected[eye];
+            wrong.crop_left = 0.20;
+            wrong.crop_right = 0.20;
+            wrong.crop_top = 0.25;
+            wrong.crop_bottom = 0.15;
+            wrong.scale_y = 0.85;
+            wrong.rotate_deg = 0.0;
+            let descriptor = AppearanceDescriptor {
+                pupil_center_px: APPEARANCE_PUPIL_REFERENCE[eye].map(|value| value as f32),
+                pupil_contrast: 50.0,
+                aperture_angle_deg: APPEARANCE_AXIS_REFERENCE_DEG[eye] as f32,
+                aperture_anisotropy: 4.0,
+                block_center_spread_px: 0.0,
+                block_angle_spread_deg: 0.0,
+                blocks: 2,
+            };
+            let actual = appearance_geometry_from_descriptor(descriptor, wrong, eye);
+            assert_eq!(actual.crop_left, expected[eye].crop_left);
+            assert_eq!(actual.crop_right, expected[eye].crop_right);
+            assert_eq!(actual.crop_top, expected[eye].crop_top);
+            assert_eq!(actual.crop_bottom, expected[eye].crop_bottom);
+            assert_eq!(actual.scale_y, expected[eye].scale_y);
+            assert_eq!(actual.rotate_deg, expected[eye].rotate_deg);
+            assert_eq!(actual.mirror_h, wrong.mirror_h);
+        }
     }
 }

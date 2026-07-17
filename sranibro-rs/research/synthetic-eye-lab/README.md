@@ -265,7 +265,7 @@ with related captures, so every result is unconditionally labelled
 dynamics, hour-scale stability, or a production correction. VR4 remains outside
 this phase.
 
-## XR5 motion-geometry development positive control
+## XR5 absolute-geometry development positive control
 
 `xr5-geometry-discovery` exercises the EyeNet-independent initializer in
 `src/geometry_discovery.rs`. It extracts only a low-dimensional temporal motion
@@ -275,6 +275,13 @@ canonical XR5 EyeNet region.
 The canonical target consists of aggregate mean/covariance constants only; no eye
 image or reconstructable template is embedded.
 
+The same executable also evaluates the second, independent neutral-appearance
+hypothesis. Per-block median `neutral_center` frames are reduced to pupil centre,
+pupil contrast, eye-aperture axis, anisotropy, and repeatability. The resulting crop
+and angle do not inherit the active crop/rotation. Production requires two repeatable
+OPEN blocks, binocular plausibility, ordinary EyeNet training guards, and untouched
+holdout improvement before this hypothesis can be offered for manual application.
+
 ```powershell
 cargo run --release --features research-synthetic-eye-lab `
   --bin xr5-geometry-discovery -- `
@@ -282,10 +289,10 @@ cargo run --release --features research-synthetic-eye-lab `
 ```
 
 This is a development positive control, not an independent transfer result: the
-same developer sessions contributed to the aggregate canonical target. The normal
-in-app fitter now derives its seed from training-only natural-blink frames, but
-the seed can enter the search only after raw-motion confidence gates and can never
-be applied without the existing EyeNet guards and untouched holdout improvement.
+same developer sessions contributed to the aggregate motion and appearance references.
+The normal in-app fitter derives both hypotheses from training-only frames. Either can
+enter the search only after its own raw-evidence gates, and neither can be applied
+without the existing EyeNet guards and untouched holdout improvement.
 The command above is read-only and never changes application configuration.
 
 ## Limits

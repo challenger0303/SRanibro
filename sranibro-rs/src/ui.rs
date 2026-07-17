@@ -1908,7 +1908,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.add_space(SP2);
                     ui.label(label(
-                        "Dream Air / XR5 only. Records labelled stereo frames in memory, estimates an absolute crop/angle from eyelid motion, compares it with a bounded ML search, then validates the winner on untouched holdout frames.",
+                        "Dream Air / XR5 only. Records labelled stereo frames in memory, estimates absolute crop/angle hypotheses from repeated neutral-eye appearance and eyelid motion, compares them with a bounded ML search, then validates the winner on untouched holdout frames.",
                     ));
                     ui.label(label(
                         "This does not train a model, change Tobii gaze calibration, or use squeeze/Wide as geometry targets.",
@@ -2110,6 +2110,49 @@ impl App {
                                     result.candidate_holdout.monotonicity[0],
                                     result.candidate_holdout.monotonicity[1]
                                 )));
+                                if let Some(seed) = &result.appearance_seed {
+                                    ui.add_space(SP2);
+                                    ui.label(
+                                        egui::RichText::new(if seed.search_eligible {
+                                            "NEUTRAL-APPEARANCE INITIAL GEOMETRY"
+                                        } else {
+                                            "NEUTRAL APPEARANCE: DIAGNOSTIC ONLY"
+                                        })
+                                        .monospace()
+                                        .size(11.0 * S)
+                                        .strong()
+                                        .color(if seed.search_eligible { OK } else { WARN }),
+                                    );
+                                    ui.label(num(&format!(
+                                        "confidence {:.0}%    {}{}",
+                                        seed.confidence * 100.0,
+                                        seed.reason,
+                                        if result.candidate_from_appearance_seed {
+                                            "    selected by training search"
+                                        } else {
+                                            ""
+                                        }
+                                    )));
+                                    for (eye, name) in [(0usize, "L"), (1usize, "R")] {
+                                        let value = &seed.eyes[eye];
+                                        let descriptor = value.descriptor;
+                                        let g = value.geometry;
+                                        ui.label(num(&format!(
+                                            "neutral {name} pupil {:.1}/{:.1} contrast {:.1} axis {:+.1} spread {:.1}px/{:.1}deg   crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1}",
+                                            descriptor.pupil_center_px[0],
+                                            descriptor.pupil_center_px[1],
+                                            descriptor.pupil_contrast,
+                                            descriptor.aperture_angle_deg,
+                                            descriptor.block_center_spread_px,
+                                            descriptor.block_angle_spread_deg,
+                                            g.crop_left,
+                                            g.crop_right,
+                                            g.crop_top,
+                                            g.crop_bottom,
+                                            g.rotate_deg,
+                                        )));
+                                    }
+                                }
                                 if let Some(seed) = &result.motion_seed {
                                     ui.add_space(SP2);
                                     ui.label(
