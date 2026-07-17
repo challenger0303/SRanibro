@@ -322,11 +322,14 @@ fn next_value(
 }
 
 fn print_help() {
-    println!(
-        "SRanibro synthetic eye lab (research only)\n\n\
-         cargo run --release --features research-synthetic-eye-lab --bin synthetic-eye-lab -- \\\n+           --experiment <phase0|milestone1|luminance-match|two-moment-match> --model <EyePrediction params> --out <directory>\n\n\
-         The lab is observational and cannot modify production settings."
-    );
+    println!(concat!(
+        "SRanibro synthetic eye lab (research only)\n\n",
+        "cargo run --release --features research-synthetic-eye-lab ",
+        "--bin synthetic-eye-lab -- \\\n",
+        "  --experiment <phase0|milestone1|luminance-match|two-moment-match> ",
+        "--model <EyePrediction params> --out <directory>\n\n",
+        "The lab is observational and cannot modify production settings."
+    ));
 }
 
 #[cfg(test)]

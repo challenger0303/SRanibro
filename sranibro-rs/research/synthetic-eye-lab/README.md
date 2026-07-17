@@ -38,6 +38,9 @@ cargo run --features research-synthetic-eye-lab --bin synthetic-eye-lab --offlin
   --model C:\path\to\00-0000.params_opencl.params `
   --out research-output\two-moment-run
 
+cargo run --release --features research-synthetic-eye-lab --bin synthetic-eye-atlas --offline -- `
+  --out research-output\moment-atlas-run
+
 python research\synthetic-eye-lab\plot_results.py `
   research-output\milestone1-run
 ```
@@ -144,6 +147,21 @@ review and testing: duplicate bit-exact inference, same-phase baseline,
 same-reference replay controls, signed Spearman, true-adjacent concordance, and
 the frozen `GO` / `NO_EVIDENCE` / `INCONCLUSIVE` precedence. It is unreachable
 under the current renderer gate and must not be invoked by bypassing that gate.
+
+## Phase 1.3A: renderer moment-feasibility atlas
+
+The frozen renderer-only contract is in
+[`PHASE1_3A_PREREG.md`](PHASE1_3A_PREREG.md). The atlas is a separate binary
+whose CLI has no model or recording argument and whose module tree contains no
+EyeNet loader. It maps finite, nested skin/sclera candidate clouds for all 34
+apertures and reports exact nearest moment pairs under the legacy,
+polarity-preserving, and unrestricted mathematical domains.
+
+Phase 1.3A has no model-facing pass threshold. Its distances and conditioning
+are instrument diagnostics only. A later, separately preregistered symmetric
+2x2 model study may use D0 adjacent-pair summaries after the atlas artifact is
+sealed. XR5/VR4 recordings remain excluded until that synthetic classification
+is also sealed.
 
 ## Limits
 
