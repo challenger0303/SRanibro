@@ -1,10 +1,12 @@
-//! Guided, in-memory capture for per-user XR5 eye-model geometry fitting.
+//! Guided capture for per-user XR5 eye-model geometry fitting.
 //!
-//! The capture intentionally stores raw stereo frames only for the lifetime of the
-//! fitting session.  Nothing biometric is written to disk.  A separate holdout tail is
-//! never exposed to the search and is used only to decide whether a candidate is safer
-//! than the geometry that was active when capture started.
+//! Raw stereo frames remain in memory unless the user explicitly exports a feedback ZIP.
+//! A separate holdout tail is never exposed to the search and is used only to decide
+//! whether a candidate is safer than the geometry that was active when capture started.
 
+use std::fmt::Write as _;
+use std::io;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -26,6 +28,23 @@ pub enum SampleKind {
 }
 
 impl SampleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Neutral => "neutral",
+            Self::GazeSweep => "gaze_sweep",
+            Self::SlowClose => "slow_close",
+            Self::NaturalBlinks => "natural_blinks",
+            Self::Closed => "closed",
+            Self::HalfOpen => "half_open",
+            Self::HoldoutNeutral => "holdout_neutral",
+            Self::HoldoutGazeSweep => "holdout_gaze_sweep",
+            Self::HoldoutSlowClose => "holdout_slow_close",
+            Self::HoldoutNaturalBlinks => "holdout_natural_blinks",
+            Self::HoldoutClosed => "holdout_closed",
+            Self::HoldoutHalfOpen => "holdout_half_open",
+        }
+    }
+
     pub fn is_holdout(self) -> bool {
         matches!(
             self,
@@ -426,6 +445,18 @@ impl GeometryCapture {
         self.last_error = None;
     }
 
+    /// Export the exact completed dataset used by the geometry fitter. This is opt-in
+    /// because the archive contains raw eye-camera images (biometric data).
+    pub fn export_recording(&self, path: &Path, metadata: &str) -> io::Result<()> {
+        if !self.is_done() || self.dataset.samples.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "finish the geometry capture before exporting it",
+            ));
+        }
+        export_dataset_zip(path, &self.dataset, metadata)
+    }
+
     pub fn status(&self) -> Status {
         let Some(index) = self.phase else {
             return Status::Idle;
@@ -494,6 +525,81 @@ fn slow_target(progress: f32, cycles: u32) -> f32 {
     }
 }
 
+fn csv_optional(value: Option<f32>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_default()
+}
+
+fn encode_gray_png(width: u32, height: u32, pixels: &[u8]) -> io::Result<Vec<u8>> {
+    let need = (width as usize).saturating_mul(height as usize);
+    if width == 0 || height == 0 || pixels.len() < need {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "geometry recording contains an incomplete image",
+        ));
+    }
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        writer
+            .write_image_data(&pixels[..need])
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        writer
+            .finish()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    }
+    Ok(encoded)
+}
+
+fn export_dataset_zip(path: &Path, dataset: &GeometryDataset, metadata: &str) -> io::Result<()> {
+    let mut csv = String::from(
+        "index,kind,holdout,phase_index,phase_time_s,expected_open,left_file,right_file,left_width,left_height,right_width,right_height,left_gain,left_bias,right_gain,right_bias,native_open_left,native_open_right\n",
+    );
+    for (index, sample) in dataset.samples.iter().enumerate() {
+        writeln!(
+            csv,
+            "{index},{},{},{},{:.6},{},frames/{index:06}_left.png,frames/{index:06}_right.png,{},{},{},{},{:.9},{:.9},{:.9},{:.9},{},{}",
+            sample.kind.as_str(),
+            sample.kind.is_holdout(),
+            sample.phase_index,
+            sample.phase_time_s,
+            csv_optional(sample.expected_open),
+            sample.left_size.0,
+            sample.left_size.1,
+            sample.right_size.0,
+            sample.right_size.1,
+            sample.brightness_affine[0][0],
+            sample.brightness_affine[0][1],
+            sample.brightness_affine[1][0],
+            sample.brightness_affine[1][1],
+            csv_optional(sample.native_open[0]),
+            csv_optional(sample.native_open[1]),
+        )
+        .map_err(|_| io::Error::other("failed to build geometry recording manifest"))?;
+    }
+
+    const README: &str = "SRanibro XR5 geometry calibration recording\n\nThis archive contains raw grayscale eye-camera images and therefore biometric data.\nShare it only when you intend to provide debugging or model-fit feedback.\n\nframes/*.png are the exact mapped stereo frames collected by Safe Geometry Fit before crop, rotation, brightness normalization, and model inference.\nsamples.csv contains pose labels, holdout membership, timing, dimensions, per-frame brightness affine, and Tobii native openness when reported.\nmetadata.txt contains non-secret runtime settings and a pseudonymous unit identifier; it intentionally omits asset paths and the real EyeChip serial.\n";
+    let mut zip = crate::diagnostics::StoredZipWriter::create(path)?;
+    zip.add("README.txt", README.as_bytes())?;
+    zip.add("metadata.txt", metadata.as_bytes())?;
+    zip.add("samples.csv", csv.as_bytes())?;
+    for (index, sample) in dataset.samples.iter().enumerate() {
+        let left = encode_gray_png(sample.left_size.0, sample.left_size.1, &sample.left)?;
+        zip.add(&format!("frames/{index:06}_left.png"), &left)?;
+        let right = encode_gray_png(sample.right_size.0, sample.right_size.1, &sample.right)?;
+        zip.add(&format!("frames/{index:06}_right.png"), &right)?;
+    }
+    zip.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +663,44 @@ mod tests {
         );
         assert!(holdout.contains(&SampleKind::HoldoutHalfOpen));
         assert!((95.0..=100.0).contains(&total_seconds()));
+    }
+
+    #[test]
+    fn feedback_zip_contains_stereo_pngs_labels_and_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "sranibro_geometry_recording_test_{}.zip",
+            std::process::id()
+        ));
+        let dataset = GeometryDataset {
+            samples: vec![GeometrySample {
+                kind: SampleKind::HalfOpen,
+                expected_open: Some(0.5),
+                phase_time_s: 1.25,
+                left: vec![0, 64, 128, 255],
+                right: vec![255, 128, 64, 0],
+                left_size: (2, 2),
+                right_size: (2, 2),
+                brightness_affine: [[1.0, 0.0], [0.9, 0.1]],
+                native_open: [Some(0.52), None],
+                phase_index: 3,
+            }],
+        };
+        export_dataset_zip(&path, &dataset, "version=test\nunit_id=unit-test\n").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        for needle in [
+            b"samples.csv".as_slice(),
+            b"frames/000000_left.png".as_slice(),
+            b"frames/000000_right.png".as_slice(),
+            b"half_open".as_slice(),
+            b"unit-test".as_slice(),
+            b"\x89PNG\r\n\x1a\n".as_slice(),
+        ] {
+            assert!(
+                bytes.windows(needle.len()).any(|window| window == needle),
+                "missing {:?}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

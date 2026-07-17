@@ -4,7 +4,7 @@
 //! paths and user names.  The caller supplies a hardware/settings summary, the
 //! persisted eyelid calibration, and a bounded log tail.
 
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 fn put_u16(out: &mut Vec<u8>, value: u16) {
@@ -59,78 +59,119 @@ pub fn redact_support_text(text: &str, eyechip_serial: Option<&str>) -> String {
     redacted
 }
 
-/// Write a standards-compatible ZIP using the uncompressed "store" method.
-/// This keeps support export dependency-free and makes corruption obvious.
-pub fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> io::Result<()> {
-    let mut out = Vec::new();
-    let mut central = Vec::new();
-    for (name, data) in entries {
+/// Incremental standards-compatible ZIP writer using the uncompressed "store" method.
+/// Keeping only the central directory in memory lets calibration exports stream thousands
+/// of already-compressed PNG frames without building a second copy of the whole recording.
+pub struct StoredZipWriter {
+    file: BufWriter<std::fs::File>,
+    central: Vec<u8>,
+    offset: u64,
+    entries: u16,
+}
+
+impl StoredZipWriter {
+    pub fn create(path: &Path) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(Self {
+            file: BufWriter::new(std::fs::File::create(path)?),
+            central: Vec::new(),
+            offset: 0,
+            entries: 0,
+        })
+    }
+
+    pub fn add(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         if name.is_empty() || name.len() > u16::MAX as usize || data.len() > u32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ZIP entry is too large",
             ));
         }
-        let offset = u32::try_from(out.len())
+        if self.entries == u16::MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZIP has too many entries",
+            ));
+        }
+        let offset = u32::try_from(self.offset)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ZIP is too large"))?;
         let crc = crc32(data);
         let len = data.len() as u32;
         let name_len = name.len() as u16;
 
-        put_u32(&mut out, 0x0403_4b50);
-        put_u16(&mut out, 20);
-        put_u16(&mut out, 0);
-        put_u16(&mut out, 0);
-        put_u16(&mut out, 0);
-        put_u16(&mut out, 0);
-        put_u32(&mut out, crc);
-        put_u32(&mut out, len);
-        put_u32(&mut out, len);
-        put_u16(&mut out, name_len);
-        put_u16(&mut out, 0);
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(data);
+        let mut header = Vec::with_capacity(30 + name.len());
+        put_u32(&mut header, 0x0403_4b50);
+        put_u16(&mut header, 20);
+        put_u16(&mut header, 0);
+        put_u16(&mut header, 0);
+        put_u16(&mut header, 0);
+        put_u16(&mut header, 0);
+        put_u32(&mut header, crc);
+        put_u32(&mut header, len);
+        put_u32(&mut header, len);
+        put_u16(&mut header, name_len);
+        put_u16(&mut header, 0);
+        header.extend_from_slice(name.as_bytes());
+        self.file.write_all(&header)?;
+        self.file.write_all(data)?;
+        self.offset = self
+            .offset
+            .checked_add(header.len() as u64)
+            .and_then(|value| value.checked_add(data.len() as u64))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ZIP is too large"))?;
 
-        put_u32(&mut central, 0x0201_4b50);
-        put_u16(&mut central, 20);
-        put_u16(&mut central, 20);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, 0);
-        put_u32(&mut central, crc);
-        put_u32(&mut central, len);
-        put_u32(&mut central, len);
-        put_u16(&mut central, name_len);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, 0);
-        put_u16(&mut central, 0);
-        put_u32(&mut central, 0);
-        put_u32(&mut central, offset);
-        central.extend_from_slice(name.as_bytes());
+        put_u32(&mut self.central, 0x0201_4b50);
+        put_u16(&mut self.central, 20);
+        put_u16(&mut self.central, 20);
+        put_u16(&mut self.central, 0);
+        put_u16(&mut self.central, 0);
+        put_u16(&mut self.central, 0);
+        put_u16(&mut self.central, 0);
+        put_u32(&mut self.central, crc);
+        put_u32(&mut self.central, len);
+        put_u32(&mut self.central, len);
+        put_u16(&mut self.central, name_len);
+        put_u16(&mut self.central, 0);
+        put_u16(&mut self.central, 0);
+        put_u16(&mut self.central, 0);
+        put_u16(&mut self.central, 0);
+        put_u32(&mut self.central, 0);
+        put_u32(&mut self.central, offset);
+        self.central.extend_from_slice(name.as_bytes());
+        self.entries += 1;
+        Ok(())
     }
 
-    let central_offset = u32::try_from(out.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ZIP is too large"))?;
-    let central_len = u32::try_from(central.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ZIP is too large"))?;
-    out.extend_from_slice(&central);
-    put_u32(&mut out, 0x0605_4b50);
-    put_u16(&mut out, 0);
-    put_u16(&mut out, 0);
-    put_u16(&mut out, entries.len() as u16);
-    put_u16(&mut out, entries.len() as u16);
-    put_u32(&mut out, central_len);
-    put_u32(&mut out, central_offset);
-    put_u16(&mut out, 0);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    pub fn finish(mut self) -> io::Result<()> {
+        let central_offset = u32::try_from(self.offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ZIP is too large"))?;
+        let central_len = u32::try_from(self.central.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ZIP is too large"))?;
+        self.file.write_all(&self.central)?;
+        let mut end = Vec::with_capacity(22);
+        put_u32(&mut end, 0x0605_4b50);
+        put_u16(&mut end, 0);
+        put_u16(&mut end, 0);
+        put_u16(&mut end, self.entries);
+        put_u16(&mut end, self.entries);
+        put_u32(&mut end, central_len);
+        put_u32(&mut end, central_offset);
+        put_u16(&mut end, 0);
+        self.file.write_all(&end)?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()
     }
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&out)?;
-    file.sync_all()
+}
+
+/// Write a small standards-compatible ZIP using the incremental writer above.
+pub fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> io::Result<()> {
+    let mut writer = StoredZipWriter::create(path)?;
+    for (name, data) in entries {
+        writer.add(name, data)?;
+    }
+    writer.finish()
 }
 
 pub fn export_support_bundle(summary: &str, log_tail: &str) -> io::Result<PathBuf> {

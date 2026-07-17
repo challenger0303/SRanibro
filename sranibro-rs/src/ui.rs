@@ -660,9 +660,52 @@ impl App {
         ));
         self.geometry_capture.start(generation);
         self.dream_air_msg = Some((
-            "Guided image-alignment capture started; raw frames stay in memory only.".into(),
+            "Guided image-alignment capture started; raw frames stay in memory unless you export the completed recording.".into(),
             ACCENT,
         ));
+    }
+
+    fn export_geometry_recording(&mut self) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let path = crate::config::base_dir()
+            .join("calibration-recordings")
+            .join(format!("sranibro_xr5_geometry_{stamp}.zip"));
+        let serial = self
+            .config
+            .dream_air_profile_for(&self.pipeline.device_key)
+            .and_then(|profile| profile.eyechip_serial.clone())
+            .or_else(crate::device::usb::peek_serial);
+        let unit_id = crate::diagnostics::pseudonymous_unit_id(serial.as_deref());
+        let baseline = self.geometry_capture_baseline;
+        let filters = self.geometry_capture_filters;
+        let mapping = self.config.mapping_for(&self.pipeline.device_key);
+        let mirrors = [
+            self.pipeline.ml_mirror_l.load(Ordering::Relaxed),
+            self.pipeline.ml_mirror_r.load(Ordering::Relaxed),
+        ];
+        let metadata = format!(
+            "schema_version=1\nsranibro_version={}\ndevice={}\nunit_id={}\ncapture_hz=20\nframe_stage=after_eye_mapping_before_ml_geometry\nbaseline_geometry={baseline:?}\nfilters={filters:?}\neye_mapping={mapping:?}\nml_mirror={mirrors:?}\nwide_source={:?}\ngaze_source={:?}\n",
+            env!("CARGO_PKG_VERSION"),
+            self.pipeline.device_key,
+            unit_id,
+            self.config.hmd.wide_source,
+            self.config.gaze_source_for(&self.pipeline.device_key),
+        );
+        match self.geometry_capture.export_recording(&path, &metadata) {
+            Ok(()) => {
+                self.dream_air_msg = Some((
+                    format!("Calibration recording ZIP saved: {}", path.display()),
+                    OK,
+                ));
+            }
+            Err(error) => {
+                self.dream_air_msg =
+                    Some((format!("Calibration recording export failed: {error}"), ERR));
+            }
+        }
     }
 
     fn start_geometry_fit(&mut self) {
@@ -1916,6 +1959,9 @@ impl App {
                     ui.label(label(
                         "The fixed inner XR5 IR-LED/lens region is excluded before extracting geometry evidence and search candidates cannot reduce the inner hardware crop below 40%.",
                     ));
+                    ui.label(label(
+                        "After capture you can export the exact labelled stereo recording for feedback. The ZIP contains raw eye images (biometric data) and is never created automatically.",
+                    ));
                     ui.add_space(SP2);
 
                     match capture_status {
@@ -2019,6 +2065,12 @@ impl App {
                             ui.label(label(
                                 "Objective audit uses this capture instead of fitting. It probes the active geometry and nearby alternatives with both the current score and the labelled method that originally found the XR5 preset; it never applies a result.",
                             ));
+                            ui.label(label(
+                                "Save the recording before starting a fit or audit; those operations consume the in-memory dataset.",
+                            ));
+                            if ui.button("Save calibration recording ZIP for feedback").clicked() {
+                                self.export_geometry_recording();
+                            }
                             ui.horizontal(|ui| {
                                 if ui.button("Run objective audit (recommended)").clicked() {
                                     self.start_geometry_audit();
