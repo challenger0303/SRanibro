@@ -31,7 +31,7 @@ const XR5_PRESET_HEIGHT_PX: f64 = 140.0;
 // the visibly saturated emitters.
 const XR5_LED_SAFE_LEFT_MAX_X: usize = 108;
 const XR5_LED_SAFE_RIGHT_MIN_X: usize = 91;
-const XR5_MIN_INNER_CROP: f64 = 0.35;
+const XR5_MIN_INNER_CROP: f64 = 0.40;
 
 /// Non-reconstructable aggregate blink-motion statistics in the 100x100 EyeNet input.
 ///
@@ -842,6 +842,7 @@ fn solve_eye(
                     crop_height,
                     width,
                     height,
+                    eye,
                 );
             }
         }
@@ -874,6 +875,7 @@ fn solve_eye(
                     crop_height,
                     width,
                     height,
+                    eye,
                 );
             }
         }
@@ -893,6 +895,7 @@ fn consider_solution(
     crop_height: f64,
     baseline_width: f32,
     baseline_height: f32,
+    eye: usize,
 ) {
     let frame_width = 200.0;
     let frame_height = 200.0;
@@ -946,6 +949,14 @@ fn consider_solution(
         rotate_deg: degrees as f32,
         mirror_h: baseline.mirror_h,
     };
+    let inner_crop = if eye == 0 {
+        geometry.crop_right
+    } else {
+        geometry.crop_left
+    };
+    if inner_crop as f64 + 1e-6 < XR5_MIN_INNER_CROP {
+        return;
+    }
     let candidate = SolvedEye { geometry, error };
     if best
         .as_ref()

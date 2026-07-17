@@ -276,7 +276,8 @@ The canonical target consists of aggregate mean/covariance constants only; no ey
 image or reconstructable template is embedded.
 All XR5 evidence first excludes the fixed inner IR-LED/lens zone. The canonical motion
 statistics are defined in that masked coordinate system, and the ML search cannot
-reduce the physical inner crop below 35%. This hardware exclusion is not fitted per user.
+reduce the physical inner crop below the validated 40% preset. This hardware exclusion
+is not fitted per user.
 
 The same executable also evaluates the second, independent neutral-appearance
 hypothesis. Per-block median `neutral_center` frames are reduced to pupil centre,

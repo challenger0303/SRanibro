@@ -1914,7 +1914,7 @@ impl App {
                         "This does not train a model, change Tobii gaze calibration, or use squeeze/Wide as geometry targets.",
                     ));
                     ui.label(label(
-                        "The fixed inner XR5 IR-LED/lens region is excluded before extracting geometry evidence and search candidates cannot reduce the inner hardware crop below 35%.",
+                        "The fixed inner XR5 IR-LED/lens region is excluded before extracting geometry evidence and search candidates cannot reduce the inner hardware crop below 40%.",
                     ));
                     ui.add_space(SP2);
 

@@ -27,7 +27,7 @@ const STAGE2_CANDIDATES: usize = 10;
 const STAGE2_FRAMES: usize = 280;
 const STAGE3_FRAMES: usize = 420;
 const HOLDOUT_FRAMES: usize = 420;
-const XR5_MIN_INNER_CROP: f32 = 0.35;
+const XR5_MIN_INNER_CROP: f32 = 0.40;
 const AUDIT_FOLDS: usize = 5;
 const AUDIT_BLOCK_FRAMES: usize = 12;
 const AUDIT_GUARD_FRAMES: usize = 1;
@@ -1275,7 +1275,6 @@ fn audit_case_specs(baseline: [MlGeometry; 2]) -> Vec<AuditCaseSpec> {
     }
 
     for (name, inner, vertical) in [
-        ("legacy neighbour inner .35", Some(0.35), None),
         ("legacy neighbour inner .45", Some(0.45), None),
         ("legacy neighbour vertical .10", None, Some(0.10)),
     ] {
@@ -1304,6 +1303,11 @@ fn audit_case_specs(baseline: [MlGeometry; 2]) -> Vec<AuditCaseSpec> {
 }
 
 fn push_audit_case(cases: &mut Vec<AuditCaseSpec>, candidate: AuditCaseSpec) {
+    if candidate.geometry[0].crop_right + 1e-6 < XR5_MIN_INNER_CROP
+        || candidate.geometry[1].crop_left + 1e-6 < XR5_MIN_INNER_CROP
+    {
+        return;
+    }
     if !cases
         .iter()
         .any(|case| geometry_nearly_equal(case.geometry, candidate.geometry))
@@ -2977,10 +2981,20 @@ mod tests {
         let cases = audit_case_specs(baseline);
         assert_eq!(cases[0].name, "active reference");
         assert_eq!(cases[0].geometry, baseline);
-        // The preset already touches the outer frame edge, so both negative-inward
-        // probes clamp back to the reference and are intentionally deduplicated.
-        assert_eq!(cases.len(), 26);
-        assert_eq!(cases.iter().filter(|case| case.axis.is_some()).count(), 18);
+        // The preset already touches the outer frame edge and the fixed inner LED crop;
+        // probes that collapse onto the reference are intentionally deduplicated.
+        // Horizontal inward motion has no legal room at the maximum 60%-wide preset;
+        // it becomes available only together with a smaller-window candidate.
+        for axis in 1..5 {
+            assert!(
+                cases.iter().any(|case| case.axis == Some(axis)),
+                "missing audit axis {axis}"
+            );
+        }
+        assert!(cases.iter().all(|case| {
+            case.geometry[0].crop_right + 1e-6 >= XR5_MIN_INNER_CROP
+                && case.geometry[1].crop_left + 1e-6 >= XR5_MIN_INNER_CROP
+        }));
         assert!(
             cases.len() * AUDIT_FOLDS * 6 * AUDIT_FRAMES_PER_FAMILY_FOLD <= 13_000,
             "audit must stay near one normal-fit evaluation budget"
