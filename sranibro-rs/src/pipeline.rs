@@ -341,40 +341,58 @@ fn merge_gaze_sample(dst: &mut GazeSample, src: GazeSample) {
     merge_eye_sample(&mut dst.right, src.right);
 }
 
-/// Blend the legacy openness/squeeze pose toward fully open in proportion to an ACTIVE
-/// Custom Wide gesture. The output envelope has a short release tail for visual smoothness;
-/// that tail must not pull a genuinely narrowed lid back toward 1.0 after the Wide gesture
-/// has ended. When the bilateral Wide values match, use one shared base openness so
-/// gaze-dependent L/R dips cannot split the pose.
-fn apply_custom_wide_pose(results: &mut [EyeResult; 2], use_custom: bool, active: [bool; 2]) {
+/// Return a continuous confidence that the legacy lid already represents an open eye.
+/// Custom Wide may strengthen an open lid, but it must not reinterpret a narrowed or
+/// closing lid as Wide. A smooth ramp avoids a one-frame mode switch at either boundary.
+fn custom_wide_pose_eligibility(openness: f32) -> f32 {
+    let t = ((openness.clamp(0.0, 1.0) - 0.35) / (0.75 - 0.35)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Blend the legacy openness/squeeze pose toward fully open in proportion to Custom Wide.
+/// The Wide envelope has a short release tail, so eligibility is derived continuously from
+/// the current lid pose rather than from WideState's per-eye boolean `active` flag. When a
+/// bilateral gesture is credible, the more-open eye is the reference; a closing eye must
+/// never drag its open partner downward.
+fn apply_custom_wide_pose(
+    results: &mut [EyeResult; 2],
+    use_custom: bool,
+    wide_requires_both: bool,
+) {
     if !use_custom {
         return;
     }
-    let bilateral = !results[0].blink
-        && !results[1].blink
-        && active[0]
-        && active[1]
-        && results[0].wide > 0.002
-        && results[1].wide > 0.002
-        && (results[0].wide - results[1].wide).abs() < 1.0e-4;
-    if bilateral {
-        let wide = results[0].wide.max(results[1].wide).clamp(0.0, 1.0);
-        let natural = results[0].openness.min(results[1].openness).clamp(0.0, 1.0);
-        let openness = natural + wide * (1.0 - natural);
-        for result in results {
-            result.openness = openness;
-            result.openness_valid = true;
-            result.squeeze *= 1.0 - wide;
+
+    let mut eligibility = [0.0; 2];
+    for i in 0..2 {
+        if results[i].blink || !results[i].openness_valid || results[i].wide <= 0.002 {
+            continue;
         }
-        return;
+        let natural = results[i].openness.clamp(0.0, 1.0);
+        eligibility[i] = custom_wide_pose_eligibility(natural);
+        if eligibility[i] <= f32::EPSILON {
+            continue;
+        }
+        let assist = results[i].wide.clamp(0.0, 1.0) * eligibility[i];
+        results[i].openness = natural + assist * (1.0 - natural);
+        results[i].squeeze *= 1.0 - assist;
     }
-    for (i, result) in results.iter_mut().enumerate() {
-        if active[i] && !result.blink && result.wide > 0.002 {
-            let wide = result.wide.clamp(0.0, 1.0);
-            let natural = result.openness.clamp(0.0, 1.0);
-            result.openness = natural + wide * (1.0 - natural);
-            result.openness_valid = true;
-            result.squeeze *= 1.0 - wide;
+
+    let bilateral = wide_requires_both
+        && !results[0].blink
+        && !results[1].blink
+        && results[0].openness_valid
+        && results[1].openness_valid
+        && results[0].wide > 0.002
+        && results[1].wide > 0.002;
+    if bilateral {
+        let wide = results[0].wide.min(results[1].wide).clamp(0.0, 1.0);
+        let t = ((wide - 0.02) / (0.20 - 0.02)).clamp(0.0, 1.0);
+        let gesture = t * t * (3.0 - 2.0 * t);
+        let pair = eligibility[0].min(eligibility[1]) * gesture;
+        let shared = results[0].openness.max(results[1].openness);
+        for result in results {
+            result.openness += pair * (shared - result.openness);
         }
     }
 }
@@ -505,15 +523,17 @@ mod merge_tests {
         let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
         results[0].openness = 0.80;
         results[1].openness = 0.91;
+        results[0].openness_valid = true;
+        results[1].openness_valid = true;
         results[0].squeeze = 0.25;
         results[1].squeeze = 0.10;
         results[0].wide = 0.7;
         results[1].wide = 0.7;
 
-        apply_custom_wide_pose(&mut results, true, [true; 2]);
+        apply_custom_wide_pose(&mut results, true, true);
 
-        assert!((results[0].openness - 0.94).abs() < 1.0e-6);
-        assert!((results[1].openness - 0.94).abs() < 1.0e-6);
+        assert!((results[0].openness - 0.973).abs() < 1.0e-6);
+        assert!((results[1].openness - 0.973).abs() < 1.0e-6);
         assert!((results[0].squeeze - 0.075).abs() < 1.0e-6);
         assert!((results[1].squeeze - 0.03).abs() < 1.0e-6);
     }
@@ -523,43 +543,124 @@ mod merge_tests {
         let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
         results[0].openness = 0.30;
         results[1].openness = 0.40;
-        results[0].wide = 0.20;
-        results[1].wide = 0.20;
+        results[0].openness_valid = true;
+        results[1].openness_valid = true;
+        results[0].wide = 0.55;
+        results[1].wide = 0.55;
 
-        apply_custom_wide_pose(&mut results, true, [false; 2]);
+        apply_custom_wide_pose(&mut results, true, true);
 
         assert!((results[0].openness - 0.30).abs() < 1.0e-6);
-        assert!((results[1].openness - 0.40).abs() < 1.0e-6);
+        assert!(results[1].openness > 0.40);
+        assert!(results[1].openness < 0.42);
     }
 
     #[test]
-    fn inactive_wide_tail_does_not_open_partner_during_a_blink() {
+    fn wide_tail_does_not_open_partner_during_a_blink() {
         let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
         results[0].openness = 0.0;
         results[0].blink = true;
         results[1].openness = 0.35;
+        results[0].openness_valid = true;
+        results[1].openness_valid = true;
         results[0].wide = 0.20;
         results[1].wide = 0.20;
 
-        apply_custom_wide_pose(&mut results, true, [false; 2]);
+        apply_custom_wide_pose(&mut results, true, true);
 
         assert_eq!(results[0].openness, 0.0);
         assert_eq!(results[1].openness, 0.35);
     }
 
     #[test]
-    fn active_wide_still_keeps_partner_open_during_a_blink() {
+    fn custom_wide_still_keeps_open_partner_open_during_a_blink() {
         let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
         results[0].openness = 0.0;
         results[0].blink = true;
         results[1].openness = 0.82;
+        results[0].openness_valid = true;
+        results[1].openness_valid = true;
         results[0].wide = 0.0;
         results[1].wide = 0.70;
 
-        apply_custom_wide_pose(&mut results, true, [true; 2]);
+        apply_custom_wide_pose(&mut results, true, true);
 
         assert_eq!(results[0].openness, 0.0);
         assert!((results[1].openness - 0.946).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn bilateral_wide_never_pulls_open_partner_down() {
+        let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        results[0].openness = 0.20;
+        results[1].openness = 0.90;
+        results[0].openness_valid = true;
+        results[1].openness_valid = true;
+        results[0].wide = 0.0677;
+        results[1].wide = 0.0677;
+
+        apply_custom_wide_pose(&mut results, true, true);
+
+        assert!((results[0].openness - 0.20).abs() < 1.0e-6);
+        assert!(results[1].openness > 0.90);
+    }
+
+    #[test]
+    fn blink_reopen_with_held_wide_does_not_drag_open_partner_down() {
+        let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        results[0].openness = 0.088;
+        results[1].openness = 1.0;
+        results[0].openness_valid = true;
+        results[1].openness_valid = true;
+        results[0].wide = 0.5542;
+        results[1].wide = 0.5542;
+
+        apply_custom_wide_pose(&mut results, true, true);
+
+        assert!((results[0].openness - 0.088).abs() < 1.0e-6);
+        assert_eq!(results[1].openness, 1.0);
+    }
+
+    #[test]
+    fn independent_wide_never_accidentally_cross_couples_equal_values() {
+        let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        results[0].openness = 0.80;
+        results[1].openness = 0.91;
+        results[0].openness_valid = true;
+        results[1].openness_valid = true;
+        results[0].wide = 0.70;
+        results[1].wide = 0.70;
+
+        apply_custom_wide_pose(&mut results, true, false);
+
+        assert!((results[0].openness - 0.94).abs() < 1.0e-6);
+        assert!((results[1].openness - 0.973).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn custom_wide_does_not_fabricate_valid_openness() {
+        let mut results = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        results[0].wide = 0.70;
+        results[1].wide = 0.70;
+
+        apply_custom_wide_pose(&mut results, true, true);
+
+        assert!(!results[0].openness_valid);
+        assert!(!results[1].openness_valid);
+        assert_eq!(results[0].openness, 1.0);
+        assert_eq!(results[1].openness, 1.0);
+    }
+
+    #[test]
+    fn custom_wide_eligibility_has_no_threshold_jump() {
+        let below = custom_wide_pose_eligibility(0.3499);
+        let edge = custom_wide_pose_eligibility(0.35);
+        let above = custom_wide_pose_eligibility(0.3501);
+
+        assert_eq!(below, 0.0);
+        assert_eq!(edge, 0.0);
+        assert!(above > 0.0);
+        assert!(above < 1.0e-5);
     }
 }
 
@@ -1025,7 +1126,6 @@ impl Pipeline {
                 // while SRanipal remains selected. This gives us same-frame A/B telemetry
                 // before the user entrusts VRCFT output to the new model.
                 let mut custom = [None, None];
-                let mut custom_pose_active = [false; 2];
                 let mut custom_fresh = false;
                 if t_em.wide_loaded.load(Ordering::Relaxed) {
                     let raw = *t_em.wide_raw.lock().unwrap();
@@ -1050,7 +1150,6 @@ impl Pipeline {
                         state.tuning.wide_requires_both,
                     );
                     let wide_diag = custom_wide_state.diag();
-                    custom_pose_active = wide_diag.active;
                     *t_em.wide_ready.lock().unwrap() = wide_diag.ready;
                     *t_em.wide_bootstrap_seen.lock().unwrap() = wide_diag.bootstrap_seen;
                     custom_fresh = now.duration_since(wide_fresh_at) <= Duration::from_millis(500)
@@ -1083,7 +1182,7 @@ impl Pipeline {
                         results[i].wide = 0.0;
                     }
                 }
-                apply_custom_wide_pose(&mut results, use_custom, custom_pose_active);
+                apply_custom_wide_pose(&mut results, use_custom, state.tuning.wide_requires_both);
                 // Brow: blink-gated EMA + baseline of the ML thread's raw brow, per eye.
                 // `is_new` advances the EMA once per inference (not per 120Hz tick); the
                 // result is None until the first open inference, so we never emit a
