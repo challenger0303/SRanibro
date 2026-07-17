@@ -211,10 +211,66 @@ positive while their target-dependent modulation is flat. It remains a
 synthetic renderer-family result. Real XR5 or VR4 frames enter only under a
 later transfer-audit preregistration.
 
+## Phase 1.4: XR5 real-recording transfer audit
+
+The frozen protocol is in
+[`PHASE1_4_XR5_TRANSFER_PREREG.md`](PHASE1_4_XR5_TRANSFER_PREREG.md). This is a
+read-only audit of every completed Dream Air / XR5 EyeWide capture below one
+`wide_data/sessions` tree. It uses the fixed production XR5 geometry and the
+same sealed EyeNet bytes as Phase 1.3. It does not search geometry or
+brightness, fit a model, select sessions, update calibration, or write to the
+recording or application configuration.
+
+The recorded audit is deliberately split into two clean release-build commands.
+The first command inventories and non-pixel-validates the private recording
+tree. It cannot accept or load a model and does not decode PNG pixels:
+
+```powershell
+cargo run --release --features research-synthetic-eye-lab `
+  --bin synthetic-eye-xr5-transfer -- seal-input `
+  --phase13-decision research-output\phase13-decision-243ab4d `
+  --phase13-confirmation research-output\phase13-confirmation-243ab4d `
+  --wide-data C:\path\to\wide_data `
+  --out research-output\phase14-xr5-input
+```
+
+Preserve the printed input-manifest SHA-256. The second command verifies that
+external seal and reconstructs the same tree before decoding any frame. It then
+performs two independent decode/preprocess passes, opens the fixed model only
+after those passes agree, and evaluates two fresh EyeNet instances in opposite
+orders:
+
+```powershell
+cargo run --release --features research-synthetic-eye-lab `
+  --bin synthetic-eye-xr5-transfer -- analyze `
+  --phase13-decision research-output\phase13-decision-243ab4d `
+  --phase13-confirmation research-output\phase13-confirmation-243ab4d `
+  --wide-data C:\path\to\wide_data `
+  --input research-output\phase14-xr5-input `
+  --input-seal <input-manifest-sha256> `
+  --model C:\path\to\00-0000.params_opencl.params `
+  --out research-output\phase14-xr5-analysis
+```
+
+Both commands require a clean worktree and a release executable built from the
+current commit. Every trusted dependency and the private tree are rechecked
+immediately before the staged artifact is published. A source, model, seal, or
+recording-tree change prevents publication. Raw PNGs are never copied to the
+artifacts.
+
+This audit characterizes the existing XR5 recordings at their saved 30 Hz rate.
+Those recordings come from one user/device, and the XR5 geometry was developed
+with related captures, so every result is unconditionally labelled
+`independence_unproven`. It cannot establish multi-user transfer, 120 Hz blink
+dynamics, hour-scale stability, or a production correction. VR4 remains outside
+this phase.
+
 ## Limits
 
-These results establish causality only inside this synthetic renderer family. They do
-not show that EyeNet uses the same feature on real HMD camera frames, and the tool never
-turns a high-scoring pattern into a production filter. Lashes, highlights, blur, noise,
-translation/cropping, 200x200 XR5 preprocessing, temporal sequences and bounded
-factorial search are deliberately deferred.
+The Phase 0--1.3 interventions establish causality only inside this synthetic
+renderer family; they do not show that EyeNet uses the same feature on real HMD
+camera frames. Phase 1.4 separately characterizes fixed 200x200 XR5 captures and
+their short recorded sequences, but it is observational and in-sample. None of
+the tools turns a high-scoring pattern into a production filter. Controlled
+real-image interventions for lashes, highlights, blur, noise, translation, crop,
+or a bounded factorial preprocessing search remain deferred.

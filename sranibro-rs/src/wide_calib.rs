@@ -459,6 +459,21 @@ fn write_gray_png(path: &Path, w: u32, h: u32, pixels: &[u8], mirror: bool) -> s
         .map_err(std::io::Error::other)
 }
 
+/// Research-only bridge used to prove that the XR5 audit reverses the exact
+/// mirror convention and PNG bytes produced by the real capture writer. It is
+/// deliberately unavailable in normal builds.
+#[cfg(feature = "research-synthetic-eye-lab")]
+#[doc(hidden)]
+pub fn research_write_gray_png(
+    path: &Path,
+    w: u32,
+    h: u32,
+    pixels: &[u8],
+    mirror: bool,
+) -> std::io::Result<()> {
+    write_gray_png(path, w, h, pixels, mirror)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
