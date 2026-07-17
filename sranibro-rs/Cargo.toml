@@ -33,6 +33,11 @@ name = "synthetic-eye-xr5-transfer"
 path = "research/synthetic-eye-lab/xr5_transfer_main.rs"
 required-features = ["research-synthetic-eye-lab"]
 
+[[bin]]
+name = "xr5-geometry-discovery"
+path = "research/synthetic-eye-lab/xr5_geometry_discovery_main.rs"
+required-features = ["research-synthetic-eye-lab"]
+
 [dependencies]
 matrixmultiply = "0.3"
 serde = { version = "1", features = ["derive"] }

@@ -14,6 +14,7 @@ pub mod device;
 pub mod diagnostics;
 pub mod engine;
 pub mod geometry_calib;
+pub mod geometry_discovery;
 pub mod geometry_fitrun;
 pub mod logcap;
 pub mod ml;

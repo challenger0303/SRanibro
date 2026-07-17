@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 
 use crate::core::types::{DespeckleParams, FlattenParams, MlGeometry};
 use crate::geometry_calib::{GeometryDataset, SampleFamily, SampleKind};
+use crate::geometry_discovery::{estimate_motion_geometry, MotionFrame, MotionGeometryEstimate};
 use crate::ml::{brightness, eye_net::EyeNet, preprocess, tvm_params};
 
 const LOG_CAP: usize = 80;
@@ -76,6 +77,11 @@ pub struct GeometryFitResult {
     pub baseline_holdout: GeometryMetrics,
     pub candidate_holdout: GeometryMetrics,
     pub holdout_improvement: f32,
+    /// EyeNet-independent absolute crop/rotation initialization derived from the
+    /// training blink motion. It is reported even when safety gates keep it out of the
+    /// search, and it never sees the untouched holdout.
+    pub motion_seed: Option<MotionGeometryEstimate>,
+    pub candidate_from_motion_seed: bool,
     pub accepted: bool,
     pub reason: String,
 }
@@ -383,6 +389,7 @@ struct Scored {
     params: SearchParams,
     geometry: [MlGeometry; 2],
     metrics: GeometryMetrics,
+    motion_seed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -428,6 +435,39 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
     if cancelled(&shared, &cancel) {
         return;
     }
+
+    // Derive the absolute seed before per-frame adaptive brightness. Geometry must
+    // follow the spatial eyelid motion, not a user's changing photometric affine.
+    let motion_seed =
+        match estimate_dataset_motion_seed(&inputs.dataset, inputs.baseline, inputs.mirrors) {
+            Ok(estimate) => {
+                log(&shared, format!("[motion seed] {}", estimate.reason));
+                for (eye, name) in [(0usize, "L"), (1usize, "R")] {
+                    let value = &estimate.eyes[eye];
+                    let g = value.geometry;
+                    log(
+                        &shared,
+                        format!(
+                        "[motion seed {name}] crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1} error {:.4}",
+                        g.crop_left,
+                        g.crop_right,
+                        g.crop_top,
+                        g.crop_bottom,
+                        g.rotate_deg,
+                        value.fit_error
+                    ),
+                    );
+                }
+                Some(estimate)
+            }
+            Err(message) => {
+                log(
+                    &shared,
+                    format!("[motion seed skipped] {message}; local ML search remains available"),
+                );
+                None
+            }
+        };
 
     log(
         &shared,
@@ -599,6 +639,13 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
     }
     stage3_params.truncate(12);
     work_total = work_total.saturating_sub((12 - stage3_params.len()) * train3.len());
+    let motion_seed_geometry = motion_seed
+        .as_ref()
+        .filter(|estimate| estimate.search_eligible && estimate.geometry != inputs.baseline)
+        .map(|estimate| estimate.geometry);
+    if motion_seed_geometry.is_some() {
+        work_total += train3.len();
+    }
     let mut stage3 = evaluate_set(
         &shared,
         &cancel,
@@ -612,12 +659,41 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         &mut work_done,
         work_total,
     );
+    if let Some(geometry) = motion_seed_geometry {
+        log(
+            &shared,
+            "[search 3/3] evaluating the independent motion-derived seed",
+        );
+        let metrics = evaluate_candidate(
+            &mut net,
+            &prepared,
+            &train3,
+            geometry,
+            inputs.mirrors,
+            &cancel,
+        );
+        work_done += train3.len();
+        progress(
+            &shared,
+            "motion-seed validation",
+            work_done.min(work_total),
+            work_total,
+        );
+        if metrics.score.is_finite() {
+            stage3.push(Scored {
+                params: SearchParams::default(),
+                geometry,
+                metrics,
+                motion_seed: true,
+            });
+        }
+    }
     if cancelled(&shared, &cancel) {
         return;
     }
     let baseline_train = stage3
         .iter()
-        .find(|entry| entry.params == SearchParams::default())
+        .find(|entry| entry.params == SearchParams::default() && !entry.motion_seed)
         .map(|entry| entry.metrics.clone())
         .unwrap_or_else(|| baseline2.clone());
     stage3.retain(|entry| admissible(&entry.metrics, &baseline_train));
@@ -628,7 +704,7 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
 
     let flat_objective = stage3.get(1).is_some_and(|runner_up| {
         (best.metrics.score - runner_up.metrics.score).abs() < 0.012
-            && best.params.distance(runner_up.params) > 0.75
+            && scored_distance(&best, runner_up) > 0.75
     });
 
     log(
@@ -669,7 +745,7 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         &best.metrics,
         &baseline_holdout,
         &candidate_holdout,
-        best.params,
+        best.params == SearchParams::default() && !best.motion_seed,
         flat_objective,
     );
     let improvement = candidate_holdout.score - baseline_holdout.score;
@@ -681,6 +757,8 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         baseline_holdout,
         candidate_holdout,
         holdout_improvement: improvement,
+        motion_seed,
+        candidate_from_motion_seed: best.motion_seed,
         accepted,
         reason,
     };
@@ -1610,6 +1688,89 @@ fn best_audit_case(
         .unwrap_or(0)
 }
 
+fn estimate_dataset_motion_seed(
+    dataset: &GeometryDataset,
+    baseline: [MlGeometry; 2],
+    mirrors: [bool; 2],
+) -> Result<MotionGeometryEstimate, String> {
+    // The canonical descriptor was defined under these fixed defaults. Do not let a
+    // user's active brightness/flatten tuning move the coordinate system we are trying
+    // to recover; the ordinary ML search still evaluates with the captured live filters.
+    let despeckle = DespeckleParams::default();
+    let flatten = FlattenParams::default();
+    let selected = dataset
+        .samples
+        .iter()
+        .filter(|sample| {
+            !sample.kind.is_holdout() && sample.kind.family() == SampleFamily::NaturalBlinks
+        })
+        .collect::<Vec<_>>();
+    let left_owned = selected
+        .iter()
+        .map(|sample| {
+            let (width, height) = sample.left_size;
+            let pixels =
+                preprocess::despeckle(&sample.left, width as usize, height as usize, &despeckle);
+            let pixels = preprocess::flatten(&pixels, width as usize, height as usize, &flatten);
+            (sample.phase_index, width, height, pixels)
+        })
+        .collect::<Vec<_>>();
+    let right_owned = selected
+        .iter()
+        .map(|sample| {
+            let (width, height) = sample.right_size;
+            let pixels =
+                preprocess::despeckle(&sample.right, width as usize, height as usize, &despeckle);
+            let pixels = preprocess::flatten(&pixels, width as usize, height as usize, &flatten);
+            (sample.phase_index, width, height, pixels)
+        })
+        .collect::<Vec<_>>();
+    let left = left_owned
+        .iter()
+        .map(|(group, width, height, pixels)| MotionFrame {
+            group: *group,
+            width: *width,
+            height: *height,
+            pixels,
+        })
+        .collect::<Vec<_>>();
+    let right = right_owned
+        .iter()
+        .map(|(group, width, height, pixels)| MotionFrame {
+            group: *group,
+            width: *width,
+            height: *height,
+            pixels,
+        })
+        .collect::<Vec<_>>();
+    estimate_motion_geometry(&left, &right, baseline, mirrors)
+}
+
+fn scored_distance(left: &Scored, right: &Scored) -> f32 {
+    if !left.motion_seed && !right.motion_seed {
+        return left.params.distance(right.params);
+    }
+    let mut squared = 0.0f32;
+    for eye in 0..2 {
+        let a = left.geometry[eye];
+        let b = right.geometry[eye];
+        let aw = 1.0 - a.crop_left - a.crop_right;
+        let bw = 1.0 - b.crop_left - b.crop_right;
+        let ah = 1.0 - a.crop_top - a.crop_bottom;
+        let bh = 1.0 - b.crop_top - b.crop_bottom;
+        let acx = a.crop_left + aw * 0.5;
+        let bcx = b.crop_left + bw * 0.5;
+        let acy = a.crop_top + ah * 0.5;
+        let bcy = b.crop_top + bh * 0.5;
+        squared += ((acx - bcx) / 0.08).powi(2);
+        squared += ((acy - bcy) / 0.08).powi(2);
+        squared += ((aw - bw) / 0.15).powi(2);
+        squared += ((ah - bh) / 0.15).powi(2);
+        squared += ((a.rotate_deg - b.rotate_deg) / 8.0).powi(2);
+    }
+    (squared / 2.0).sqrt()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_set(
     shared: &Arc<Mutex<Shared>>,
@@ -1649,6 +1810,7 @@ fn evaluate_set(
                 params,
                 geometry,
                 metrics,
+                motion_seed: false,
             });
         }
     }
@@ -1983,10 +2145,10 @@ fn acceptance(
     candidate_train: &GeometryMetrics,
     baseline_holdout: &GeometryMetrics,
     candidate_holdout: &GeometryMetrics,
-    params: SearchParams,
+    candidate_is_baseline: bool,
     flat_objective: bool,
 ) -> (bool, String) {
-    if params == SearchParams::default() {
+    if candidate_is_baseline {
         return (
             false,
             "The current geometry already scored best; nothing was changed.".into(),
@@ -2546,7 +2708,7 @@ mod tests {
             &training_winner,
             &baseline,
             &tiny_holdout_gain,
-            SearchParams([0.2, 0.0, 0.0, 0.0, 0.0]),
+            false,
             false,
         );
         assert!(!accepted);
@@ -2582,7 +2744,7 @@ mod tests {
             &candidate_train,
             &baseline,
             &candidate_holdout,
-            SearchParams([0.2, 0.0, 0.0, 0.0, 0.0]),
+            false,
             false,
         );
         assert!(accepted, "{reason}");

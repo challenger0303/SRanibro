@@ -265,6 +265,29 @@ with related captures, so every result is unconditionally labelled
 dynamics, hour-scale stability, or a production correction. VR4 remains outside
 this phase.
 
+## XR5 motion-geometry development positive control
+
+`xr5-geometry-discovery` exercises the EyeNet-independent initializer in
+`src/geometry_discovery.rs`. It extracts only a low-dimensional temporal motion
+envelope from the existing `blink_negative` frames after fixed default despeckling and
+solves for the absolute crop window and rotation that map that envelope into the
+canonical XR5 EyeNet region.
+The canonical target consists of aggregate mean/covariance constants only; no eye
+image or reconstructable template is embedded.
+
+```powershell
+cargo run --release --features research-synthetic-eye-lab `
+  --bin xr5-geometry-discovery -- `
+  --wide-data $env:APPDATA\SRanibro\wide_data
+```
+
+This is a development positive control, not an independent transfer result: the
+same developer sessions contributed to the aggregate canonical target. The normal
+in-app fitter now derives its seed from training-only natural-blink frames, but
+the seed can enter the search only after raw-motion confidence gates and can never
+be applied without the existing EyeNet guards and untouched holdout improvement.
+The command above is read-only and never changes application configuration.
+
 ## Limits
 
 The Phase 0--1.3 interventions establish causality only inside this synthetic
