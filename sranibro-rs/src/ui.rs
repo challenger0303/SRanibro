@@ -204,6 +204,9 @@ struct App {
     geometry_preview_restore: Option<[crate::core::types::MlGeometry; 2]>,
     /// Previous persisted geometry retained for one-click rollback after Apply.
     geometry_rollback: Option<[crate::core::types::MlGeometry; 2]>,
+    /// Explicit acknowledgement required before persisting a candidate that failed
+    /// untouched-holdout validation. Reset whenever a new capture or fit begins.
+    geometry_unvalidated_ack: bool,
     /// Which tab of the ML-input modal is active: 0 = Image (crop/stretch/rotate), 1 = Filter.
     geom_tab: u8,
     /// Which eye the Image-tab sliders target: 0 = both, 1 = left, 2 = right. The
@@ -291,6 +294,7 @@ impl App {
             geometry_capture_filters: None,
             geometry_preview_restore: None,
             geometry_rollback: None,
+            geometry_unvalidated_ack: false,
             geom_tab: 0,
             geom_eye: 0,
             net_view: false,
@@ -649,6 +653,8 @@ impl App {
             return;
         }
         self.restore_geometry_preview(false);
+        self.geometry_fitter.clear_finished();
+        self.geometry_unvalidated_ack = false;
         let generation = [
             self.tele.c_frame_l.load(Ordering::Relaxed),
             self.tele.c_frame_r.load(Ordering::Relaxed),
@@ -748,6 +754,7 @@ impl App {
             despeckle,
             flatten,
         };
+        self.geometry_unvalidated_ack = false;
         match self.geometry_fitter.start(inputs) {
             Ok(()) => {
                 self.dream_air_msg = Some((
@@ -867,17 +874,17 @@ impl App {
         }
     }
 
-    fn apply_geometry_candidate(&mut self, result: &GeometryFitResult) {
-        if !result.accepted {
+    fn apply_geometry_candidate(&mut self, result: &GeometryFitResult, allow_unvalidated: bool) {
+        if !result.accepted && !allow_unvalidated {
             self.dream_air_msg = Some((
-                "This candidate did not pass holdout validation and cannot be applied.".into(),
+                "Confirm the holdout warning before applying this candidate.".into(),
                 ERR,
             ));
             return;
         }
         let device = self.pipeline.device_key.clone();
         if self.config.geometry_for(&device) == result.candidate {
-            self.dream_air_msg = Some(("This validated geometry is already applied.".into(), OK));
+            self.dream_air_msg = Some(("This geometry is already applied.".into(), OK));
             return;
         }
         let live = *self.pipeline.geometry.lock().unwrap();
@@ -913,9 +920,18 @@ impl App {
         }
         self.set_live_geometry(result.candidate);
         self.geometry_rollback = Some(previous);
+        self.geometry_unvalidated_ack = false;
         self.dream_air_msg = Some((
-            format!("Candidate applied. Safety backup: {}", backup.display()),
-            OK,
+            format!(
+                "{} candidate applied. Safety backup: {}",
+                if result.accepted {
+                    "Validated"
+                } else {
+                    "Unvalidated"
+                },
+                backup.display()
+            ),
+            if result.accepted { OK } else { WARN },
         ));
     }
 
@@ -2281,40 +2297,61 @@ impl App {
                                     ui.label(num(last));
                                 }
                                 ui.add_space(SP2);
-                                if result.accepted {
-                                    let already_applied = self
-                                        .config
-                                        .geometry_for(&self.pipeline.device_key)
-                                        == result.candidate;
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                !already_applied,
-                                                egui::Button::new("Preview candidate live"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.preview_geometry_candidate(&result);
-                                        }
-                                        if ui
+                                let already_applied = self
+                                    .config
+                                    .geometry_for(&self.pipeline.device_key)
+                                    == result.candidate;
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !already_applied,
+                                            egui::Button::new("Preview candidate live"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.preview_geometry_candidate(&result);
+                                    }
+                                    if result.accepted
+                                        && ui
                                             .add_enabled(
                                                 !already_applied,
                                                 egui::Button::new("Apply validated candidate"),
                                             )
                                             .clicked()
-                                        {
-                                            self.apply_geometry_candidate(&result);
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                self.geometry_preview_restore.is_some(),
-                                                egui::Button::new("Discard preview"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.restore_geometry_preview(true);
-                                        }
-                                    });
+                                    {
+                                        self.apply_geometry_candidate(&result, false);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.geometry_preview_restore.is_some(),
+                                            egui::Button::new("Discard preview"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.restore_geometry_preview(true);
+                                    }
+                                });
+                                if !result.accepted && !already_applied {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "The automatic recommendation is still to keep the current geometry. Preview the candidate before overriding it.",
+                                        )
+                                        .size(10.0 * S)
+                                        .color(WARN),
+                                    );
+                                    ui.checkbox(
+                                        &mut self.geometry_unvalidated_ack,
+                                        "I understand this candidate failed holdout validation",
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            self.geometry_unvalidated_ack,
+                                            egui::Button::new("Apply unvalidated candidate"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.apply_geometry_candidate(&result, true);
+                                    }
                                 }
                                 ui.horizontal(|ui| {
                                     if ui.button("Record again").clicked() {
@@ -5091,6 +5128,7 @@ impl App {
         self.geometry_capture_filters = None;
         self.geometry_fitter.cancel();
         self.geometry_rollback = None;
+        self.geometry_unvalidated_ack = false;
         let norm = |s: &str| {
             let t = s.trim();
             if t.is_empty() {

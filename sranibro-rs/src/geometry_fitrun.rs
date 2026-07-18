@@ -348,6 +348,24 @@ impl GeometryFitter {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+
+    /// Drop a completed/cancelled result before a new capture starts. A running job is
+    /// never cleared: its worker must be cancelled and finish first.
+    pub fn clear_finished(&mut self) -> bool {
+        if self.is_running() {
+            return false;
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let mut state = lock_shared(&self.shared);
+        state.status = Status::Idle;
+        state.log.clear();
+        state.stage.clear();
+        state.completed = 0;
+        state.total = 0;
+        true
+    }
 }
 
 impl Drop for GeometryFitter {
@@ -2681,6 +2699,46 @@ mod tests {
             presence: 0.10,
             open,
         }
+    }
+
+    #[test]
+    fn clear_finished_removes_stale_result_state() {
+        let mut fitter = GeometryFitter::new();
+        {
+            let mut state = lock_shared(&fitter.shared);
+            state.log.push("old result".into());
+            state.stage = "done".into();
+            state.completed = 10;
+            state.total = 10;
+            state.status = Status::Cancelled {
+                log: state.log.clone(),
+            };
+        }
+
+        assert!(fitter.clear_finished());
+        let state = lock_shared(&fitter.shared);
+        assert!(matches!(state.status, Status::Idle));
+        assert!(state.log.is_empty());
+        assert!(state.stage.is_empty());
+        assert_eq!(state.completed, 0);
+        assert_eq!(state.total, 0);
+    }
+
+    #[test]
+    fn clear_finished_never_hides_a_running_job() {
+        let mut fitter = GeometryFitter::new();
+        {
+            let mut state = lock_shared(&fitter.shared);
+            state.status = Status::Running {
+                stage: "search".into(),
+                completed: 1,
+                total: 2,
+                log: Vec::new(),
+            };
+        }
+
+        assert!(!fitter.clear_finished());
+        assert!(matches!(fitter.status(), Status::Running { .. }));
     }
 
     #[test]
