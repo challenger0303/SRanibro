@@ -145,7 +145,8 @@ response heatmap that shows how the model reacts to each part of the eye image.
 Dream Air / SE (XR5) adds an angled-camera preset, per-eye gaze finishing correction,
 an optional fused EyeChip gaze source, personal image EyeWide fitting, and Safe
 Geometry Fit. Safe Geometry Fit records labelled stereo samples, searches within
-hardware-safe bounds, and accepts a result only after untouched holdout validation.
+hardware-safe bounds, and validates the result on untouched holdout frames. Rejected
+candidates can still be previewed and applied through an explicit manual override.
 The inner XR5 IR LED/lens zone is excluded from geometry evidence. A completed
 capture can be exported as a feedback ZIP containing the exact labelled eye frames;
 that archive contains biometric eye imagery and is created only when you press Save.

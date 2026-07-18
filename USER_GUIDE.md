@@ -193,10 +193,14 @@ eyelid model does not respond well for the current wearer or optical position.
    close and blink prompt.
 2. Keep the HMD seated consistently for the full recording.
 3. Run the fit after capture completes.
-4. Preview and apply a candidate only if it passes untouched holdout validation.
+4. Use **Preview candidate live** and check normal blinks and slow closes.
+5. If the result is `HOLDOUT PASS`, save it with **Apply validated candidate**.
 
-`KEEP CURRENT GEOMETRY` is a safe result, not an error. It means the candidate
-did not prove that it generalizes better than the active geometry.
+`KEEP CURRENT GEOMETRY` is the automatic recommendation to retain the current
+settings. You can still preview a rejected candidate. If it works better in the
+headset, acknowledge the warning and choose **Apply unvalidated candidate**.
+SRanibro creates a backup first, and **Rollback last applied geometry** restores
+the previous settings during the same run.
 
 Safe Geometry Fit is inside `SRanibro.exe` and does not require Python. It uses
 the configured SRanipal eyelid model and does not train a new model.

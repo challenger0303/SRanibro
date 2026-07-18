@@ -191,10 +191,13 @@ Recenterは現在の自然な開眼状態を基準として学習します。**A
    指示をすべて行う
 2. 記録中はHMDの装着位置を一定に保つ
 3. 記録完了後にFitを実行する
-4. untouched holdout検証を通った候補だけPreview / Applyする
+4. **Preview candidate live**で候補を試し、まぶたの動きを確認する
+5. `HOLDOUT PASS`なら**Apply validated candidate**で保存する
 
-`KEEP CURRENT GEOMETRY`は失敗ではなく、安全側の正常な結果です。候補が現在値より
-他の動きにも適用できると証明できなかったため、現在値を維持したという意味です。
+`KEEP CURRENT GEOMETRY`は、現在値を残すという自動判定です。不合格候補もPreviewは
+できます。実際の動きが良ければ警告を確認し、チェックを入れて
+**Apply unvalidated candidate**を押すと保存できます。適用前の状態は自動でバックアップ
+され、直後なら**Rollback last applied geometry**で戻せます。
 
 Safe Geometry Fitは`SRanibro.exe`内で完結し、Pythonは不要です。設定済みの
 SRanipalまぶたモデルを評価しますが、新しいMLモデルを学習する機能ではありません。
