@@ -1162,7 +1162,7 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(14.0 * S, 9.0 * S)),
             )
             .show(ctx, |ui| {
-                // Minimal bar: just the wordmark + badge. Device name, output state,
+                // Minimal bar: just the wordmark. Device name, output state,
                 // and per-stage detail live in the pipeline nodes (hover a node).
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -1180,8 +1180,6 @@ impl App {
                             .strong()
                             .color(ACCENT),
                     );
-                    ui.add_space(10.0 * S);
-                    badge(ui, "CONSOLE");
                 });
             });
     }
@@ -5208,22 +5206,6 @@ fn now_hms() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{:02}:{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60, s % 60)
-}
-
-/// The "CONSOLE" badge: transparent fill, hairline border, muted mono text.
-fn badge(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::default()
-        .stroke(Stroke::new(1.0, BORDER))
-        .rounding(5.0 * S)
-        .inner_margin(egui::Margin::symmetric(6.0 * S, 1.0 * S))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(text)
-                    .monospace()
-                    .size(10.0 * S)
-                    .color(TEXT3),
-            );
-        });
 }
 
 fn log_line(ui: &mut egui::Ui, tag: &str, col: Color32, module: &str, msg: &str) {
