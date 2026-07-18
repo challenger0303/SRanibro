@@ -1,15 +1,15 @@
 SRanibro  (v0.1.5-beta)
 =======================
 
-VR eye-tracking -> VRCFaceTracking bridge for Tobii-based eye-tracking VR
-headsets: Pimax Crystal / Crystal Super, Pimax Dream Air / XR5, StarVR One
-and Varjo.
+VR eye-tracking -> VRCFaceTracking bridge for Hotmirror eye-tracking VR
+headsets: Pimax Crystal / Crystal Super (VR4), Pimax Dream Air / SE (XR5),
+StarVR One and Varjo.
 
 SRanibro reads your headset's eye cameras, runs eyelid + gaze inference
 locally, and serves the result over the BrokenEye protocol so VRCFaceTracking
 can drive your avatar's eyes -- openness, wide, squeeze, and gaze.
 
-  BETA. Expect rough edges. Dream Air / XR5 image alignment, image EyeWide,
+  BETA. Expect rough edges. Dream Air / SE (XR5) image alignment, image EyeWide,
   eyebrow model fitting and calibration-recording export are included.
 
 The SRanibro APP is a closed-source, binary-only beta -- it's on the Releases
@@ -45,11 +45,24 @@ telemetry. Its only outputs are the local BrokenEye / OSC sockets described
 below.
 
 
+USER GUIDE
+----------
+
+English:
+  https://github.com/challenger0303/SRanibro/blob/main/USER_GUIDE.md
+
+Japanese:
+  https://github.com/challenger0303/SRanibro/blob/main/USER_GUIDE.ja.md
+
+The guides cover first-time setup, the bundled VRCFaceTracking module,
+calibration, Dream Air / SE (XR5) tools, troubleshooting, and safe feedback export.
+
+
 REQUIREMENTS
 ------------
 
   OS        Windows 10 / 11 (x64), a DX12- or Vulkan-capable GPU
-  Headset   Pimax Crystal / Crystal Super, Pimax Dream Air / XR5,
+  Headset   Pimax Crystal / Crystal Super (VR4), Dream Air / SE (XR5),
             StarVR One, or a supported Varjo path
             (the StarVR One uses Tobii IS4)
   Consumer  VRCFaceTracking -- use the bundled SRanibro eye-only module
@@ -85,16 +98,18 @@ QUICK START
    line reads "Tobii DLL required -- set it in Settings, then reload." -- that
    is expected.
 
-2. Settings -> Assets:
-     - SRanipal folder       Browse to your SRanipal install directory.
-     - Tobii DLL (required)  Browse to your Tobii stream-engine DLL.
+2. Settings:
+     - Connection & models -> SRanipal model folder
+                             Browse to your SRanipal install directory.
+     - Connection & models -> Tobii runtime DLL
+                             Browse to your Tobii stream-engine DLL.
      - Device                auto (default; auto-detects a connected Pimax
                              eye-chip), pimax_vr4 (Pimax over WinUSB),
-                             pimax_xr5 (Dream Air / XR5 angled cameras),
-                             pimax_dll (Pimax via the Tobii stream engine),
-                             or starvr (StarVR One). Auto can distinguish the
-                             connected Pimax VR4/XR5 EyeChip; explicit selection
-                             remains available for diagnosis.
+                             pimax_xr5 (Dream Air / SE; XR5 angled cameras),
+                             starvr (StarVR One), varjo (native Varjo Base),
+                             or varjo_mjpeg (Varjo Eye Streamer). Auto can
+                             distinguish the connected Pimax VR4/XR5 EyeChip;
+                             StarVR and Varjo must be selected explicitly.
      - Apply & reload (no app restart).
 
 3. On connect, SRanibro stops the Tobii runtime service to open the eye-camera
@@ -127,10 +142,11 @@ the top-left of the eye cameras opens ML-input tools: crop / rotate / stretch th
 image the model sees, a reflection filter, an optional Brightness match, and a
 response heatmap that shows how the model reacts to each part of the eye image.
 
-Dream Air / XR5 adds an angled-camera preset, per-eye gaze finishing correction,
+Dream Air / SE (XR5) adds an angled-camera preset, per-eye gaze finishing correction,
 an optional fused EyeChip gaze source, personal image EyeWide fitting, and Safe
 Geometry Fit. Safe Geometry Fit records labelled stereo samples, searches within
-hardware-safe bounds, and accepts a result only after untouched holdout validation.
+hardware-safe bounds, and validates the result on untouched holdout frames. Rejected
+candidates can still be previewed and applied through an explicit manual override.
 The inner XR5 IR LED/lens zone is excluded from geometry evidence. A completed
 capture can be exported as a feedback ZIP containing the exact labelled eye frames;
 that archive contains biometric eye imagery and is created only when you press Save.
@@ -161,7 +177,7 @@ UPDATE HISTORY
 --------------
 
 v0.1.5-beta
-  - Added full Pimax Dream Air / XR5 support for its 200x200 120 Hz stereo eye
+  - Added full Pimax Dream Air / SE (XR5) support for its 200x200 120 Hz stereo eye
     cameras, native Tobii pupil/openness/gaze data, and angled image geometry.
   - Added optional EyeChip combined gaze plus saved per-eye centre/range/vergence
     correction. Per-eye gaze remains available for natural convergence.
