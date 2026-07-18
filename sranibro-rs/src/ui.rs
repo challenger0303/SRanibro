@@ -976,21 +976,30 @@ impl App {
     fn hot_load_wide_model(&mut self, wide_bin: &std::path::Path) {
         match crate::ml::wide_net::WideNet::load(wide_bin) {
             Ok(net) => {
-                self.pipeline.set_wide(Some(net));
+                let active_xr5 = self.pipeline.device_key == "pimax_xr5";
+                if active_xr5 {
+                    self.pipeline.set_wide(Some(net));
+                }
                 let path = wide_bin.to_string_lossy().into_owned();
                 self.edit.wide_model = path.clone();
                 self.config.assets.wide_model = Some(path);
                 match self.config.save(&crate::config::config_path()) {
                     Ok(()) => {
-                        self.dream_air_msg = Some((
+                        let message = if active_xr5 {
                             "Wide model fitted and loaded for A/B comparison; choose Auto or Custom to output it"
-                                .into(),
-                            OK,
-                        ));
+                        } else {
+                            "Wide model fitted and saved, but not loaded because the active HMD is not XR5; switch back to XR5 and Apply & reload"
+                        };
+                        self.dream_air_msg = Some((message.into(), OK));
                     }
                     Err(error) => {
+                        let action = if active_xr5 {
+                            "loaded"
+                        } else {
+                            "validated but not loaded on this non-XR5 HMD"
+                        };
                         self.dream_air_msg = Some((
-                            format!("Wide model loaded, but config save failed: {error}"),
+                            format!("Wide model {action}, but config save failed: {error}"),
                             ERR,
                         ));
                     }
@@ -4467,41 +4476,48 @@ impl App {
                                                 }
                                             });
                                     });
-                                    ui.horizontal(|ui| {
-                                        ui.label(label("XR5 EyeWide source"));
-                                        egui::ComboBox::from_id_salt("settings_wide_source")
-                                            .selected_text(self.edit.wide_source.as_str())
-                                            .show_ui(ui, |ui| {
-                                                for source in WideSource::ALL {
-                                                    ui.selectable_value(
-                                                        &mut self.edit.wide_source,
-                                                        source,
-                                                        source.as_str(),
-                                                    );
-                                                }
-                                            });
-                                    });
-                                    let mut use_combined =
-                                        self.edit.gaze_source == GazeSource::Combined;
-                                    if ui
-                                        .checkbox(
-                                            &mut use_combined,
-                                            "XR5: use EyeChip combined gaze (steadier)",
-                                        )
-                                        .on_hover_text(
-                                            "Default off. Applies after reload; does not affect openness or non-XR5 headsets.",
-                                        )
-                                        .changed()
-                                    {
-                                        self.edit.gaze_source = if use_combined {
-                                            GazeSource::Combined
-                                        } else {
-                                            GazeSource::PerEye
-                                        };
+                                    let selected_device =
+                                        crate::config::canonical_device_key(&self.edit.device);
+                                    let xr5_settings = selected_device == "pimax_xr5"
+                                        || (selected_device == "auto"
+                                            && self.pipeline.device_key == "pimax_xr5");
+                                    if xr5_settings {
+                                        ui.horizontal(|ui| {
+                                            ui.label(label("XR5 EyeWide source"));
+                                            egui::ComboBox::from_id_salt("settings_wide_source")
+                                                .selected_text(self.edit.wide_source.as_str())
+                                                .show_ui(ui, |ui| {
+                                                    for source in WideSource::ALL {
+                                                        ui.selectable_value(
+                                                            &mut self.edit.wide_source,
+                                                            source,
+                                                            source.as_str(),
+                                                        );
+                                                    }
+                                                });
+                                        });
+                                        let mut use_combined =
+                                            self.edit.gaze_source == GazeSource::Combined;
+                                        if ui
+                                            .checkbox(
+                                                &mut use_combined,
+                                                "XR5: use EyeChip combined gaze (steadier)",
+                                            )
+                                            .on_hover_text(
+                                                "Default off. Applies after reload; does not affect openness or non-XR5 headsets.",
+                                            )
+                                            .changed()
+                                        {
+                                            self.edit.gaze_source = if use_combined {
+                                                GazeSource::Combined
+                                            } else {
+                                                GazeSource::PerEye
+                                            };
+                                        }
+                                        ui.label(label(
+                                            "Combined mode trades natural near-focus convergence for lower per-eye jitter. Re-run gaze Center after changing it.",
+                                        ));
                                     }
-                                    ui.label(label(
-                                        "Combined mode trades natural near-focus convergence for lower per-eye jitter. Re-run gaze Center after changing it.",
-                                    ));
 
                                     let mut eyebrow_enabled = self
                                         .pipeline
@@ -4629,12 +4645,19 @@ impl App {
                                         &mut self.edit.brow_model,
                                         false,
                                     );
-                                    settings_path_row(
-                                        ui,
-                                        "XR5 EyeWide model (wide.bin)",
-                                        &mut self.edit.wide_model,
-                                        false,
-                                    );
+                                    let selected_device =
+                                        crate::config::canonical_device_key(&self.edit.device);
+                                    if selected_device == "pimax_xr5"
+                                        || (selected_device == "auto"
+                                            && self.pipeline.device_key == "pimax_xr5")
+                                    {
+                                        settings_path_row(
+                                            ui,
+                                            "XR5 EyeWide model (wide.bin)",
+                                            &mut self.edit.wide_model,
+                                            false,
+                                        );
+                                    }
                                 });
                         });
                         ui.add_space(SP3);
@@ -5065,6 +5088,7 @@ impl App {
     fn apply_and_reload(&mut self) {
         self.restore_geometry_preview(false);
         self.geometry_capture.abort();
+        self.wide.abort();
         self.geometry_capture_baseline = None;
         self.geometry_capture_filters = None;
         self.geometry_fitter.cancel();

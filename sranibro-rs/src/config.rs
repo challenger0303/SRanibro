@@ -94,9 +94,35 @@ pub fn config_path() -> PathBuf {
     base_dir().join("sranibro.toml")
 }
 
-/// Resolved path to the persisted calibration file.
+/// Legacy pre-0.1.5 calibration path. New runtime code must use
+/// [`calib_path_for`] so learned camera-specific bounds cannot cross HMDs.
 pub fn calib_path() -> PathBuf {
     base_dir().join("sranibro_calib.toml")
+}
+
+/// Resolved path to the persisted eyelid calibration for one canonical HMD.
+///
+/// The old single file mixed XR5 crop/model statistics with VR4, StarVR, and Varjo.
+/// Do not auto-import that ambiguous file: every HMD safely learns a fresh calibration
+/// once, then keeps its own baseline, blink depth, and mid-close anchor thereafter.
+pub fn calib_path_for(device: &str) -> PathBuf {
+    let canonical = canonical_device_key(device);
+    let safe: String = canonical
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    };
+    base_dir().join(format!("sranibro_calib_{safe}.toml"))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -419,8 +445,8 @@ pub struct Hmd {
     /// left/right eye cameras. (`device = "varjo"` uses the native VarjoLib SDK instead.)
     pub varjo_left_url: String,
     pub varjo_right_url: String,
-    /// EyeWide provider. The custom model is intentionally XR5-only; other HMDs
-    /// always retain the existing SRanipal-derived path.
+    /// Preferred XR5 EyeWide provider. This preference is retained while another HMD is
+    /// selected, but [`Config::wide_source_for`] forces every non-XR5 runtime to SRanipal.
     pub wide_source: WideSource,
 
     // --- Legacy single-mapping fields (pre per-device map). Still read from old configs
@@ -605,6 +631,17 @@ impl Config {
     /// currently-running device, so each HMD remembers its own orientation).
     pub fn set_mapping(&mut self, device: &str, m: EyeMapping) {
         self.hmd.mappings.insert(canonical_device_key(device), m);
+    }
+
+    /// Effective EyeWide provider for the running HMD. The saved selector is an XR5
+    /// preference, never a global override: VR4, StarVR, Varjo, and VPE always keep the
+    /// established SRanipal-derived Wide path even when XR5 was last set to Custom/Auto.
+    pub fn wide_source_for(&self, device: &str) -> WideSource {
+        if canonical_device_key(device) == "pimax_xr5" {
+            self.hmd.wide_source
+        } else {
+            WideSource::Sranipal
+        }
     }
 
     /// Resolved PER-EYE ML-input geometry for `device` as `[left, right]`: the saved
@@ -953,6 +990,27 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn is_state_file_name(name: &str) -> bool {
+    name == "sranibro.toml"
+        || name == "sranibro_calib.toml"
+        || (name.starts_with("sranibro_calib_") && name.ends_with(".toml"))
+}
+
+fn state_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str().map(str::to_owned) {
+            let path = entry.path();
+            if path.is_file() && is_state_file_name(&name) {
+                files.push((name, path));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
 fn create_state_backup_at(base: &Path, label: &str) -> std::io::Result<PathBuf> {
     let root = base.join("backups");
     std::fs::create_dir_all(&root)?;
@@ -969,16 +1027,13 @@ fn create_state_backup_at(base: &Path, label: &str) -> std::io::Result<PathBuf> 
         suffix += 1;
     }
     std::fs::create_dir_all(&dir)?;
-    for name in ["sranibro.toml", "sranibro_calib.toml"] {
-        let source = base.join(name);
-        if source.is_file() {
-            std::fs::copy(source, dir.join(name))?;
-        }
+    for (name, source) in state_files(base)? {
+        std::fs::copy(source, dir.join(name))?;
     }
     Ok(dir)
 }
 
-/// Snapshot the two user-editable state files before applying a guided profile.
+/// Snapshot the configuration and every per-HMD calibration before applying a profile.
 pub fn create_state_backup(label: &str) -> std::io::Result<PathBuf> {
     create_state_backup_at(&base_dir(), label)
 }
@@ -994,16 +1049,13 @@ pub fn latest_state_backup() -> Option<PathBuf> {
     entries.last().map(|entry| entry.path())
 }
 
-/// Restore a prior state snapshot. Missing files are left unchanged so backups
-/// made before a calibration file existed remain usable.
+/// Restore every state file present in a prior snapshot. Missing files are left unchanged
+/// so backups made before per-HMD calibration existed remain usable.
 pub fn restore_state_backup(dir: &Path) -> std::io::Result<()> {
     let base = base_dir();
-    for name in ["sranibro.toml", "sranibro_calib.toml"] {
-        let source = dir.join(name);
-        if source.is_file() {
-            let bytes = std::fs::read(source)?;
-            write_atomic(&base.join(name), &bytes)?;
-        }
+    for (name, source) in state_files(dir)? {
+        let bytes = std::fs::read(source)?;
+        write_atomic(&base.join(name), &bytes)?;
     }
     Ok(())
 }
@@ -1108,6 +1160,37 @@ mod tests {
         assert!(
             c.ml_params_path().is_none(),
             "no sranipal_dir -> no ML path"
+        );
+    }
+
+    #[test]
+    fn xr5_wide_source_never_leaks_to_other_hmds() {
+        let mut c = Config::default();
+        c.hmd.wide_source = WideSource::Custom;
+
+        for xr5 in ["pimax_xr5", "pimax-xr5", "xr5", "dream_air"] {
+            assert_eq!(c.wide_source_for(xr5), WideSource::Custom, "{xr5}");
+        }
+        for other in ["auto", "pimax_vr4", "starvr", "varjo", "varjo_mjpeg", "vpe"] {
+            assert_eq!(
+                c.wide_source_for(other),
+                WideSource::Sranipal,
+                "{other} must retain SRanipal Wide"
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_paths_are_canonical_and_per_device() {
+        assert_eq!(calib_path_for("dream_air"), calib_path_for("pimax_xr5"));
+        assert_ne!(calib_path_for("pimax_xr5"), calib_path_for("pimax_vr4"));
+        assert_ne!(calib_path_for("starvr"), calib_path_for("varjo"));
+        assert_ne!(calib_path_for("pimax_xr5"), calib_path());
+        assert_eq!(
+            calib_path_for("pimax-xr5")
+                .file_name()
+                .and_then(|s| s.to_str()),
+            Some("sranibro_calib_pimax_xr5.toml")
         );
     }
 
@@ -1522,12 +1605,24 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("sranibro.toml"), "config-v1").unwrap();
+        std::fs::write(root.join("sranibro_calib_pimax_xr5.toml"), "xr5-calib").unwrap();
+        std::fs::write(root.join("sranibro_calib_starvr.toml"), "starvr-calib").unwrap();
+        std::fs::write(root.join("unrelated.toml"), "do-not-copy").unwrap();
         let backup = create_state_backup_at(&root, "before calibration").unwrap();
         assert_eq!(
             std::fs::read_to_string(backup.join("sranibro.toml")).unwrap(),
             "config-v1"
         );
         assert!(!backup.join("sranibro_calib.toml").exists());
+        assert_eq!(
+            std::fs::read_to_string(backup.join("sranibro_calib_pimax_xr5.toml")).unwrap(),
+            "xr5-calib"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup.join("sranibro_calib_starvr.toml")).unwrap(),
+            "starvr-calib"
+        );
+        assert!(!backup.join("unrelated.toml").exists());
         assert!(backup
             .file_name()
             .unwrap()

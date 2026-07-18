@@ -25,6 +25,7 @@ pub struct Engine {
 pub fn pipeline_start_settings(cfg: &Config, device_key: &str) -> (DeviceMap, PipelineInit) {
     let mapping = cfg.mapping_for(device_key);
     let geometry = cfg.geometry_for(device_key);
+    let is_xr5 = crate::config::canonical_device_key(device_key) == "pimax_xr5";
     let ml_mirror = [
         geometry[0].mirror_h.unwrap_or(mapping.ml_mirror_l),
         geometry[1].mirror_h.unwrap_or(mapping.ml_mirror_r),
@@ -43,19 +44,19 @@ pub fn pipeline_start_settings(cfg: &Config, device_key: &str) -> (DeviceMap, Pi
             despeckle: cfg.despeckle_for(device_key),
             flatten: cfg.flatten_for(device_key),
             brightness: cfg.brightness_for(device_key),
-            gaze_correction: if crate::config::canonical_device_key(device_key) == "pimax_xr5" {
+            gaze_correction: if is_xr5 {
                 cfg.gaze_correction_for(device_key)
             } else {
                 crate::config::GazeCorrection::default()
             },
-            wide_enabled: if crate::config::canonical_device_key(device_key) == "pimax_xr5" {
+            wide_enabled: if is_xr5 {
                 cfg.dream_air_profile_for(device_key)
                     .map(|profile| profile.wide_supported)
                     .unwrap_or([true; 2])
             } else {
                 [true; 2]
             },
-            wide_source: cfg.hmd.wide_source,
+            wide_source: cfg.wide_source_for(device_key),
         },
     )
 }
@@ -179,13 +180,8 @@ pub fn build_engine(cfg: &Config) -> std::io::Result<Engine> {
     let cfg = &effective;
 
     let is_xr5 = crate::config::canonical_device_key(&device_key) == "pimax_xr5";
-    if cfg.hmd.wide_source == WideSource::Custom && !is_xr5 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "custom EyeWide is supported only on Dream Air / Pimax XR5",
-        ));
-    }
-    if cfg.hmd.wide_source == WideSource::Custom && net.is_none() {
+    let wide_source = cfg.wide_source_for(&device_key);
+    if wide_source == WideSource::Custom && net.is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "custom EyeWide needs the SRanipal eyelid model for blink gating",
@@ -196,7 +192,7 @@ pub fn build_engine(cfg: &Config) -> std::io::Result<Engine> {
     } else {
         None
     };
-    if cfg.hmd.wide_source == WideSource::Custom && wide.is_none() {
+    if wide_source == WideSource::Custom && wide.is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "wide_source=custom needs a valid [assets].wide_model",
@@ -306,6 +302,24 @@ mod tests {
             pipeline_start_settings(&cfg, "pimax_vr4").1.gaze_correction,
             crate::config::GazeCorrection::default()
         );
+    }
+
+    #[test]
+    fn custom_wide_selection_is_effective_only_for_xr5() {
+        let mut cfg = Config::default();
+        cfg.hmd.wide_source = WideSource::Custom;
+
+        assert_eq!(
+            pipeline_start_settings(&cfg, "pimax_xr5").1.wide_source,
+            WideSource::Custom
+        );
+        for other in ["pimax_vr4", "starvr", "varjo", "varjo_mjpeg", "vpe"] {
+            assert_eq!(
+                pipeline_start_settings(&cfg, other).1.wide_source,
+                WideSource::Sranipal,
+                "{other} must never inherit the XR5 custom selector"
+            );
+        }
     }
 
     #[test]

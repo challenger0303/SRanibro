@@ -735,13 +735,29 @@ impl Pipeline {
         mut adapter: Box<dyn HmdAdapter>,
         net: Option<EyeNet>,
         brow: Option<BrowNet>,
-        wide: Option<WideNet>,
+        mut wide: Option<WideNet>,
         mut sinks: Vec<Box<dyn OutputSink>>,
         map: DeviceMap,
         device_status: Arc<Mutex<String>>,
         device_key: String,
-        init: PipelineInit,
+        mut init: PipelineInit,
     ) -> io::Result<Pipeline> {
+        // Defense in depth: Pipeline is public and the diagnostic CLI calls it directly.
+        // Even a stale/global config or future caller must never run XR5 image-Wide or
+        // XR5 gaze trim on VR4, StarVR, Varjo, or VPE.
+        let is_xr5 = crate::config::canonical_device_key(&device_key) == "pimax_xr5";
+        if !is_xr5 {
+            if wide.is_some() {
+                eprintln!(
+                    "[wide] ignored XR5 custom EyeWide model for non-XR5 device {device_key}"
+                );
+            }
+            wide = None;
+            init.wide_source = WideSource::Sranipal;
+            init.wide_enabled = [true; 2];
+            init.gaze_correction = GazeCorrection::default();
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let recenter = Arc::new(AtomicBool::new(false));
@@ -1056,6 +1072,9 @@ impl Pipeline {
         }
 
         // Emit thread @ ~120Hz: post-process -> telemetry + sinks.
+        let calib_path = crate::config::calib_path_for(&device_key)
+            .to_string_lossy()
+            .into_owned();
         let (t_em, es, ep, er) = (tele.clone(), stop.clone(), paused.clone(), recenter.clone());
         let edr = diag_rec.clone();
         let t_tune = tuning.clone();
@@ -1076,10 +1095,9 @@ impl Pipeline {
             let mut wide_fresh_at = Instant::now() - Duration::from_secs(10);
             let period = Duration::from_micros(8333);
             let mut last = std::time::Instant::now();
-            // Persisted calibration: load the relaxed-open baseline on start, then
-            // re-save periodically (and on stop) so it survives restarts. Anchored to
-            // the app dir (not CWD) so it persists when launched from a shortcut.
-            let calib_path = crate::config::calib_path().to_string_lossy().into_owned();
+            // Persisted PER-HMD calibration: load this camera/model pair's baseline,
+            // blink depth, and mid-close anchor, then re-save periodically and on stop.
+            // Never import the ambiguous legacy shared file into a new device bucket.
             if let Some(store) = crate::core::eye_state::load_calib(&calib_path) {
                 state.restore_all(&store);
             }
@@ -1432,6 +1450,17 @@ impl Pipeline {
     /// Hot-swap the custom XR5 EyeWide model. The next ML iteration starts producing
     /// A/B telemetry; source selection still follows `[hmd].wide_source` after reload.
     pub fn set_wide(&self, net: Option<WideNet>) {
+        let net = if crate::config::canonical_device_key(&self.device_key) == "pimax_xr5" {
+            net
+        } else {
+            if net.is_some() {
+                eprintln!(
+                    "[wide] refused XR5 custom EyeWide hot-load for non-XR5 device {}",
+                    self.device_key
+                );
+            }
+            None
+        };
         let loaded = net.is_some();
         if let Ok(mut guard) = self.wide.lock() {
             *guard = net;
