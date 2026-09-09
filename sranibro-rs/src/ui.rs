@@ -1872,6 +1872,9 @@ struct App {
     /// Last "Apply & reload" result message (text, color).
     reload_msg: Option<(String, Color32)>,
     reload_job: Option<std::thread::JoinHandle<std::io::Result<crate::engine::Engine>>>,
+    /// Paint-only snapshot, captured once when reload begins. No live widgets or
+    /// camera texture uploads run behind the progress overlay.
+    reload_backdrop: Vec<egui::epaint::ClippedShape>,
     /// On-demand SRanipal discovery runs off the UI thread because a bounded
     /// Downloads/Desktop fallback may take several seconds on a large profile.
     sranipal_discovery_job: Option<mpsc::Receiver<Option<crate::sranipal_discovery::Found>>>,
@@ -2141,6 +2144,7 @@ impl App {
             edit,
             reload_msg,
             reload_job: None,
+            reload_backdrop: Vec::new(),
             sranipal_discovery_job: None,
             page,
             last: [0; 5],
@@ -2688,11 +2692,7 @@ impl eframe::App for App {
                 return;
             }
             self.title_bar(ctx);
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("Reloading tracking");
-                ui.label("Stopping the previous session and opening the device. Please wait.");
-                ui.spinner();
-            });
+            self.reload_overlay(ctx);
             ctx.request_repaint_after(Duration::from_millis(if native_window_drag_active() {
                 250
             } else {
@@ -2876,6 +2876,18 @@ impl eframe::App for App {
             self.gaze_correction_modal(ctx);
         }
         self.gaze_residual_capture_overlay(ctx);
+        if self.reload_job.is_some() {
+            // Keep a single snapshot of the just-rendered page. Draining a clone
+            // leaves this frame untouched and preserves all modal/layer ordering.
+            let (layers, transforms) = ctx.memory(|memory| {
+                (
+                    memory.layer_ids().collect::<Vec<_>>(),
+                    memory.layer_transforms.clone(),
+                )
+            });
+            self.reload_backdrop =
+                ctx.graphics(|graphics| graphics.clone().drain(&layers, &transforms));
+        }
         let frame_time = now.elapsed();
         if frame_time >= Duration::from_millis(50) {
             let page = match self.page {
@@ -2895,6 +2907,40 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn reload_overlay(&self, ctx: &egui::Context) {
+        let body = ctx.available_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("reload-backdrop"),
+        ));
+        painter.rect_filled(body, 0.0, BG);
+        for clipped in &self.reload_backdrop {
+            let clip = clipped.clip_rect.intersect(body);
+            if clip.is_positive() {
+                painter.with_clip_rect(clip).add(clipped.shape.clone());
+            }
+        }
+        painter.rect_filled(body, 0.0, Color32::from_black_alpha(115));
+        egui::Area::new(egui::Id::new("reload-progress"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                card().show(ui, |ui| {
+                    ui.set_width((300.0 * S).min((body.width() - 48.0 * S).max(140.0)));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().color(ACCENT));
+                        ui.label(
+                            egui::RichText::new("Reloading tracking…")
+                                .color(TEXT1)
+                                .strong(),
+                        );
+                    });
+                    ui.add_space(SP2);
+                    ui.label(prose("Please wait while tracking reconnects."));
+                });
+            });
+    }
+
     #[cfg(any())]
     fn current_preflight(&self) -> PreflightReport {
         let frame_dims = {
@@ -16850,6 +16896,7 @@ impl App {
                 "Tracking reload worker stopped unexpectedly",
             ))
         });
+        self.reload_backdrop.clear();
         match rebuilt {
             Ok(eng) => {
                 if let Some(direct) = eng.starvr_direct_mode {
