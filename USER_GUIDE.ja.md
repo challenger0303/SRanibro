@@ -1,285 +1,193 @@
 # SRanibro 使い方ガイド
 
-**SRanibro v0.1.5-beta**向けです。ベータ期間中は画面や項目名が変わることがあります。
+**v0.1.9-beta（Hotmirror / PSVR2統合版）**向けです。
 
-[English guide](USER_GUIDE.md)
+[English guide](USER_GUIDE.md) · [ダウンロード](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.9-beta)
 
-SRanibroは、Hotmirror系VR HMDのアイカメラ映像を処理し、VRCFaceTracking
-（VRCFT）で利用できる視線・まぶた・EyeWide・EyeSquintへ変換します。処理は
-PC内で完結します。SRanipalのモデルやTobiiのランタイムファイルは同梱されない
-ため、利用許諾を持つ自分のファイルを用意してください。
+SRanibroは、Hotmirror系VR HMDのアイカメラ映像を使い、まぶた・見開き・目を強く閉じる動きをVRCFaceTracking（VRCFT）へ送るソフトです。視線や瞳孔のデータも扱います。まぶたモデルの推論はPC内で行います。
+
+最初から長いキャリブレーションをする必要はありません。まず普通に装着して動きを確認し、必要な場合だけ明るさと開閉のバーを調整してください。Wearing Memoryは、良い設定ができた後に使う任意の機能です。
 
 ## 1. 必要なもの
 
 - Windows 10 / 11 x64
-- 対応HMD
+- 対応HMDとメーカーの通常ソフトウェア
   - Pimax Crystal / Crystal Super（VR4）
-  - Pimax Dream Air / SE (XR5)
   - StarVR One
-  - 対応するVarjoカメラ経路
-- 自分が利用権を持つSRanipalインストール、またはEyePredictionモデル
-- 互換性のあるTobii stream-engineランタイムDLL
-- VRChatアバターを動かす場合はVRCFaceTracking
+  - Varjo（対応カメラ経路）
+  - PlayStation VR2（PSVR2Toolkit経由）
+- 利用できるSRanipalインストールとEyePredictionモデル
+- VRChatへ送る場合は、VRCFaceTrackingと対応アバター
 
-PimaxやVarjoの通常ソフトウェアを先に導入してください。SRanibroの補正を使う
-前に、メーカー側の視線キャリブレーションを完了します。特にDream Air / SE (XR5)
-では重要です。SRanibroは小さな残差を後から補正できますが、HMD本来の多点
-キャリブレーションを置き換えるものではありません。
+**Pimax Dream Air / SE（XR5）は保留中で、この統合版には含まれません。** 旧ガイドのSafe Geometry Fitなどを、この版の初期設定として行う必要はありません。
 
-## 2. ダウンロード
+先にメーカー側の視線キャリブレーションを済ませてください。SRanibroのRecenterはまぶたの基準を合わせる操作で、メーカー側の視線キャリブレーションとは別です。
 
-必ず公式の
-[SRanibro Releasesページ](https://github.com/challenger0303/SRanibro/releases)
-からダウンロードしてください。
+PSVR2は、PSVR2Toolkitを導入してSteamVRを起動しておく必要があります。PlayStation VR2 Appだけをインストールした状態では、Toolkitの機能は利用できません。
 
-推奨は `SRanibro-v0.1.5-beta-bundle.zip` です。次の2つが入っています。
+## 2. ダウンロードと配置
 
-- `SRanibro.exe`
-- `SRanibro-VRCFT-module.zip`
+公式リリースから **`SRanibro-v0.1.9-beta-bundle.zip`** をダウンロードし、書き込み可能なフォルダーへ展開します。
 
-現在のexeはコード署名されていないため、Windows SmartScreenが警告することが
-あります。Windowsの保護機能を無効にせず、Releaseページに記載されたSHA-256
-と一致することを確認してください。
+- `SRanibro.exe` — アプリ本体
+- `eyebrow.bin` — 汎用眉モデル
+- `SRanibro-VRCFT-module.zip` — VRCFT用モジュール
+- `README.txt` — 簡単な案内
 
-デスクトップ上のフォルダーなど、書き込み可能な場所へ展開します。
-`Program Files`の下には置かないでください。インストーラーはなく、設定・
-キャリブレーション・ログは次の場所へ保存されます。
+`eyebrow.bin`はexeと同じフォルダーに置いてください。個人用の眉モデルが選択済みなら、そちらが優先されます。
+
+SRanipalのまぶたモデルは別途必要です。指定方法は「最初の起動」を参照してください。
+
+exeは未署名のため、SmartScreenの警告が出る場合があります。公式リリースから入手し、Windowsの保護機能を無効にしないでください。
+
+更新前は設定フォルダーをコピーして保管すると、元に戻しやすくなります。
 
 ```text
 %APPDATA%\SRanibro\
 ```
 
+通常の設定・ログはここに保存されます。ただし、exeの横に書き込み可能な`sranibro.toml`がある場合は、そのフォルダーを使うポータブル動作になります。
+
 ## 3. VRCFaceTrackingモジュールの導入
 
-`SRanibro-VRCFT-module.zip`を展開します。中には `SRanibro.dll`、
-`module.json`、`config.json`、簡単なREADMEが入っています。
-
-次のフォルダーを正確に作成します。
+`SRanibro-VRCFT-module.zip`を展開し、次のフォルダーを作ります。
 
 ```text
 %APPDATA%\VRCFaceTracking\CustomLibs\4d4b786f-e496-4df9-9421-dae811edff06\
 ```
 
-その中へ次の3ファイルをコピーします。
+その中へ`SRanibro.dll`、`module.json`、`config.json`の3ファイルを入れます。ZIPをそのまま置くのではなく、中身をコピーしてください。
+
+SRanibroを起動してからVRCFTを起動し、Eye Moduleに`SRanibro`が表示されることを確認します。同梱モジュールは目用の枠を使うため、Vive Facial Trackerなど別の顔トラッカーと併用できます。
+
+## 4. 最初の起動
+
+1. HMDを接続し、メーカーのソフトウェアを起動する。PSVR2はToolkitを導入したSteamVRも起動する。
+2. `SRanibro.exe`を起動し、歯車の**Settings**を開く。
+3. **SRanipal runtime**で**Find automatically**を試す。見つからなければ`sr_runtime.exe`を選ぶか、それが入っているフォルダーを指定する。
+4. **Tracking & device**のHeadsetで使用する機種を選ぶ。自動判別が意図と違う場合は明示的に選ぶ。
+5. **Apply & reload**を押す。
+
+指定したSRanipalフォルダーには、次のモデルが必要です。
 
 ```text
-SRanibro.dll
-module.json
-config.json
+model\EyePrediction\00-0000.params_opencl.params
 ```
 
-SRanibroを先に起動し、その後VRCFaceTrackingを起動してください。有効な
-Eye Moduleの名前が `SRanibro` になれば導入成功です。
+機種・モデル・パスなどの変更にはApply & reloadを使います。左下のReloadも設定を適用して再接続する操作です。リロード中は画面が暗くなり、中央に読み込み表示が出ます。完了までは設定を操作できません。
 
-このモジュールは**目専用**です。視線、まぶた、瞳孔、EyeWide、EyeSquintを
-提供しますが、Face / Expression Providerの枠は取得しません。そのため、
-Vive Facial Trackerなど別の顔トラッカーと併用できます。
+## 5. Dashboardと負荷の確認
 
-## 4. SRanibroの初期設定
+Pipelineを展開すると、機器・カメラ・モデル・出力の状態を確認できます。失敗している段階があれば、先にその理由を確認してください。
 
-`SRanibro.exe`を起動し、**Settings**を開いて、
-**Connection & models**を展開します。
+**PREVIEW**をONにすると左右のアイカメラ映像が表示されます。OFFは映像表示だけを止める操作で、トラッキングを止めるものではありません。
 
-- **SRanipal model folder** — SRanipalのインストールフォルダーを選択します。
-  SRanibroが中のEyePredictionモデルを探します。
-- **Tobii runtime DLL** — 互換性のあるTobii stream-engine DLLを選択します。
+映像の`120/s`などはカメラフレームの到着レートです。モニター上の表示Hzや、まぶたMLの推論レートとは別です。MLはカメラより低いレートで動く場合があります。
 
-次に**Tracking & device**を展開し、HMDを選びます。
+負荷が気になるときは：
 
-| 設定 | 用途 |
+- 普段はPREVIEWをOFFにする、またはウィンドウを最小化する。
+- **Settings → Tracking & device → Eyelid inference**で、まず**Auto**を使う。
+- GPU利用時だけ問題が出るなら**CPU**に切り替えて比較する。切り替え時には再接続されます。
+
+AutoはGPUの出力と速度を確認して推論経路を選びます。GPUを選べば必ず速くなるとは限りません。
+
+## 6. まぶた・Wide・Squeezeを調整する
+
+左サイドバーの調整ページで、**Recenter**と**Live eyelid response**を使います。
+
+### まず装着と映像を整える
+
+普段使う位置にHMDを装着し、両目を自然に開いて正面を見ます。見開いたままRecenterしないでください。
+
+映像の見え方が原因で反応が悪そうな場合は、Dashboardのアイカメラの歯車から画像設定を開き、**Filter → Eye-image brightness**を少しずつ調整します。現在の明るさ調整は固定スライダーで、自動では変わりません。明るくしすぎれば良いわけでもありません。
+
+これはモデルへ渡す映像の調整です。Tobiiの視線データや、生のアイカメラ出力は変更しません。画像設定を変えた後は、まぶたの基準も確認し直してください。
+
+### 開閉のバー
+
+1. **Recenter**を押し、自然に開いた状態の基準が落ち着くまで待つ。
+2. 緑のマーカーと**Avatar openness**を見ながら、左右それぞれの開眼側・閉眼側のハンドルを調整する。
+3. 普通の瞬き、ゆっくり閉じる動作、ウィンクを確認する。
+4. 自然に開いたときに100%、無理に力を入れず閉じたときに0%になるか確認する。
+
+変更はリアルタイムで反映されます。ドラッグを離すと自動保存されるため、別のApply操作は不要です。
+
+- **閉じ切らない**：目を閉じた状態の緑マーカーに、閉眼側のハンドルを近づける。
+- **まだ開いているのに閉じる**：閉眼側を「さらに閉じないと届かない」位置へ戻し、ゆっくり閉じて確認する。
+- **開眼側が合わない**：まずRecenterし、その後で開眼側を調整する。
+
+左右でモデルの数値が違うことはあります。LINKは調整値を連動させるためのもので、左右の検出値を必ず同じにする機能ではありません。片側だけ合わない場合は連動を外して調整します。
+
+### EyeWideとSqueeze
+
+**Set Wide neutral**は、見開いていない自然な開眼状態で押します。その後で見開き、オレンジのWideマーカーと出力を見ながらWideの開始・最大側を調整します。緑は通常の開閉、オレンジはWideの確認用です。
+
+Squeezeは別のバーです。普通の閉眼と、閉じた状態から少し力を入れる動作を比べて範囲を調整してください。無理に強く力を入れる必要はありません。
+
+**Eyelid response**は途中の開閉の反応を変える調整です。まず上下限を合わせ、それでも途中の動きが合わない場合に使います。
+
+## 7. Wearing Memory（任意）
+
+「この装着位置・この設定なら良く動く」という状態を保存し、似た映像になったときに自動で補正する機能です。悪い状態を自動で学習し直す機能ではありません。
+
+1. **Wearing memory...**を開く。
+2. **Adjust without recovery**を押して自動補正を止める。
+3. 自然な開眼状態でRecenterし、開閉のバーを合わせる。
+4. 必要なら**Set L closed / Set R closed**を使う。選んだ目を閉じ、2回の通知音の間は閉じたままにする。
+5. 両目の開閉と普通の瞬きが正しく動くことを確認する。
+6. **Save current good state**を押し、両目を自然に開いて正面を見たまま保存完了を待つ。
+7. **Automatic wearing-position recovery**をONにする。
+
+Recenterやバーの調整だけではMemoryは保存されません。補正中・Try中は、そのまま保存せず、Adjust without recoveryで補正を外した後の動作を確認してください。
+
+- **Try**：保存済みの状態を試す。試用を終えるにはAdjust without recoveryを使う。
+- **Delete**：不要な状態を削除する。
+- **Undo threshold edits**：今回のまぶた閾値の編集を戻す。後から変更したWide・Squeeze・反応カーブは戻さない。
+- **Finish without saving memory**：Memoryへ追加せず調整モードを終える。設定を元に戻す操作ではない。
+
+最大8件を保存します。ほぼ同じ状態を再保存すると既存の記録を更新するため、件数が増えない場合があります。保存先は機器・個体識別・画像設定で分かれます。明るさやクロップなどを変更すると、以前のMemoryが表示・適用されなくなる場合があります。
+
+短い瞬きでは補正を保ちますが、長く確認できない状態が続けば補正を解除します。スイッチをOFFにしても保存済みMemoryは消えません。合わない場合はOFFにして手動設定へ戻してください。
+
+Memoryには目の映像から作った小さな参照画像と調整値を保存します。通常動作で外部へ送信するものではありませんが、設定フォルダーを共有するときは内容を確認してください。
+
+## 8. 眉（任意）
+
+Dashboardの**BROW**で切り替えます。
+
+- **LEGACY**：EyeWide / EyeSquintに連動した眉を、同梱VRCFTモジュールで動かす。個人モデルの学習は不要。
+- **ESTIMATE**：独立した眉モデルを使う。互換モデルが読み込まれていないと選択できない。通常のトラッキング中にPythonは起動しない。
+- **BROW L/R SYNC**：独立眉の左右連動を切り替える。
+
+まず同梱の`eyebrow.bin`で試してください。自分向けに合わせる場合は、Eyebrow項目でデータを記録し、**Fit in app (no Python)**を使えます。これは既存モデルを個人向けに合わせる機能です。
+
+**Train & bake**は外部の`vr_eyebrow`プロジェクトとPython環境を使う再学習です。通常利用や同梱モデルを使うだけなら不要です。
+
+独立眉をVRChatへ送る場合は、Eyebrow内の**VRChat eyebrow OSC → Send eyebrows directly to VRChat OSC**と送信先を確認します。同じ眉パラメーターを複数のアプリから同時に送らないでください。アバター側にも対応パラメーターが必要です。
+
+## 9. 視線・出力・普段の使い方
+
+視線の中心や動く幅は**Gaze centre & movement range...**で確認します。アバターによって見え方が違うため、モデルの明るさやまぶたのバーを動かす前に、アバター側の範囲も確認してください。
+
+**Eye mapping**は左右眼の対応や方向を直すための設定です。視線方向の反転と左右ストリームの交換は別の操作で、交換すると映像の左右も変わります。より目だけ逆になるなど判断が難しい場合は、反転を重ねず、機種・映像・現在のmapping設定を添えて報告してください。
+
+VRCFTへは通常`127.0.0.1:5555`で接続します。**VRCFT openness low-pass**を増やすと滑らかになりますが、遅延も増えます。まず0または1 samplesで試してください。
+
+最小化してもカメラ・ML・VRCFT出力は続きます。使い終わったらアプリを終了してください。Eye image outputは映像配信用の別機能で、DashboardのPREVIEWに映像を表示するためにONにする必要はありません。
+
+## 10. 困ったとき
+
+| 症状 | 最初に確認すること |
 | --- | --- |
-| `auto` | Pimax向けの推奨設定。接続されたVR4 / XR5 EyeChipを自動判別します。 |
-| `pimax_vr4` | Pimax Crystal / Crystal SuperのVR4経路を明示選択します。 |
-| `pimax_xr5` | Pimax Dream Air / SE (XR5)の斜めアイカメラ経路を明示選択します。 |
-| `starvr` | StarVR OneをTobiiランタイム経由で使用します。 |
-| `varjo` | Varjo Baseのネイティブカメラ経路です。 |
-| `varjo_mjpeg` | 外部Varjo Eye StreamerのMJPEG経路です。 |
+| 起動しない／すぐ終了する | 設定フォルダーの`sranibro.log`。設定を消す前にコピーを保管する。 |
+| 映像が表示されない | PREVIEWがONか、機種が正しいか、HMDが起動しているか。Pipelineのカメラ段階も確認する。 |
+| PSVR2でReload failed | PSVR2Toolkitが導入済みか、SteamVR上で動いているか。PSVR2 Appだけでは不足。 |
+| 閉じ切らない／片側だけ早く閉じる | 自動復帰を止め、装着位置・明るさ・Recenter・左右それぞれの閉眼側を確認する。 |
+| EyeWideが出ない | 自然な開眼状態でSet Wide neutralを行い、オレンジのマーカーとWide範囲を確認する。 |
+| 装着し直すと合わない | MemoryをOFFにして手動設定を確認する。良く動く状態になってから保存する。 |
+| 保存件数が増えない | 似た状態の更新か確認する。最大8件。保存エラーの表示も確認する。 |
+| VRCFTがつながらない | モジュールの配置、SRanibroの起動、TCP 5555番ポートの競合を確認する。 |
+| 操作が重い | PREVIEWをOFFにし、最小化やCPU推論との比較を行う。 |
 
-`auto`はPimax用です。StarVRとVarjoは明示的に選択してください。
-
-最後に**Apply & reload**を押します。HMD、モデル、ファイルパス、OSC送信先の
-変更は、このボタンを押すまで反映されません。ライブトグルや多くのTuning項目
-は変更時に自動保存されます。
-
-Pimaxを直接開くときは、Tobii Platform ServiceからEyeChipを引き渡すために
-UACが表示されることがあります。SRanibroでカメラを使う場合は許可してください。
-
-## 5. Dashboardの確認
-
-**DEVICE**から**OUTPUT**までのPipelineが緑色になり、左右のアイカメラ映像が
-表示されれば正常です。
-
-映像右下の `120/s` などの表示は、実際に届いているカメラフレームのレートです。
-まぶたMLはカメラより低いレートで動く場合があります。視線とVRCFT出力も、それぞれ
-別のレートで動作します。
-
-赤い段階があるときはPipelineを展開するか、**Console**ページを開いてください。
-無関係なTuningを動かす前に、最初に失敗している段階と理由を確認します。
-
-## 6. VRCFaceTracking / VRChatとの接続
-
-推奨起動順は次の通りです。
-
-1. HMDのメーカーソフトを起動し、HMDを接続する
-2. SRanibroを起動し、Pipelineが緑になるまで待つ
-3. VRCFaceTrackingを起動し、`SRanibro` Eye Moduleを有効にする
-4. VRChatを起動する
-
-SRanibroは `127.0.0.1:5555` でローカルの目データを配信します。VRCFTが接続
-できない場合は、別のアプリがTCP 5555番ポートを使用していないか確認してください。
-
-Settingsの**VRCFT openness low-pass**は即時反映されます。
-
-- `0` または `1` samples — パススルー。遅延が最小です。
-- 大きな値 — 滑らかになりますが、遅延が増えます。
-
-SRanibro側ですでにまぶたの後処理をしているため、まずはパススルーから試し、
-アバター上で追加の平滑化が必要な場合だけ増やしてください。
-
-## 7. 最初のまぶたキャリブレーション
-
-普段と同じ位置にHMDを装着してから行います。キャリブレーションのためだけに
-強く押し付けたり、不自然な位置にずらしたりしないでください。
-
-1. **Calibration**を開く
-2. 両目を自然に開き、正面を見る
-3. **Recenter**を押す
-4. 約1秒待ち、意識的なゆっくりした瞬きを2～3回行う
-5. 普通の瞬き、ゆっくり閉じる動作、片目を閉じた保持、自然な再開眼を確認する
-
-Recenterは現在の自然な開眼状態を基準として学習します。**Adaptive blink bounds**
-は完全に閉じた深さを別に学習します。既定でONであり、通常はONのほうが良い結果に
-なります。時間がたって偏りが出た場合は、HMDを普段の位置へ戻してRecenterします。
-
-キャリブレーションはHMDごとに別保存されます。古いバージョンから更新した後は、
-使用するHMDごとに一度Recenterしてください。
-
-### Eye mapping
-
-**Settings → Eye mapping**は、症状が一致するときだけ変更します。
-
-- 左を見たのにアバターが右を見る → **Flip gaze left / right**
-- アバター上で左右の目が入れ替わっている → **Swap left / right**
-- アイカメラ映像そのものが左右反転している → **Flip image horizontally**
-
-これらはHMDごとに保存されます。
-
-## 8. Dream Air / SE (XR5)専用機能
-
-この章の項目は、Dream Air / SE (XR5)が実際に動作中のときだけ表示されます。
-
-### Gaze sourceと補正
-
-最初にPimaxソフト側でTobiiの視線キャリブレーションを完了してください。基礎
-キャリブレーションが間違っていると、SRanibroへ視線値は届いていても、左右の視線が
-不自然にずれることがあります。
-
-オプションの**EyeChip combined gaze**は、片目の揺れや一時的な認識喪失がある
-ときに安定しやすい経路です。一方で、近距離を見たときの自然な左右眼の寄りを一部
-失う代わりに安定性を得ます。切り替え後は**Apply & reload**を押し、Gaze correction
-の**Center**をやり直してください。
-
-**Dream Air / XR5 gaze correction**は、メーカー側キャリブレーション後に残った
-中心・範囲・左右眼の寄りの誤差だけを調整するために使います。
-
-### Automatic eye image alignment / Safe Geometry Fit
-
-内蔵XR5 geometryは、それ自体が有効なフォールバックです。現在の装着者や光学位置で
-まぶたMLの反応が悪い場合にだけFitを試してください。
-
-1. ガイド付き記録を開始し、OPEN、HALF、CLOSED、視線移動、Slow Close、Blinkの
-   指示をすべて行う
-2. 記録中はHMDの装着位置を一定に保つ
-3. 記録完了後にFitを実行する
-4. **Preview candidate live**で候補を試し、まぶたの動きを確認する
-5. `HOLDOUT PASS`なら**Apply validated candidate**で保存する
-
-`KEEP CURRENT GEOMETRY`は、現在値を残すという自動判定です。不合格候補もPreviewは
-できます。実際の動きが良ければ警告を確認し、チェックを入れて
-**Apply unvalidated candidate**を押すと保存できます。適用前の状態は自動でバックアップ
-され、直後なら**Rollback last applied geometry**で戻せます。
-
-Safe Geometry Fitは`SRanibro.exe`内で完結し、Pythonは不要です。設定済みの
-SRanipalまぶたモデルを評価しますが、新しいMLモデルを学習する機能ではありません。
-
-完了した記録はFitのためにメモリ上へ保持されます。明示的にExportを押したときだけ
-ディスクへ保存されます。出力ZIPには生体情報に当たる目の映像が含まれるため、内容を
-確認し、信頼できる相手にだけ共有してください。
-
-### XR5 image EyeWide
-
-`SRanipal`は従来のWide出力を使用します。`Auto`は、有効で新鮮なカスタムXR5
-Wideモデルがあるときだけそれを使い、それ以外では安全に従来経路へ戻ります。
-`Custom`は正常なカスタムモデルを必須にします。
-
-**Fit in app (no Python)**は、互換性のある既存Wideベースモデルを個人向けに
-合わせ直します。ベースモデルがなければ、有用なモデルを一から作ることはできません。
-
-## 9. 眉トラッキング（任意）
-
-眉トラッキングには互換性のある `brow.bin` ベースモデルが必要です。
-
-- **Fit in app (no Python)** — 記録した眉データを使い、既存モデルのHeadを個人向け
-  に合わせ直します。短時間で行う通常の個人調整向けです。
-- **Train & bake** — 外部の `vr_eyebrow` プロジェクトでモデルを作ります。
-  Python、PyTorch、設定済み環境が必要です。
-
-**Enable eyebrow tracking**がマスタートグルです。同梱VRCFTモジュールは目専用なので、
-VRCFTに目を任せたままSRanibroからFT/v2眉パラメーターだけを送る場合は、
-**Send eyebrows directly to VRChat OSC**を有効にします。
-
-## 10. 普段の使い方と終了
-
-SRanibroを最小化してもトラッキングは停止しません。UIの再描画負荷だけを落とし、
-カメラ、ML、VRCFT出力はバックグラウンドで継続します。
-
-使用しないときはSRanibroを終了してください。その後Pimax / Tobiiの通常ランタイムが
-EyeChipを再取得できない場合は、次を実行します。
-
-```text
-SRanibro.exe restore
-```
-
-PCの再起動でも通常のメーカーサービス状態へ戻ります。
-
-## 11. トラブルシューティングとフィードバック
-
-### ウィンドウが閉じる、または表示されない
-
-次のログを確認します。
-
-```text
-%APPDATA%\SRanibro\sranibro.log
-```
-
-### アイカメラ映像が来ない
-
-- HMD選択が正しいか確認する
-- HMDが接続済み・起動済みか確認する
-- Tobii DLLのパスを確認する
-- Apply & reloadを再実行し、必要ならUACの引き渡しを許可する
-
-### Pupilは来るがGazeが来ない
-
-メーカー側のTobii / Pimax視線キャリブレーションを完了してから、
-**Apply & reload**を実行します。まぶたgeometryを変更する前に、Consoleで
-Wearable / Gaze subscriptionの状態を確認してください。
-
-### 時間がたつと片方のまぶたが偏る
-
-HMDを普段の位置へ装着し直してRecenterします。**Adaptive blink bounds**をONのまま、
-ゆっくりした瞬きを2～3回行います。再発する場合はCalibrationページの**REC**で
-短い診断CSVを記録してください。
-
-### VRCFTが接続しない
-
-- SRanibroを先に起動する
-- CustomLibsのフォルダー名が上記GUIDと完全に一致するか確認する
-- `SRanibro.dll`、`module.json`、`config.json`の3つが入っているか確認する
-- TCP 5555番ポートが他のアプリに使われていないか確認する
-
-### 問題報告を送る
-
-関係するログ末尾、短い診断CSV、必要な場合のみXR5 calibration recordingを用意します。
-ログにはWindowsユーザー名やローカルパスが含まれることがあります。Calibration
-recordingには目の映像が含まれます。共有前に必ず内容を確認してください。
+報告にはアプリのバージョン、機種、再現手順、関係するログ末尾を添えてください。必要なら**REC**で短い診断CSVを記録します。ログやCSVにはローカルパス・追跡データが、Memoryや映像記録には目の画像が含まれる場合があります。共有前に確認してください。

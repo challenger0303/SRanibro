@@ -1,289 +1,193 @@
 # SRanibro User Guide
 
-For **SRanibro v0.1.5-beta**. The interface may change while the app is in beta.
+For **v0.1.9-beta, the unified Hotmirror / PSVR2 build**.
 
-[日本語版 / Japanese guide](USER_GUIDE.ja.md)
+[日本語版 / Japanese guide](USER_GUIDE.ja.md) · [Download](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.9-beta)
 
-SRanibro converts eye-camera data from hot-mirror VR HMDs into eye tracking for
-VRCFaceTracking (VRCFT). Processing stays on your PC. The app does not include
-SRanipal model weights or Tobii runtime files; you must supply copies you are
-authorized to use.
+SRanibro processes eye-camera images from hot-mirror VR headsets and sends eyelid openness, EyeWide and EyeSquint to VRCFaceTracking (VRCFT). It also handles gaze and pupil data. Eyelid inference runs locally on your PC.
+
+You do not need a long calibration sequence to get started. Wear the headset normally, check tracking, and adjust image brightness and the open/closed handles only if needed. Wearing Memory is optional: use it after you have a setup that works well.
 
 ## 1. Before you start
 
-You need:
-
 - Windows 10 or 11 x64.
-- A supported HMD:
+- A supported headset and its normal vendor software:
   - Pimax Crystal / Crystal Super (VR4)
-  - Pimax Dream Air / SE (XR5)
   - StarVR One
-  - A supported Varjo camera path
-- Your own SRanipal installation or EyePrediction model weights.
-- Your own compatible Tobii stream-engine runtime DLL.
-- VRCFaceTracking if you want to drive a VRChat avatar.
+  - Varjo, through a supported camera path
+  - PlayStation VR2 through PSVR2Toolkit
+- A SRanipal installation and EyePrediction model you are entitled to use.
+- VRCFaceTracking and a compatible avatar for VRChat output.
 
-For Pimax or Varjo, install the normal vendor software first. Complete the
-vendor's gaze calibration before using SRanibro's finishing correction. This is
-especially important on Dream Air / SE (XR5): SRanibro can correct a small residual
-offset, but it cannot replace the headset's full gaze calibration.
+**Pimax Dream Air / SE (XR5) is paused and is not included in this unified build.** The Safe Geometry Fit instructions in older guides are not part of this build's initial setup.
 
-## 2. Download SRanibro
+Complete the headset vendor's gaze calibration first. SRanibro's Recenter sets an eyelid reference; it is not the same as calibrating gaze in the vendor software.
 
-Download only from the official
-[SRanibro Releases page](https://github.com/challenger0303/SRanibro/releases).
+PSVR2 requires PSVR2Toolkit and a running SteamVR session. Installing the PlayStation VR2 App alone does not install the Toolkit functionality.
 
-The recommended download is `SRanibro-v0.1.5-beta-bundle.zip`, which contains:
+## 2. Download and extract
 
-- `SRanibro.exe`
-- `SRanibro-VRCFT-module.zip`
+Download **`SRanibro-v0.1.9-beta-bundle.zip`** from the official release and extract it to a writable folder.
 
-The executable is not code-signed yet, so Windows SmartScreen may warn. Do not
-disable Windows security. Verify the SHA-256 values shown on the Release page.
+- `SRanibro.exe` — application
+- `eyebrow.bin` — generic eyebrow model
+- `SRanibro-VRCFT-module.zip` — VRCFT module
+- `README.txt` — quick instructions
 
-Extract the app to a folder your account can write to, such as a folder on the
-Desktop. Do not put it under `Program Files`. SRanibro is portable and has no
-installer. Its configuration, calibration and logs are stored under:
+Keep `eyebrow.bin` beside the executable. If you have already selected a personal eyebrow model, that model takes priority.
+
+You need to supply the SRanipal eyelid model separately. See "First launch" for setup instructions.
+
+The executable is unsigned, so SmartScreen may warn. Download from the official release and do not disable Windows protection.
+
+Before upgrading, keep a copy of your settings folder:
 
 ```text
 %APPDATA%\SRanibro\
 ```
 
+Settings and logs normally live there. If a writable `sranibro.toml` exists beside the executable, SRanibro uses that folder instead (portable mode).
+
 ## 3. Install the VRCFaceTracking module
 
-Unzip `SRanibro-VRCFT-module.zip`. It contains `SRanibro.dll`, `module.json`,
-`config.json`, and a small module README.
-
-Create this exact folder:
+Extract `SRanibro-VRCFT-module.zip` and create this folder:
 
 ```text
 %APPDATA%\VRCFaceTracking\CustomLibs\4d4b786f-e496-4df9-9421-dae811edff06\
 ```
 
-Copy these three files into it:
+Copy `SRanibro.dll`, `module.json` and `config.json` into it. Copy the contents, not the unopened ZIP.
+
+Start SRanibro, then start VRCFT. Its Eye Module should report `SRanibro`. The bundled module uses the eye-provider slot, leaving a separate facial tracker such as Vive Facial Tracker available.
+
+## 4. First launch
+
+1. Connect the headset and start its vendor software. For PSVR2, also start SteamVR with PSVR2Toolkit installed.
+2. Run `SRanibro.exe` and open the gear-shaped **Settings** page.
+3. Under **SRanipal runtime**, try **Find automatically**. If that fails, select `sr_runtime.exe` or specify the folder containing it.
+4. Choose your headset under **Tracking & device**. Select it explicitly if automatic detection chooses the wrong device.
+5. Press **Apply & reload**.
+
+The SRanipal folder must contain:
 
 ```text
-SRanibro.dll
-module.json
-config.json
+model\EyePrediction\00-0000.params_opencl.params
 ```
 
-Start SRanibro before VRCFaceTracking. The active eye module should be named
-`SRanibro`.
+Use Apply & reload for device, model and path changes. The lower-left Reload button also applies settings and reconnects. During reload, the current page dims and a centered progress indicator appears. Settings are inactive until it finishes.
 
-This is an **eye-only** VRCFT module. It provides gaze, openness, pupil,
-EyeWide and EyeSquint without taking the face/expression provider slot, so a
-separate facial tracker can remain active.
+## 5. Check the dashboard and load
 
-## 4. Configure SRanibro
+Expand Pipeline to check the device, camera, model and output stages. If a stage has failed, check its reason before changing unrelated settings.
 
-Run `SRanibro.exe`, open **Settings**, then expand **Connection & models**.
+Turn **PREVIEW** on to display the two camera images. Turning it off hides the images without stopping tracking.
 
-Set:
+A number such as `120/s` on an image is the camera-frame arrival rate. It is not your monitor's refresh rate or the eyelid inference rate. The model may run more slowly than the cameras.
 
-- **SRanipal model folder** — select the SRanipal installation folder. SRanibro
-  finds the EyePrediction weights inside it.
-- **Tobii runtime DLL** — select your compatible Tobii stream-engine DLL.
+If load is a problem:
 
-Then expand **Tracking & device** and select the headset path:
+- Leave PREVIEW off during normal use, or minimize the window.
+- Start with **Auto** under **Settings → Tracking & device → Eyelid inference**.
+- If problems occur only with GPU inference, compare **CPU** mode. Changing the inference mode reconnects tracking.
 
-| Setting | Use it for |
+Auto checks GPU output and speed before choosing a path. GPU mode is not guaranteed to be faster on every PC.
+
+## 6. Adjust eyelids, Wide and Squeeze
+
+Use **Recenter** and **Live eyelid response** on the left sidebar's tuning page.
+
+### Start with the fit and image
+
+Wear the headset in your usual position. Look straight ahead with both eyes naturally open; do not widen your eyes for Recenter.
+
+If the image seems to be causing poor model response, open the camera gear on the dashboard and adjust **Filter → Eye-image brightness** in small steps. This is a fixed slider: brightness does not keep adapting automatically. Brighter is not always better.
+
+This changes the image passed to the model, not Tobii gaze or raw camera output. Recheck your eyelid references after changing image settings.
+
+### Open and closed handles
+
+1. Press **Recenter** and wait for the relaxed-open reference to settle.
+2. Watch the green marker and **Avatar openness** while adjusting the open and closed handles for each eye.
+3. Check normal blinks, slow closing and winks.
+4. Confirm that relaxed open reaches 100% and gentle full closure reaches 0%.
+
+Changes apply live. They save automatically when you release the drag; there is no separate Apply step.
+
+- **Not closing fully:** move the closed handle toward the green marker's value while that eye is gently closed.
+- **Closing before your eye is actually shut:** move the closed handle back toward a value that requires more closure, then check with a slow close.
+- **Open side feels wrong:** Recenter first, then adjust the open handle.
+
+The two eyes can produce different model values. LINK links adjustment values; it does not force both detected outputs to be identical. Unlink the controls when only one eye needs a different setting.
+
+### EyeWide and Squeeze
+
+Press **Set Wide neutral** with your eyes relaxed, not widened. Then widen your eyes and adjust the Wide start/full range while watching the orange marker and output. Green shows normal eyelid movement; orange shows Wide.
+
+Squeeze has its own rail. Compare ordinary closure with gently adding tension after closing, then adjust its range. You do not need to squeeze forcefully.
+
+**Eyelid response** changes the response between the endpoints. Set the endpoints first, then use this control if the movement in between still feels wrong.
+
+## 7. Wearing Memory (optional)
+
+Wearing Memory saves a wearing position and eyelid settings that you have confirmed work well. It recalls a correction when the eye-camera appearance is similar. It does not automatically learn its way out of a bad setup.
+
+1. Open **Wearing memory...**.
+2. Choose **Adjust without recovery** to pause automatic correction.
+3. Recenter with relaxed open eyes and adjust the eyelid handles.
+4. If useful, use **Set L closed / Set R closed**. Close the selected eye and hold it closed through the two tones.
+5. Check both eyes' opening, full closure and natural blinks.
+6. Press **Save current good state**. Keep both eyes relaxed and open, looking straight ahead, until saving finishes.
+7. Turn on **Automatic wearing-position recovery**.
+
+Recenter and slider edits alone do not save a memory. Do not save straight from a recovered or Try state: use Adjust without recovery and verify the uncorrected response first.
+
+- **Try:** temporarily try a saved state. Use Adjust without recovery to end the trial.
+- **Delete:** remove an unwanted state.
+- **Undo threshold edits:** undo the current eyelid-threshold edits without rolling back later Wide, Squeeze or response-curve changes.
+- **Finish without saving memory:** leave adjustment mode without adding a memory. This does not undo your settings.
+
+Up to eight states can be stored. Saving nearly the same state updates the existing entry, so the count may not increase. Memories are separated by device, unit identity and image settings. Changing brightness, crop or other image settings can make previous memories unavailable for display or matching in the new setup.
+
+Brief blinks retain the correction; prolonged missing evidence releases it. Turning recovery off keeps the saved memories. If recovery does not help, turn it off and return to manual settings.
+
+A memory stores a small eye-image reference and adjustment values locally. Normal operation does not upload these, but inspect your settings folder before sharing it.
+
+## 8. Eyebrows (optional)
+
+Choose a mode under **BROW** on the dashboard:
+
+- **LEGACY:** the bundled VRCFT module derives eyebrow motion from EyeWide / EyeSquint. No personal training is required.
+- **ESTIMATE:** use an independent eyebrow model. This is unavailable without a compatible loaded model. Python is not run during normal tracking.
+- **BROW L/R SYNC:** link or unlink the independent eyebrows.
+
+Try the included `eyebrow.bin` first. To adapt a model to yourself, record data in the Eyebrow section and use **Fit in app (no Python)**. This adapts an existing model.
+
+**Train & bake** uses an external `vr_eyebrow` project and Python environment for retraining. It is not required just to run the application or use the bundled model.
+
+For independent eyebrows in VRChat, check **VRChat eyebrow OSC → Send eyebrows directly to VRChat OSC** and its destination in the Eyebrow section. Avoid sending the same eyebrow parameters from multiple applications at once. The avatar also needs compatible parameters.
+
+## 9. Gaze, output and everyday use
+
+Use **Gaze centre & movement range...** for gaze centering and range. Avatars can display the same gaze differently, so check the avatar's range before changing image brightness or eyelid handles.
+
+**Eye mapping** changes eye identity or direction. Reversing gaze direction and swapping eye streams are different operations; a stream swap also swaps the camera images. If the problem is harder to identify, such as near-focus convergence going outward, report the headset, camera view and current mapping instead of stacking several flips.
+
+VRCFT normally connects to `127.0.0.1:5555`. Increasing **VRCFT openness low-pass** adds smoothing and delay. Start with 0 or 1 sample.
+
+Minimizing keeps camera, model and VRCFT output running. Close the app when finished. Eye image output is a separate streaming feature; you do not need to enable it to see the dashboard PREVIEW.
+
+## 10. Troubleshooting
+
+| Symptom | Check first |
 | --- | --- |
-| `auto` | Recommended for Pimax. Detects a connected VR4 or XR5 EyeChip. |
-| `pimax_vr4` | Explicit Pimax Crystal / Crystal Super VR4 path. |
-| `pimax_xr5` | Explicit Pimax Dream Air / SE (XR5) angled-camera path. |
-| `starvr` | StarVR One through its Tobii runtime. |
-| `varjo` | Native Varjo Base camera path. |
-| `varjo_mjpeg` | External Varjo Eye Streamer MJPEG path. |
+| The app will not open or immediately exits | Read `sranibro.log` in the settings folder. Copy your settings before removing anything. |
+| No camera preview | Check PREVIEW, the headset selection, whether the headset is awake, and the camera stage in Pipeline. |
+| PSVR2 reports Reload failed | Check that PSVR2Toolkit is installed and running in SteamVR. The PSVR2 App alone is not enough. |
+| An eye will not close, or closes too early | Pause recovery; check wearing position, brightness, Recenter and that eye's closed handle. |
+| EyeWide does not respond | Use Set Wide neutral with relaxed eyes, then check the orange marker and Wide range. |
+| Tracking changes after putting the headset back on | Turn Memory off and verify manual settings. Save only after tracking works well. |
+| The saved count does not increase | Check whether a similar entry was updated. The limit is eight. Also check for a save error. |
+| VRCFT will not connect | Check module placement, that SRanibro is running, and whether another app uses TCP port 5555. |
+| UI interaction is heavy | Turn PREVIEW off; compare minimized operation and CPU inference. |
 
-`auto` is for Pimax detection; choose StarVR or Varjo explicitly.
-
-Click **Apply & reload**. Device, model, file-path and OSC changes do not take
-effect until this button is pressed. Live switches and most tuning controls are
-saved immediately.
-
-Pimax direct access may show a UAC prompt while SRanibro releases the EyeChip
-from the Tobii platform service. Allow it if you want SRanibro to own the camera.
-
-## 5. Check the dashboard
-
-The pipeline should turn green from **DEVICE** through **OUTPUT**, and both eye
-images should appear.
-
-The number such as `120/s` on a camera image is the observed camera-frame arrival
-rate. The eyelid model can run at a lower rate than the camera while gaze and
-output continue at their own rates.
-
-If a stage is red, expand the pipeline or open **Console**. The first failed
-stage and its current reason are more useful than changing unrelated tuning.
-
-## 6. Connect VRCFaceTracking and VRChat
-
-Recommended startup order:
-
-1. Start the headset vendor software and connect the HMD.
-2. Start SRanibro and wait for the pipeline to go green.
-3. Start VRCFaceTracking and enable the `SRanibro` eye module.
-4. Start VRChat.
-
-SRanibro serves its local eye stream on `127.0.0.1:5555`. If VRCFT does not
-connect, make sure another app is not already using TCP port 5555.
-
-The **VRCFT openness low-pass** control in Settings is live:
-
-- `0` or `1` sample: pass-through, least latency.
-- Larger values: smoother, but add delay.
-
-SRanibro already performs eyelid post-processing, so start with pass-through
-unless your avatar still needs extra smoothing.
-
-## 7. First eyelid calibration
-
-Wear the HMD normally before calibrating. Do not press the headset into an
-unusual position just for calibration.
-
-1. Open **Calibration**.
-2. Look straight ahead with both eyes naturally open.
-3. Press **Recenter**.
-4. Wait about a second, then perform two or three deliberate slow blinks.
-5. Test normal blinks, a slow close, a held wink and a relaxed reopen.
-
-Recenter learns the current relaxed-open baseline. **Adaptive blink bounds**
-learns the real full-close depth separately. It is enabled by default and is
-normally the better choice. If tracking becomes biased after the headset moves
-on your face, reseat it normally and press Recenter again.
-
-Calibration is stored separately for each HMD. After updating from an older
-version, press Recenter once on every headset you use.
-
-### Eye mapping
-
-Use **Settings → Eye mapping** only when the symptom matches:
-
-- Avatar looks right when you look left → **Flip gaze left / right**.
-- The avatar's left and right eyes are swapped → **Swap left / right**.
-- The eye-camera image itself is mirrored → **Flip image horizontally**.
-
-These settings are saved per HMD.
-
-## 8. Dream Air / SE (XR5)
-
-The following controls are shown only while Dream Air / SE (XR5) is active.
-
-### Gaze source and correction
-
-Calibrate Tobii gaze in Pimax software first. If that base calibration is wrong,
-SRanibro may receive plausible gaze data while the left/right alignment is still
-incorrect.
-
-The optional **EyeChip combined gaze** source is usually steadier when one eye
-jitters or temporarily loses tracking. It trades some natural near-focus
-vergence for stability. Changing the source requires **Apply & reload**; run
-the gaze **Center** step again afterwards.
-
-Use **Dream Air / XR5 gaze correction** only for the remaining center, range or
-vergence error after the vendor calibration.
-
-### Automatic eye image alignment / Safe Geometry Fit
-
-The built-in XR5 geometry is already a valid fallback. Run the fit only if the
-eyelid model does not respond well for the current wearer or optical position.
-
-1. Start the guided recording and follow every OPEN, HALF, CLOSED, gaze, slow
-   close and blink prompt.
-2. Keep the HMD seated consistently for the full recording.
-3. Run the fit after capture completes.
-4. Use **Preview candidate live** and check normal blinks and slow closes.
-5. If the result is `HOLDOUT PASS`, save it with **Apply validated candidate**.
-
-`KEEP CURRENT GEOMETRY` is the automatic recommendation to retain the current
-settings. You can still preview a rejected candidate. If it works better in the
-headset, acknowledge the warning and choose **Apply unvalidated candidate**.
-SRanibro creates a backup first, and **Rollback last applied geometry** restores
-the previous settings during the same run.
-
-Safe Geometry Fit is inside `SRanibro.exe` and does not require Python. It uses
-the configured SRanipal eyelid model and does not train a new model.
-
-The completed recording stays in memory for fitting. It is saved to disk only
-when you explicitly export it. An exported ZIP contains biometric eye images;
-inspect it and share it only with people you trust.
-
-### XR5 image EyeWide
-
-`SRanipal` uses the legacy Wide response. `Auto` uses a valid, fresh custom XR5
-Wide model when available and otherwise falls back safely. `Custom` requires a
-working custom model.
-
-**Fit in app (no Python)** adapts an existing compatible Wide base model. It
-cannot create a useful model without that base model.
-
-## 9. Optional eyebrow tracking
-
-Eyebrow tracking is optional and requires a compatible `brow.bin` base model.
-
-- **Fit in app (no Python)** refits the existing model head from your captured
-  eyebrow dataset. This is the quick per-user route.
-- **Train & bake** creates a model through the external `vr_eyebrow` project and
-  requires Python, PyTorch and a configured environment.
-
-Use **Enable eyebrow tracking** as the master switch. The bundled VRCFT module is
-eye-only, so enable **Send eyebrows directly to VRChat OSC** if VRCFT should keep
-handling the eyes while SRanibro sends FT/v2 eyebrow parameters.
-
-## 10. Daily use and shutdown
-
-Minimizing the SRanibro window does not stop tracking. The UI reduces its redraw
-work, while the camera, model and VRCFT output continue in the background.
-
-Close SRanibro when you no longer need it. If a Pimax/Tobii vendor runtime cannot
-reacquire the EyeChip afterwards, run:
-
-```text
-SRanibro.exe restore
-```
-
-Rebooting also restores the normal vendor-service state.
-
-## 11. Troubleshooting and feedback
-
-### Window closes or never appears
-
-Read:
-
-```text
-%APPDATA%\SRanibro\sranibro.log
-```
-
-### Camera images are missing
-
-- Confirm the correct HMD path is selected.
-- Confirm the HMD is connected and awake.
-- Confirm the Tobii DLL path is valid.
-- Apply again and accept the UAC handoff if requested.
-
-### Pupil arrives but gaze does not
-
-Complete the vendor's Tobii/Pimax gaze calibration, then use **Apply & reload**.
-Check Console for the wearable/gaze subscription state before changing eyelid
-geometry.
-
-### One eyelid becomes biased over time
-
-Reseat the HMD normally and press Recenter. Leave **Adaptive blink bounds** on,
-then perform two or three slow blinks. If the problem returns, record a short
-diagnostic CSV with **REC** on the Calibration page.
-
-### VRCFT does not connect
-
-- Start SRanibro first.
-- Check that the custom module folder uses the exact GUID above.
-- Confirm `SRanibro.dll`, `module.json` and `config.json` are in that folder.
-- Check that TCP port 5555 is free.
-
-### Sending a report
-
-Useful files include the relevant log tail, a short diagnostic CSV, and—only
-when needed—an exported XR5 calibration recording. Logs may contain your Windows
-username and local file paths. Calibration recordings contain eye imagery.
-Review all files before sharing them.
+For a report, include the application version, headset, reproduction steps and relevant log tail. Use **REC** for a short diagnostic CSV if needed. Logs and CSVs can contain local paths and tracking data; memories and recordings can contain eye images. Review files before sharing them.
