@@ -72,7 +72,7 @@ impl VarjoNativeAdapter {
                 slot_a_eye: Eye::Left,
                 image_w: 640,
                 image_h: 400,
-                transport: "VarjoLib SDK (data stream)".into(),
+                transport: "Varjo Base SDK (data stream)".into(),
                 streams: "eye-camera Y8 + gaze (Native SDK)".into(),
                 gaze_src: "gaze direction (Native SDK)".into(),
                 ..DeviceProfile::default()
@@ -256,12 +256,12 @@ impl HmdAdapter for VarjoNativeAdapter {
         let mut on_gaze = on_gaze; // called from this thread's poll loop (no mutex needed)
 
         let handle = thread::spawn(move || {
-            set_status(&status, "loading VarjoLib…");
+            set_status(&status, "loading Varjo Base runtime…");
             let lib = match unsafe { VarjoLib::load(&dll_path) } {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("[varjo] {e}");
-                    set_status(&status, format!("VarjoLib load failed: {e}"));
+                    set_status(&status, "Varjo Base runtime load failed");
                     return;
                 }
             };
@@ -583,6 +583,7 @@ impl HmdAdapter for VarjoNativeAdapter {
                                 pupil_valid: false,
                                 pupil_pos: [0.0, 0.0],
                                 pupil_pos_valid: false,
+                                pupil_pos_reported: false,
                                 openness: 0.0,
                                 openness_valid: false,
                                 openness_reported: false,

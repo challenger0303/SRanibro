@@ -65,7 +65,7 @@ impl Xr5Adapter {
             // region 1 → LEFT, region 0 → RIGHT (see vr4_adapter::region_to_eye); the
             // pair's "slot A" is the LEFT eye, matching the Python XR5 bridge.
             slot_a_eye: Eye::Left,
-            transport: "WinUSB + native TTP (DLL-free)".into(),
+            transport: "WinUSB + native TTP".into(),
             streams: "TTP image 1291 + wearable 1285".into(),
             gaze_src: match gaze_source {
                 GazeSource::PerEye => "per-eye gaze · pupil · openness (Tobii)".into(),
@@ -83,7 +83,7 @@ impl Xr5Adapter {
         // including when the active device selector is `auto`.
         let gaze_source = cfg.gaze_source_for("pimax_xr5");
         let dll_path = cfg
-            .tobii_dll_path()
+            .tobii_runtime_path()
             .map(|p| p.to_string_lossy().into_owned());
         Self(Vr4Adapter::with_profile(
             Self::profile(gaze_source),
@@ -141,8 +141,8 @@ mod tests {
         assert_eq!(p.ml_device, "xr5", "angled-optics ML route");
         assert_eq!(p.slot_a_eye, Eye::Left, "region 1 = LEFT");
         assert!(
-            p.transport.contains("DLL-free"),
-            "DLL-free WinUSB+TTP transport"
+            p.transport.contains("native TTP"),
+            "native WinUSB+TTP transport"
         );
         assert!(p.streams.contains("1291"), "TTP image stream 1291");
     }
@@ -157,6 +157,7 @@ mod tests {
             !a.0.uses_wearable_gaze(),
             "XR5 gaze must come only from stream 1289"
         );
+
         assert!(!a.0.uses_combined_gaze());
         // DLL-free WinUSB path claims the EyeChip directly → runtime must be stopped.
         assert!(a.needs_eyechip_handoff());

@@ -234,6 +234,32 @@ mod sys {
         run("sc.exe", &["config", &name, "start=", "demand"]);
         run("sc.exe", &["start", &name]);
     }
+
+    /// Whether the generic StarVR broker can still claim the EyeChip. Direct DLL
+    /// mode requires the service to be both disabled and fully stopped so it
+    /// cannot auto-revive during `tobii_device_create`.
+    pub fn starvr_service_needs_handoff() -> bool {
+        list_tobii_services()
+            .into_iter()
+            .find(|name| name.eq_ignore_ascii_case("Tobii Service"))
+            .is_some_and(|name| !(service_start_disabled(&name) && service_stopped(&name)))
+    }
+
+    /// Disable and stop only the generic StarVR broker. Pimax platform runtimes
+    /// are handled separately by `ensure_capture_ready`.
+    pub fn stop_starvr_service() {
+        let Some(name) = list_tobii_services()
+            .into_iter()
+            .find(|name| name.eq_ignore_ascii_case("Tobii Service"))
+        else {
+            eprintln!("[platform] StarVR direct: generic Tobii Service is not installed");
+            return;
+        };
+        eprintln!("[platform] StarVR direct: disabling + stopping {name}");
+        run("sc.exe", &["config", &name, "start=", "disabled"]);
+        run("sc.exe", &["stop", &name]);
+        std::thread::sleep(Duration::from_millis(600));
+    }
 }
 
 // --- public API (thin cfg shims over `sys`) ---
@@ -325,6 +351,37 @@ pub fn ensure_starvr_ready() {
     }
 }
 
+/// Free the generic StarVR EyeChip broker before trying the stream-engine DLL
+/// directly. This is the alternate route used after the service path reports a
+/// connection failure.
+#[cfg(windows)]
+pub fn ensure_starvr_direct_ready() {
+    if !sys::starvr_service_needs_handoff() {
+        return;
+    }
+    eprintln!("[platform] StarVR direct mode needs the generic Tobii Service stopped");
+    if sys::is_elevated() {
+        sys::stop_starvr_service();
+    } else {
+        match sys::run_elevated_and_wait(&["starvr-direct"]) {
+            Ok(code) => {
+                eprintln!("[platform] elevated StarVR direct switch finished (exit {code})")
+            }
+            Err(e) => eprintln!("[platform] UAC elevation failed: {e}"),
+        }
+    }
+}
+
+/// Elevated helper target used by [`ensure_starvr_direct_ready`].
+#[cfg(windows)]
+pub fn cmd_starvr_direct() {
+    if sys::is_elevated() {
+        sys::stop_starvr_service();
+    } else {
+        eprintln!("[platform] starvr-direct requires elevation");
+    }
+}
+
 /// Elevated helper target used by [`ensure_starvr_ready`].
 #[cfg(windows)]
 pub fn cmd_starvr_service() {
@@ -355,6 +412,10 @@ pub fn cmd_restore() {
 }
 #[cfg(not(windows))]
 pub fn ensure_starvr_ready() {}
+#[cfg(not(windows))]
+pub fn ensure_starvr_direct_ready() {}
+#[cfg(not(windows))]
+pub fn cmd_starvr_direct() {}
 #[cfg(not(windows))]
 pub fn cmd_starvr_service() {
     eprintln!("`starvr-service` mode is Windows-only.");

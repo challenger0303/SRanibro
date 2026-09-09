@@ -17,6 +17,8 @@ fn replay(csv: &str, base: [f32; 2], depth: [f32; 2]) -> Vec<(u32, [f32; 2], [f3
         blink_depth: d,
         mid_anchor: 0.5,
         learned_once: true, // restored real calibration: already learned (no re-snap)
+        endpoint_locked: false,
+        endpoint_calibrated_unix: 0,
     };
     let mut st = SRanipalState::new();
     st.restore_all(&CalibStore {

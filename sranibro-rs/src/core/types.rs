@@ -49,6 +49,10 @@ pub struct EyeSample {
     pub pupil_valid: bool,
     pub pupil_pos: [f32; 2],
     pub pupil_pos_valid: bool,
+    /// True when this sample actually carried a pupil-position validity field.
+    /// A reported-invalid wearable sample clears stale validity; a gaze-only
+    /// packet leaves the last wearable pupil position untouched.
+    pub pupil_pos_reported: bool,
     pub openness: f32,
     pub openness_valid: bool,
     /// True when this sample actually carried a native openness validity field.
@@ -68,6 +72,7 @@ impl Default for EyeSample {
             pupil_valid: false,
             pupil_pos: [0.5, 0.5],
             pupil_pos_valid: false,
+            pupil_pos_reported: false,
             openness: 0.0,
             openness_valid: false,
             openness_reported: false,
@@ -192,7 +197,7 @@ impl Default for DespeckleParams {
 /// removed while the eye's high-frequency structure (lid, lashes) is preserved. A LARGE
 /// radius keeps a blink (a mid-frequency lid motion) mostly intact. Per-device; OFF by
 /// default (experimental; enable when the close-up shadow is the problem). Runs AFTER
-/// despeckle, BEFORE brightness normalization.
+/// despeckle, BEFORE fixed manual brightness.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FlattenParams {
@@ -214,19 +219,17 @@ impl Default for FlattenParams {
     }
 }
 
-/// Adaptive brightness + contrast normalization of the eye ML input. Lens-to-eye
-/// distance varies per person (and per HMD reseat), so the IR illumination — hence the
-/// image brightness/contrast — drifts; and the openness model reads "brighter = more
-/// open" (per the response heatmap), so that drift biases openness. This holds the input
-/// at a learned target: a SLOWLY-adapted per-user baseline (the source) is mapped by an
-/// affine onto the target, so lens-distance drift is corrected while fast changes (blinks)
-/// pass through unchanged. The target is auto-captured from the user's own settled frames
-/// (`captured`) and persisted per-device, so it re-anchors across sessions. Applied to the
-/// ML input only, AFTER despeckle; complements (does not replace) the camera's own AE.
+/// Per-device eye-image brightness settings. Production uses only `manual_gain`: a fixed
+/// user-controlled multiplier that never learns or moves on its own. The remaining fields
+/// are retained solely so older configs deserialize without losing data; config resolution
+/// and the live ML path force the legacy adaptive mode off.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BrightnessNorm {
     pub enabled: bool,
+    /// Fixed user-controlled exposure multiplier applied to the eyelid model input.
+    /// `1.0` is unchanged. It is persisted independently for each HMD.
+    pub manual_gain: f32,
     /// Baseline EMA rate per ML frame (~60Hz). Small = slow (won't chase blinks). ~0.02
     /// ≈ a couple-second time constant.
     pub adapt: f32,
@@ -249,6 +252,10 @@ impl Default for BrightnessNorm {
             // OFF by default: still being tuned, and normalizing to a stale target after a
             // big lens-distance change can misbehave — opt-in per device.
             enabled: false,
+            // The SRanipal eyelid model is substantially more stable when the camera
+            // input is lifted toward the brightness of its training domain. Users can
+            // still return this fixed control to 100% per HMD.
+            manual_gain: 1.6,
             adapt: 0.02,
             strength: 1.0,
             auto_learn: true,
@@ -256,6 +263,285 @@ impl Default for BrightnessNorm {
             tgt_spread: [40.0, 40.0],
             captured: false,
         }
+    }
+}
+
+/// Per-eye model that removes a repeatable gaze-direction bias from the eyelid
+/// model's raw openness coordinate.  The independent variable is the HMD's native
+/// gaze direction before any avatar/output trim.  Coefficients predict a positive
+/// raw-domain lift from centered angles `[x, y, x*y, x^2, y^2]`, with x/y scaled by
+/// [`GazeEyelidProfile::angle_scale_deg`].
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GazeEyelidEyeProfile {
+    pub enabled: bool,
+    pub center_deg: [f32; 2],
+    pub coefficients: [f32; 5],
+    /// Hard upper bound fitted from labelled relaxed-open evidence.
+    pub max_lift: f32,
+    pub train_error: f32,
+    pub holdout_error_before: f32,
+    pub holdout_error_after: f32,
+}
+
+impl Default for GazeEyelidEyeProfile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            center_deg: [0.0; 2],
+            coefficients: [0.0; 5],
+            max_lift: 0.0,
+            train_error: 0.0,
+            holdout_error_before: 0.0,
+            holdout_error_after: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GazeEyelidProfile {
+    pub schema_version: u32,
+    pub calibrated_unix: u64,
+    pub angle_scale_deg: f32,
+    pub eyes: [GazeEyelidEyeProfile; 2],
+}
+
+impl Default for GazeEyelidProfile {
+    fn default() -> Self {
+        Self {
+            schema_version: 2,
+            calibrated_unix: 0,
+            angle_scale_deg: 20.0,
+            eyes: [GazeEyelidEyeProfile::default(); 2],
+        }
+    }
+}
+
+impl GazeEyelidProfile {
+    pub fn is_compatible(&self) -> bool {
+        self.schema_version == 2
+            && self.angle_scale_deg.is_finite()
+            && (5.0..=60.0).contains(&self.angle_scale_deg)
+            && self.eyes.iter().all(|eye| {
+                eye.center_deg.iter().all(|value| value.is_finite())
+                    && eye.coefficients.iter().all(|value| value.is_finite())
+                    && eye.max_lift.is_finite()
+                    && (0.0..=0.12).contains(&eye.max_lift)
+            })
+    }
+
+    /// Convert a finite direction vector into horizontal/vertical angular
+    /// coordinates. The vector need not be normalized, but +Z must be forward,
+    /// matching the device gate and every other gaze consumer.
+    pub fn gaze_angles_deg(gaze: [f32; 3]) -> Option<[f32; 2]> {
+        if !gaze.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        let horizontal_radius = gaze[0].hypot(gaze[2]);
+        if horizontal_radius <= 1.0e-6 || gaze[2] <= 0.0 {
+            return None;
+        }
+        Some([
+            gaze[0].atan2(gaze[2]).to_degrees(),
+            gaze[1].atan2(horizontal_radius).to_degrees(),
+        ])
+    }
+
+    /// Positive-only raw openness correction. A profile can restore a directional
+    /// droop, but can never manufacture a lower (more closed) value.
+    pub fn predicted_lift(&self, eye: usize, gaze: [f32; 3]) -> Option<f32> {
+        if !self.is_compatible() {
+            return None;
+        }
+        let profile = self.eyes.get(eye)?;
+        if !profile.enabled {
+            return None;
+        }
+        let angle = Self::gaze_angles_deg(gaze)?;
+        let scale = self.angle_scale_deg;
+        let x = (angle[0] - profile.center_deg[0]) / scale;
+        let y = (angle[1] - profile.center_deg[1]) / scale;
+        let basis = [x, y, x * y, x * x, y * y];
+        let lift = profile
+            .coefficients
+            .iter()
+            .zip(basis)
+            .map(|(coefficient, value)| coefficient * value)
+            .sum::<f32>();
+        if !lift.is_finite() {
+            return None;
+        }
+        Some(lift.clamp(0.0, profile.max_lift.clamp(0.0, 0.12)))
+    }
+}
+
+/// Per-eye held-wink response. `wink_depth` is baseline-relative, so Recenter may
+/// move the relaxed-open coordinate without invalidating the calibrated wink floor.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WinkEyeProfile {
+    pub enabled: bool,
+    /// Apply the separately fitted held-wink floor. A validated squeeze
+    /// signature may keep wink classification enabled while this remains false,
+    /// which guarantees that a signature-only calibration cannot move openness.
+    pub floor_enabled: bool,
+    pub wink_depth: f32,
+    /// Whether this recording contained a repeatable unilateral native-squeeze
+    /// signal which may corroborate (but never by itself create) a wink.
+    pub squeeze_enabled: bool,
+    /// Raw ch3/ch4 rise above the runtime adaptive relaxed-squeeze floor needed
+    /// to accelerate wink entry.
+    pub squeeze_enter_delta: f32,
+    /// Lower hysteresis threshold used while a wink is already active.
+    pub squeeze_release_delta: f32,
+    pub holdout_before: f32,
+    pub holdout_after: f32,
+}
+
+impl Default for WinkEyeProfile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            floor_enabled: false,
+            wink_depth: 0.20,
+            squeeze_enabled: false,
+            squeeze_enter_delta: 0.14,
+            squeeze_release_delta: 0.07,
+            holdout_before: 0.0,
+            holdout_after: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WinkProfile {
+    pub schema_version: u32,
+    pub calibrated_unix: u64,
+    pub eyes: [WinkEyeProfile; 2],
+}
+
+impl Default for WinkProfile {
+    fn default() -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            calibrated_unix: 0,
+            eyes: [WinkEyeProfile::default(); 2],
+        }
+    }
+}
+
+impl WinkProfile {
+    pub const SCHEMA_VERSION: u32 = 2;
+
+    pub fn is_compatible(&self) -> bool {
+        self.schema_version == Self::SCHEMA_VERSION
+            && self.eyes.iter().all(|eye| {
+                eye.wink_depth.is_finite()
+                    && (0.05..=0.40).contains(&eye.wink_depth)
+                    && (!eye.squeeze_enabled
+                        || (eye.squeeze_enter_delta.is_finite()
+                            && eye.squeeze_release_delta.is_finite()
+                            && (0.03..=0.60).contains(&eye.squeeze_enter_delta)
+                            && (0.0..eye.squeeze_enter_delta).contains(&eye.squeeze_release_delta)))
+            })
+    }
+}
+
+/// Guaranteed visible bottom for a confirmed bilateral natural blink. This is
+/// deliberately separate from general close/reopen smoothing: it never turns a
+/// slow close or a one-eye wink into a timed pulse.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BlinkTimingProfile {
+    pub schema_version: u32,
+    pub enabled: bool,
+    pub min_closed_ms: f32,
+    pub calibrated_unix: u64,
+    pub train_blinks: u16,
+    pub holdout_blinks: u16,
+}
+
+impl Default for BlinkTimingProfile {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            enabled: true,
+            // Five 120 Hz emit frames. Long enough to survive one compositor
+            // sample while remaining far below a deliberate held close.
+            min_closed_ms: 42.0,
+            calibrated_unix: 0,
+            train_blinks: 0,
+            holdout_blinks: 0,
+        }
+    }
+}
+
+impl BlinkTimingProfile {
+    pub fn is_compatible(&self) -> bool {
+        self.schema_version == 1
+            && self.min_closed_ms.is_finite()
+            && (25.0..=100.0).contains(&self.min_closed_ms)
+    }
+
+    pub fn minimum_frames(&self) -> u8 {
+        ((self.min_closed_ms * 0.120).round() as u8).clamp(3, 12)
+    }
+}
+
+/// Smooth, zero-centred gain field applied to one eye after fixed manual brightness.
+/// The four coefficients deliberately describe only low-frequency illumination:
+/// linear left/right and up/down tilt plus a symmetric bowl/arch on each axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PhotometricGainField {
+    pub horizontal: f32,
+    pub vertical: f32,
+    pub horizontal_curve: f32,
+    pub vertical_curve: f32,
+}
+
+impl PhotometricGainField {
+    pub fn is_identity(self) -> bool {
+        self.horizontal == 0.0
+            && self.vertical == 0.0
+            && self.horizontal_curve == 0.0
+            && self.vertical_curve == 0.0
+    }
+}
+
+/// Fixed per-device correction discovered from labelled eye-camera recordings.
+///
+/// This lives after fixed manual brightness and before geometry.
+/// Keeping that seam explicit lets an offline fit replay the exact recorded affine,
+/// while VR4/Varjo geometry remains fixed. `affine[eye]` is `[gain, bias]`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PhotometricCorrection {
+    pub enabled: bool,
+    pub affine: [[f32; 2]; 2],
+    pub flatten: FlattenParams,
+    pub field: [PhotometricGainField; 2],
+}
+
+impl Default for PhotometricCorrection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            affine: [[1.0, 0.0]; 2],
+            flatten: FlattenParams::default(),
+            field: [PhotometricGainField::default(); 2],
+        }
+    }
+}
+
+impl PhotometricCorrection {
+    pub fn is_identity(self) -> bool {
+        !self.enabled
+            || (self.affine == [[1.0, 0.0]; 2]
+                && !self.flatten.enabled
+                && self.field.iter().all(|field| field.is_identity()))
     }
 }
 

@@ -1,9 +1,7 @@
 //! SRanibro app entry — first-run / startup view.
 //!
-//! Demonstrates the distribution model: load `sranibro.toml`, validate the
-//! user-supplied assets (SRanipal ML weights + patched Tobii DLLs — none of
-//! which we bundle), and report readiness. The device adapter + egui UI are the
-//! next keystones; this entry already gives an honest "what's missing and why".
+//! Loads `sranibro.toml`, validates user-selectable models, and reports readiness.
+//! Device connection support is discovered automatically by the normal GUI path.
 //!
 //! Double-clicking the exe (no args) launches the GUI. In a *release* build we use the
 //! Windows GUI subsystem so no console window pops up; the diagnostic CLI subcommands
@@ -67,18 +65,27 @@ fn main() {
             run_status_report();
             return;
         }
+        #[cfg(not(feature = "psvr2-only"))]
         Some("custom") => {
             sranibro_rs::platform::cmd_custom();
             return;
         }
+        #[cfg(not(feature = "psvr2-only"))]
         Some("restore") => {
             sranibro_rs::platform::cmd_restore();
             return;
         }
+        #[cfg(not(any(feature = "psvr2-only", feature = "xr5-only")))]
+        Some("starvr-direct") => {
+            sranibro_rs::platform::cmd_starvr_direct();
+            return;
+        }
+        #[cfg(not(any(feature = "psvr2-only", feature = "xr5-only")))]
         Some("starvr-service") => {
             sranibro_rs::platform::cmd_starvr_service();
             return;
         }
+        #[cfg(not(feature = "psvr2-only"))]
         Some("mode") => {
             println!("{:?}", sranibro_rs::platform::detect_mode());
             return;
@@ -86,20 +93,20 @@ fn main() {
         // VPE eyechip native-wake validator (diagnostic): dumps the device/interface
         // layout + runs the RE'd keepalive to test if SRanibro can hold the VPE eyechip
         // without SRanipal running in the background. Windows-only.
-        #[cfg(windows)]
+        #[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
         Some("vpetest") => {
             sranibro_rs::device::vpe_probe::run();
             return;
         }
         // VPE read-only interface/driver map (no service changes) — run it WITH and
         // WITHOUT SRanipal to see which interface is always present.
-        #[cfg(windows)]
+        #[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
         Some("vpescan") => {
             sranibro_rs::device::vpe_probe::scan();
             return;
         }
         // VPE eyechip wake via the HID API (the always-present 0BB4:0309 HidUsb interface).
-        #[cfg(windows)]
+        #[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
         Some("vpewake") => {
             sranibro_rs::device::vpe_hid::run();
             return;
@@ -116,10 +123,24 @@ fn main() {
             run_capture(std::env::args().skip(2).collect());
             return;
         }
+        #[cfg(feature = "psvr2-only")]
+        Some(
+            "custom" | "restore" | "starvr-direct" | "starvr-service" | "mode" | "vpetest"
+            | "vpescan" | "vpewake" | "vr4",
+        ) => {
+            eprintln!("This command is unavailable in the PSVR2-only beta.");
+            return;
+        }
+        #[cfg(feature = "xr5-only")]
+        Some("starvr-direct" | "starvr-service" | "vpetest" | "vpescan" | "vpewake" | "vr4") => {
+            eprintln!("This command is unavailable in the XR5-only build.");
+            return;
+        }
         _ => {}
     }
 
     // `vr4` subcommand: live hardware acquisition test (Windows + VR4 only).
+    #[cfg(not(any(feature = "psvr2-only", feature = "xr5-only")))]
     if std::env::args().nth(1).as_deref() == Some("vr4") {
         run_vr4();
         return;
@@ -149,6 +170,11 @@ fn main() {
 /// writes a starter template on first run, and prints each asset's presence + what it
 /// gates — the "what's missing and why" view, without launching the GUI.
 fn run_status_report() {
+    #[cfg(feature = "psvr2-only")]
+    println!("SRanibro PSVR2 Beta v{}", env!("CARGO_PKG_VERSION"));
+    #[cfg(feature = "xr5-only")]
+    println!("SRanibro XR5 Beta v{}", env!("CARGO_PKG_VERSION"));
+    #[cfg(not(any(feature = "psvr2-only", feature = "xr5-only")))]
     println!("SRanibro v{}", env!("CARGO_PKG_VERSION"));
 
     let cfg_path = sranibro_rs::config::config_path();
@@ -167,7 +193,7 @@ fn run_status_report() {
     }
     println!("[config] device = {}", cfg.hmd.device);
 
-    println!("\nAssets (you supply these — nothing proprietary is bundled):");
+    println!("\nModels and optional tools:");
     for a in cfg.check_assets() {
         let mark = if a.present {
             "OK"
@@ -190,6 +216,11 @@ fn run_status_report() {
     let missing = cfg.missing_required();
     println!();
     if missing.is_empty() {
+        #[cfg(feature = "psvr2-only")]
+        println!("Ready: required model assets present. Launch SRanibro with PSVR2Toolkit active.");
+        #[cfg(feature = "xr5-only")]
+        println!("Ready: XR5 research variant assets present.");
+        #[cfg(not(any(feature = "psvr2-only", feature = "xr5-only")))]
         println!(
             "Ready: required assets present. (Run `sranibro-rs vr4` to test VR4 acquisition.)"
         );
@@ -204,7 +235,7 @@ fn run_status_report() {
 
 /// Live VR4 acquisition test: stream over WinUSB and print per-second rates.
 /// Requires the platform service stopped: `net stop "Tobii VR4PIMAXP3B Platform Runtime"`.
-#[cfg(windows)]
+#[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
 fn merge_sample(
     dst: &mut sranibro_rs::core::types::GazeSample,
     src: sranibro_rs::core::types::GazeSample,
@@ -216,7 +247,7 @@ fn merge_sample(
     merge_eye(&mut dst.right, src.right);
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
 fn merge_eye(
     dst: &mut sranibro_rs::core::types::EyeSample,
     src: sranibro_rs::core::types::EyeSample,
@@ -233,9 +264,12 @@ fn merge_eye(
         dst.pupil_mm = src.pupil_mm;
         dst.pupil_valid = true;
     }
-    if src.pupil_pos_valid {
-        dst.pupil_pos = src.pupil_pos;
-        dst.pupil_pos_valid = true;
+    if src.pupil_pos_reported {
+        if src.pupil_pos_valid {
+            dst.pupil_pos = src.pupil_pos;
+        }
+        dst.pupil_pos_valid = src.pupil_pos_valid;
+        dst.pupil_pos_reported = true;
     }
     if src.openness_reported {
         dst.openness = src.openness;
@@ -244,7 +278,7 @@ fn merge_eye(
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
 fn run_vr4() {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -254,7 +288,7 @@ fn run_vr4() {
     use sranibro_rs::device::vr4_adapter::Vr4Adapter;
     use sranibro_rs::device::HmdAdapter;
 
-    println!("SRanibro VR4 acquisition test (WinUSB, DLL-free)");
+    println!("SRanibro VR4 acquisition test (WinUSB)");
     println!("If this hangs/fails: stop the service first ->");
     println!("  net stop \"Tobii VR4PIMAXP3B Platform Runtime\"\n");
 
@@ -662,7 +696,13 @@ fn run_full() {
     }
     let mut sinks: Vec<Box<dyn OutputSink>> = vec![Box::new(DebugSink::new(60))];
     match BrokenEyeSink::new(5555, cfg.output.vrcft_filter_samples) {
-        Ok(s) => sinks.push(Box::new(s)),
+        Ok(s) => {
+            s.status().sranipal_brow_link.store(
+                cfg.output.vrcft_sranipal_brow_link,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            sinks.push(Box::new(s));
+        }
         Err(e) => eprintln!("[brokeneye] could not start server: {e}"),
     }
     if cfg.output.osc {
@@ -727,7 +767,7 @@ fn run_full() {
     eprintln!("run mode is Windows-only.");
 }
 
-/// Per-unit eye-image mapping from config (swap L/R, mirror image).
+/// Per-unit camera/auxiliary and gaze mapping from config.
 fn device_map_for(cfg: &Config, device_key: &str) -> sranibro_rs::pipeline::DeviceMap {
     let m = cfg.mapping_for(device_key);
     sranibro_rs::pipeline::DeviceMap {
@@ -763,17 +803,7 @@ fn run_ui_mode() {
     // the console (AttachConsole'd earlier) — that is the intended behaviour.
     sranibro_rs::logcap::init();
     let (cfg, _) = Config::load(&sranibro_rs::config::config_path());
-    if cfg.ui.steamvr_overlay {
-        eprintln!("[ui] steamvr_overlay=true, but the in-headset SteamVR overlay isn't ported to the Rust build yet — desktop dashboard only.");
-    }
-    let engine = match sranibro_rs::engine::build_engine(&cfg) {
-        Ok(e) => e,
-        Err(e) => {
-            log_diag(&format!("engine start failed: {e}"));
-            return;
-        }
-    };
-    if let Err(e) = sranibro_rs::ui::run_ui(engine.pipeline, engine.be_status) {
+    if let Err(e) = sranibro_rs::ui::run_ui_from_config(cfg) {
         // Most likely a graphics-init failure (no usable GPU adapter / driver) — log it
         // so a blank-window launch on another machine is diagnosable, not a silent flash.
         log_diag(&format!(

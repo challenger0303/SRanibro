@@ -12,6 +12,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::FreeLibrary;
 use windows_sys::Win32::System::LibraryLoader::LoadLibraryA;
@@ -22,7 +23,7 @@ use super::ttp::{
     self, decode_value, encode_blob, encode_u32, encode_u32_vector, Value, PID_GAZE, PID_IMAGE,
     PID_WEARABLE,
 };
-use super::usb::UsbDevice;
+use super::usb::{self, UsbDevice};
 use super::{FrameFn, GazeFn, HmdAdapter};
 use crate::core::types::{DeviceProfile, Eye};
 
@@ -47,6 +48,7 @@ pub struct Vr4Adapter {
     /// firmware uses 1289. Never merge both streams: their timing and L/R
     /// conventions are not interchangeable.
     wearable_gaze_source: bool,
+
     /// XR5-only source selection inside pid 1289. When true, shape the EyeChip's
     /// fused column-5 direction as both eyes instead of columns 3/4. Fixed for the
     /// lifetime of the stream to avoid source-switch jitter.
@@ -72,7 +74,7 @@ impl Vr4Adapter {
             // preprocessing route and is intentionally separate.
             name: "Pimax Crystal Super".into(),
             ml_device: "vr4".into(),
-            transport: "WinUSB · DLL-free".into(),
+            transport: "WinUSB · native TTP".into(),
             streams: "Tobii TTP: gaze 1289 · adv 1285 · img 1291".into(),
             gaze_src: "gaze · pupil · openness (Tobii)".into(),
             ..DeviceProfile::default()
@@ -200,32 +202,30 @@ fn load_required_dll(
         _ => {
             set_status(
                 status,
-                "Tobii DLL required — set it in Settings, then reload",
+                "Tobii runtime unavailable — reinstall the official SRanibro build",
             );
-            eprintln!(
-                "{log_tag} refusing to connect: no Tobii DLL configured ([assets].tobii_dll)"
-            );
+            eprintln!("{log_tag} refusing to connect: Tobii runtime unavailable in this build");
             return None;
         }
     };
     if !std::path::Path::new(&path).is_file() {
-        set_status(status, format!("Tobii DLL not found: {path}"));
+        set_status(status, "Tobii runtime file not found");
+        eprintln!("{log_tag} Tobii runtime file not found");
         return None;
     }
     let c = match CString::new(path.clone()) {
         Ok(c) => c,
         Err(_) => {
-            set_status(status, "bad Tobii DLL path");
+            set_status(status, "Tobii runtime path is invalid");
             return None;
         }
     };
     let hmod = unsafe { LoadLibraryA(c.as_ptr() as *const u8) };
     if hmod.is_null() {
-        set_status(status, format!("Tobii DLL load failed: {path}"));
-        eprintln!("{log_tag} LoadLibrary failed for {path}");
+        set_status(status, "Tobii runtime load failed");
+        eprintln!("{log_tag} Tobii runtime load failed");
         return None;
     }
-    eprintln!("{log_tag} Tobii DLL loaded (connection authorized): {path}");
     Some(DllGuard(hmod))
 }
 
@@ -286,6 +286,12 @@ fn handshake(dev: &mut UsbDevice, log_tag: &str) -> io::Result<()> {
             "SKIPPED — no challenge blob in response"
         }
     );
+    if !authed {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "EyeChip did not return an authentication challenge",
+        ));
+    }
 
     // Subscribe gaze + wearable-advanced (pupil/openness) + image, then unlock.
     for sid in [PID_GAZE, PID_WEARABLE, PID_IMAGE] {
@@ -295,10 +301,52 @@ fn handshake(dev: &mut UsbDevice, log_tag: &str) -> io::Result<()> {
             "{log_tag} subscribe stream {sid} {}",
             if acked { "ack" } else { "(no ack within 1s)" }
         );
+        if !acked {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("EyeChip did not acknowledge stream {sid}"),
+            ));
+        }
     }
     let mid = dev.send(1915, &encode_u32(1001))?;
     let _ = dev.recv(mid, 1000)?;
     Ok(())
+}
+
+/// Wait until the previous in-process WinUSB session has been closed long enough
+/// for EyeChip firmware to accept a fresh authentication handshake. The wait lives
+/// on the adapter thread, reports status, and checks `stop` every 50 ms.
+fn wait_for_reopen_quiet_period(
+    stop: &AtomicBool,
+    status: &Arc<Mutex<String>>,
+    log_tag: &str,
+) -> bool {
+    let initial = usb::reopen_quiet_remaining();
+    if initial.is_zero() {
+        return true;
+    }
+
+    eprintln!(
+        "{log_tag} waiting {:.1}s for EyeChip firmware to release the previous session",
+        initial.as_secs_f32()
+    );
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let remaining = usb::reopen_quiet_remaining();
+        if remaining.is_zero() {
+            return true;
+        }
+        set_status(
+            status,
+            format!(
+                "waiting for EyeChip release... {:.1}s",
+                remaining.as_secs_f32()
+            ),
+        );
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
 }
 
 /// Region→eye mapping shared by VR4 and the XR5 delegate. The TTP image decoder
@@ -342,25 +390,76 @@ impl HmdAdapter for Vr4Adapter {
             } else {
                 None
             };
-            set_status(&status, "opening EyeChip…");
-            let mut dev = match UsbDevice::open() {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("{log_tag} open failed: {e}");
-                    set_status(
-                        &status,
-                        "no EyeChip — connect the headset and stop the Tobii platform service",
-                    );
+            const START_ATTEMPTS: u8 = 4;
+            const RETRY_STEPS: u8 = 10;
+            let mut ready = None;
+            for attempt in 1..=START_ATTEMPTS {
+                if stop.load(Ordering::Relaxed) {
                     return;
                 }
-            };
-            eprintln!("{log_tag} opened EyeChip (serial={})", dev.serial);
-            set_status(&status, "authenticating…");
-            if let Err(e) = handshake(&mut dev, log_tag) {
-                eprintln!("{log_tag} handshake failed: {e}");
-                set_status(&status, format!("handshake failed: {e}"));
-                return;
+                if !wait_for_reopen_quiet_period(&stop, &status, log_tag) {
+                    return;
+                }
+                set_status(
+                    &status,
+                    format!("opening EyeChip… attempt {attempt}/{START_ATTEMPTS}"),
+                );
+                match UsbDevice::open() {
+                    Ok(mut dev) => {
+                        eprintln!(
+                            "{log_tag} opened EyeChip (serial={}, attempt {attempt}/{START_ATTEMPTS})",
+                            dev.serial
+                        );
+                        set_status(
+                            &status,
+                            format!("authenticating… attempt {attempt}/{START_ATTEMPTS}"),
+                        );
+                        match handshake(&mut dev, log_tag) {
+                            Ok(()) => {
+                                ready = Some(dev);
+                                break;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "{log_tag} handshake attempt {attempt}/{START_ATTEMPTS} failed: {error}"
+                                );
+                                set_status(
+                                    &status,
+                                    format!("handshake retry {attempt}/{START_ATTEMPTS}: {error}"),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "{log_tag} open attempt {attempt}/{START_ATTEMPTS} failed: {error}"
+                        );
+                        set_status(
+                            &status,
+                            format!("EyeChip open retry {attempt}/{START_ATTEMPTS}: {error}"),
+                        );
+                    }
+                }
+                if attempt < START_ATTEMPTS {
+                    // Dropping the failed WinUSB handle is not immediately observable by
+                    // every EyeChip firmware. Give it 500 ms, while remaining responsive
+                    // to an app stop/reload request.
+                    for _ in 0..RETRY_STEPS {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
             }
+            let Some(mut dev) = ready else {
+                set_status(
+                    &status,
+                    format!("EyeChip connection failed after {START_ATTEMPTS} attempts"),
+                );
+                eprintln!("{log_tag} connection failed after {START_ATTEMPTS} bring-up attempts");
+                return;
+            };
             eprintln!("{log_tag} streaming");
             set_status(&status, "streaming");
 
@@ -400,19 +499,19 @@ impl HmdAdapter for Vr4Adapter {
                                 let combined_sample = g.to_xr5_combined_gaze_sample();
                                 let sample = if log_tag == "[xr5]" && combined_gaze_source {
                                     combined_sample
-                                } else if log_tag == "[xr5]" {
-                                    per_eye_sample
                                 } else {
-                                    g.to_gaze_sample()
+                                    // VR4 and XR5 share stream 1289 and both require
+                                    // per-vector validity; packet status is not a valid bit.
+                                    per_eye_sample
                                 };
-                                if log_tag == "[xr5]" && gaze_diag_seen < 8 {
+                                if gaze_diag_seen < 8 {
                                     eprintln!(
                                         "{log_tag} gaze diag #{gaze_diag_seen}: mode={} status={} L={:?} valid={} R={:?} valid={} C={:?} valid={} convergence_raw={}",
                                         if combined_gaze_source { "combined" } else { "per-eye" },
                                         g.status,
-                                        g.l_gaze,
+                                        per_eye_sample.left.gaze,
                                         per_eye_sample.left.gaze_valid,
-                                        g.r_gaze,
+                                        per_eye_sample.right.gaze,
                                         per_eye_sample.right.gaze_valid,
                                         g.combined,
                                         combined_sample.left.gaze_valid,
@@ -507,5 +606,20 @@ impl HmdAdapter for Vr4Adapter {
     // EyeChip directly.
     fn needs_eyechip_handoff(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vr4_adapter_routes_only_stream_1289_gaze_for_pipeline_mapping() {
+        let adapter = Vr4Adapter::new();
+        assert!(
+            !adapter.uses_wearable_gaze(),
+            "1285 stays auxiliary pupil/openness data"
+        );
+        assert!(!adapter.uses_combined_gaze());
     }
 }

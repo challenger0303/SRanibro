@@ -8,18 +8,36 @@
 //! Input: ML output index 1 (openness raw; relax≈0.66 wide≈0.71 squeeze≈0.55
 //! closed≈0.39) per eye, plus the native gaze sample. Output: two [`EyeResult`].
 
-use super::types::{Eye, EyeResult, GazeSample};
+use super::types::{
+    BlinkTimingProfile, Eye, EyeResult, GazeEyelidProfile, GazeSample, WinkProfile,
+};
 
 // --- tuning constants (identical to the Python reference) ---
 const OPEN_TRUST_FRAMES: u32 = 20;
 const BLINK_RESET_FRAMES: u32 = 5;
 const WARMUP_FRAMES: u32 = 200;
 const KALMAN_ALPHA: f32 = 0.30;
+/// Fallback Wide entry distance used until a relaxed-neutral capture completes.
 const UPPER_OFFSET: f32 = 0.02;
 const SQUEEZE_TOP_OFFSET: f32 = 0.03;
+const DEFAULT_BASELINE: f32 = 0.60;
 const BLINK_OFFSET: f32 = 0.20; // raw < baseline-0.20 -> enter blink
 const BLINK_RELEASE_OFFSET: f32 = 0.10; // raw must rise > baseline-0.10 to exit blink
-const WIDE_RELEASE_OFFSET: f32 = 0.01; // raw must drop > upper-0.01 to exit wide
+/// Maximum Wide hysteresis. For a noise-calibrated entry smaller than the old
+/// fixed threshold, release is scaled down with it so Wide cannot remain latched
+/// below the relaxed-neutral level.
+const WIDE_RELEASE_OFFSET: f32 = 0.01;
+/// Allocation-free relaxed-neutral capture used to derive a per-eye Wide entry
+/// threshold. Recenter contributes 92 real samples (the old baseline is an
+/// 8-sample prior); cold start contributes all 100, so 96 covers either path.
+const WIDE_NEUTRAL_SAMPLE_CAP: usize = 96;
+const WIDE_NEUTRAL_MIN_SAMPLES: usize = 48;
+/// Three robust sigmas keeps ordinary relaxed noise out of Wide. The rails stop a
+/// nearly constant/quantized signal becoming hair-trigger and a poor capture from
+/// making Wide unreachable.
+const WIDE_NEUTRAL_SIGMA_MULT: f32 = 3.0;
+const WIDE_ENTRY_MIN_OFFSET: f32 = 0.006;
+const WIDE_ENTRY_MAX_OFFSET: f32 = 0.030;
 /// Adaptive wide ceiling: minimum openness span above `upper` for wide=1.0 (caps
 /// how touchy wide can be — bigger = less sensitive), and how slowly the learned
 /// ceiling relaxes back toward that floor.
@@ -233,6 +251,17 @@ const DETECT_GRACE_FRAMES: u32 = 24;
 const YOKE_ENGAGE_OPEN: f32 = 0.35;
 /// Release with wide hysteresis and only after the eye also has valid gaze again.
 const YOKE_RELEASE_OPEN: f32 = 0.55;
+const WINK_ARM_FRAMES: u8 = 5;
+const WINK_OWN_ENTER_OPEN: f32 = 0.78;
+const WINK_SQUEEZE_ENTER_OPEN: f32 = 0.90;
+const WINK_PARTNER_OPEN: f32 = 0.86;
+const WINK_RELEASE_OPEN: f32 = 0.92;
+/// Conservative raw ch3/ch4 rise used only to keep an uncalibrated unilateral
+/// squeeze from teaching the bilateral close endpoint.
+const WINK_LEARN_SQUEEZE_DELTA: f32 = 0.10;
+/// Hard fail-safe for the natural-blink bottom guarantee. A corrupt setting or
+/// impossible close slew may never suppress reopening beyond 400 ms.
+const BLINK_PULSE_MAX_FRAMES: u16 = 48;
 
 // --- XR5/native gaze stabilization ---
 /// Calm lower bound for the motion-adaptive gaze EMA. Large motion still raises alpha
@@ -385,12 +414,51 @@ const WIDE_GATE_STEP: f32 = 0.08;
 const COUPLE_RATE: f32 = 0.001; // ~10s convergence at 120Hz when 0.04 apart
 const COUPLE_MIN_OPEN_STREAK: u32 = 30; // both eyes stable open >=0.25s
 const SQUEEZE_DWELL_MIN: u32 = 8; // ~67ms @120Hz before squeeze fires
+/// Native ch3 rises during an ordinary lid close, so exposing its already-charged
+/// value on the first `closed` frame makes EyeSquint look binary. Start a fresh
+/// output envelope only after the eye is actually closed. The short hold also keeps
+/// most natural blinks from leaking into squeeze.
+const NATIVE_SQUEEZE_CLOSED_DELAY: u16 = 8; // ~67ms @120Hz
+const NATIVE_SQUEEZE_ATTACK_ALPHA: f32 = 0.18; // ~100ms to settle after the delay
+const NATIVE_SQUEEZE_RELEASE_ALPHA: f32 = 0.30;
+/// EyeNet's native squeeze channel often peaks while the lid is travelling and
+/// falls again at full closure. Preserve that evidence without exposing it until
+/// the closed-eye dwell has passed. A slow decay lets a held squeeze relax while
+/// the eye remains closed instead of latching for the whole close episode.
+const NATIVE_SQUEEZE_PEAK_RELEASE_ALPHA: f32 = 0.025;
 const SQUEEZE_HARDCLOSE_T: f32 = 0.70; // force openness=0 at this depth into squeeze
 /// Model output ch0 = presence/confidence. The real SRanipal EyePredictionModule
 /// binarizes it at this threshold (`FUN_180012430`) and treats the eye as lost
 /// (forced closed) below it. In normal tracking ch0 stays high (~0.8), so this is
 /// a dropout safety gate, not a blink source. (RE'd 2026-06-26.)
 const CH0_PRESENT_GATE: f32 = 0.05;
+
+// --- user eyelid-response trim + conservative session-only reseat recovery ---
+const CLOSE_DEPTH_SCALE_MIN: f32 = 0.85;
+const CLOSE_DEPTH_SCALE_MAX: f32 = 1.15;
+const CURVE_MID_OUTPUT_MIN: f32 = 0.35;
+const CURVE_MID_OUTPUT_MAX: f32 = 0.65;
+const SNAP_GATE_OPEN_MIN: f32 = 0.15;
+const SNAP_GATE_OPEN_MAX: f32 = 1.0;
+const DEFAULT_SNAP_GATE_OPEN: f32 = 1.0;
+const AUTO_RESEAT_NATIVE_OPEN_MIN: f32 = 0.95;
+const BLINK_CLOSE_MS_MAX: f32 = 160.0;
+/// A new wearing-position candidate must remain bilateral and coherent for four
+/// seconds at the 120 Hz emit cadence before it can move the transient offset.
+const AUTO_RESEAT_STABLE_FRAMES: u16 = 480;
+const AUTO_RESEAT_CANDIDATE_BAND: f32 = 0.015;
+const AUTO_RESEAT_PAIR_COHERENCE: f32 = 0.20;
+const AUTO_RESEAT_SQUEEZE_MAX: f32 = 0.05;
+const AUTO_RESEAT_CENTER_DEG: f32 = 12.0;
+const AUTO_RESEAT_OFFSET_CAP: f32 = 0.12;
+const AUTO_RESEAT_DEPTH_CAP_FRAC: f32 = 0.60;
+const AUTO_RESEAT_OFFSET_STEP: f32 = 0.0015;
+/// A recalled appearance profile is explicit user-authored evidence, so unlike
+/// passive auto-reseat it may translate the complete open/closed coordinate
+/// system. Slew it over roughly one second to avoid a visible output step.
+const APPEARANCE_BASELINE_STEP: f32 = 0.0010;
+const APPEARANCE_WIDE_STEP: f32 = 0.0015;
+const APPEARANCE_OFFSET_CAP: f32 = 0.20;
 
 // --- adaptive openness Kalman (RE'd FUN_180010ee0 feeding FUN_180010da0; opt-in) ---
 const KAL_MOTION_DEADZONE: f32 = 0.05; // |Δ| >= this -> fast regime
@@ -417,6 +485,22 @@ fn apply_anchor(x: f32, a: f32) -> f32 {
         0.5 * x / a.max(1e-3)
     } else {
         0.5 + 0.5 * (x - a) / (1.0 - a).max(1e-3)
+    }
+}
+
+/// User-facing response trim through (0, 0), (0.5, midpoint), (1, 1).
+///
+/// Keep the exact identity path explicit: an untouched per-HMD profile must not
+/// introduce even a one-bit change to the established eyelid response.
+fn apply_response_curve(x: f32, midpoint: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let midpoint = midpoint.clamp(CURVE_MID_OUTPUT_MIN, CURVE_MID_OUTPUT_MAX);
+    if midpoint.to_bits() == 0.5f32.to_bits() {
+        x
+    } else if x <= 0.5 {
+        x * (2.0 * midpoint)
+    } else {
+        midpoint + (x - 0.5) * (2.0 * (1.0 - midpoint))
     }
 }
 
@@ -533,6 +617,9 @@ pub struct Tuning {
     /// open) = today's independent behavior. Toggled by the chain glyph drawn between
     /// the wide and squeeze rows in the ML PARAMETERS card.
     pub wide_squeeze_exclusive: bool,
+    /// Emit the average of the independently post-processed left/right eyebrow
+    /// values to both eyes. Off preserves asymmetric eyebrow expressions.
+    pub brow_lr_sync: bool,
     /// Eye-open dead-zone: openness reads FULLY open (1.0) once raw is within this much
     /// BELOW the learned relaxed baseline (default 0.08; the old behavior was effectively
     /// 0.03). The baseline is the MEAN of the relaxed raw, so with too tight a margin about
@@ -585,6 +672,7 @@ impl Default for Tuning {
             wide_requires_both: true,
             gaze_yoke: true,
             wide_squeeze_exclusive: false,
+            brow_lr_sync: false,
             open_deadzone: 0.08,
             blink_reopen_ms: 0.0,
             blink_close_ms: 0.0,
@@ -597,7 +685,19 @@ impl Default for Tuning {
 struct EyeState {
     baseline: f32,
     baseline_n: u32,
+    /// Explicit Recenter is a user-confirmed request to acquire the current relaxed
+    /// level even when it moved farther than the ordinary bootstrap outlier window.
+    /// Runtime-only: restore/cold-start keep the guarded automatic path.
+    recenter_active: bool,
     upper: f32,
+    /// Per-eye distance above relaxed neutral at which SRanipal-derived Wide
+    /// begins. Learned from robust neutral noise during bootstrap/recenter.
+    wide_entry_offset: f32,
+    /// Runtime-only samples for the current Wide-neutral capture. This is kept
+    /// out of persisted calibration intentionally: every launch re-verifies the
+    /// current wearing/illumination condition before using the adaptive threshold.
+    wide_neutral_samples: [f32; WIDE_NEUTRAL_SAMPLE_CAP],
+    wide_neutral_n: u8,
     /// Adaptive wide ceiling: absolute openness at which wide reaches 1.0.
     wide_ceiling: f32,
     /// Adaptive relaxed-s3 floor for native squeeze.
@@ -622,6 +722,11 @@ struct EyeState {
     reach_env: f32,
     /// Whether a confirmed close pair has established `blink_depth`. Persisted.
     learned_once: bool,
+    /// An explicit guided endpoint fit owns `blink_depth`. While locked, normal
+    /// blink episodes may still train the mid-curve but cannot move either endpoint.
+    endpoint_locked: bool,
+    /// Unix timestamp of the explicit fit, for UI provenance only.
+    endpoint_calibrated_unix: u64,
     /// Minimum bottom of the current uncommitted close candidate set. Cold-start
     /// squints and partial closes are indistinguishable in one episode, so the
     /// floor always requires repeat evidence before moving.
@@ -649,6 +754,14 @@ struct EyeState {
     open_streak: u32,
     closed_streak: u32,
     squeeze_streak: u32,
+    /// Runtime-only native-squeeze response. The model channel is evaluated all the
+    /// time for wink/closure classification, but its avatar output starts from zero
+    /// only after a real closed-eye hold, then follows the channel smoothly.
+    native_squeeze_closed_frames: u16,
+    /// Peak follower for native squeeze observed during the closing stroke. This
+    /// is evidence only; it never reaches the avatar before the closed-eye dwell.
+    native_squeeze_peak: f32,
+    native_squeeze_envelope: f32,
     is_closed: bool, // sticky blink (hysteresis)
     is_wide: bool,   // sticky wide (hysteresis)
     /// Stuck-wide breaker bookkeeping (runtime-only, not persisted): accumulated
@@ -699,6 +812,19 @@ struct EyeState {
     /// own gaze is treated as unreliable — its gaze EMA is frozen and the yoke
     /// mirrors the partner whenever the partner is open and tracking.
     yoke_hold: bool,
+    /// Runtime-only held-wink debounce. The calibrated depth itself is supplied
+    /// by the per-HMD WinkProfile.
+    wink_arm: u8,
+    wink_active: bool,
+    /// Confirmed bilateral natural blink: suppress reopening until this eye has
+    /// actually reached zero and held it for the configured visible-bottom time.
+    blink_pulse_active: bool,
+    blink_pulse_bottom_frames: u8,
+    blink_pulse_age: u16,
+    blink_pulse_consumed: bool,
+    /// A special close detector crossed the user-selected zero gate. Runtime-only.
+    response_snap_committed: bool,
+
     kalman_x: f32,
     smooth_open: f32,
     /// Adaptive openness Kalman (used only when `Tuning.adaptive_kalman`).
@@ -707,12 +833,61 @@ struct EyeState {
     pupil_smooth: f32,
 }
 
+/// Robustly convert one relaxed-neutral capture into a Wide entry distance.
+///
+/// MAD ignores isolated blink/saccade samples. The central 80% span is a second
+/// quantization-safe estimate for signals whose median absolute deviation rounds
+/// to zero. Neither calculation allocates on the tracking thread.
+fn wide_entry_offset_from_neutral(samples: &[f32; WIDE_NEUTRAL_SAMPLE_CAP], n: usize) -> f32 {
+    let n = n.min(WIDE_NEUTRAL_SAMPLE_CAP);
+    if n < WIDE_NEUTRAL_MIN_SAMPLES {
+        return UPPER_OFFSET;
+    }
+
+    let mut ordered = *samples;
+    ordered[..n].sort_by(f32::total_cmp);
+    let median = if n % 2 == 0 {
+        (ordered[n / 2 - 1] + ordered[n / 2]) * 0.5
+    } else {
+        ordered[n / 2]
+    };
+    let p10 = ordered[(n - 1) * 10 / 100];
+    let p90 = ordered[(n - 1) * 90 / 100];
+
+    let mut deviations = [0.0; WIDE_NEUTRAL_SAMPLE_CAP];
+    for (dst, value) in deviations[..n].iter_mut().zip(ordered[..n].iter()) {
+        *dst = (*value - median).abs();
+    }
+    deviations[..n].sort_by(f32::total_cmp);
+    let mad = if n % 2 == 0 {
+        (deviations[n / 2 - 1] + deviations[n / 2]) * 0.5
+    } else {
+        deviations[n / 2]
+    };
+
+    // 1.4826*MAD and (p90-p10)/2.563 are normal-distribution sigma estimates.
+    let sigma = (1.4826 * mad).max((p90 - p10).max(0.0) / 2.563);
+    (WIDE_NEUTRAL_SIGMA_MULT * sigma).clamp(WIDE_ENTRY_MIN_OFFSET, WIDE_ENTRY_MAX_OFFSET)
+}
+
+fn record_wide_neutral_sample(s: &mut EyeState, raw: f32) {
+    let n = usize::from(s.wide_neutral_n).min(WIDE_NEUTRAL_SAMPLE_CAP);
+    if n < WIDE_NEUTRAL_SAMPLE_CAP {
+        s.wide_neutral_samples[n] = raw;
+        s.wide_neutral_n = (n + 1) as u8;
+    }
+}
+
 impl Default for EyeState {
     fn default() -> Self {
         Self {
             baseline: 0.60,
             baseline_n: 0,
+            recenter_active: false,
             upper: 0.62,
+            wide_entry_offset: UPPER_OFFSET,
+            wide_neutral_samples: [0.0; WIDE_NEUTRAL_SAMPLE_CAP],
+            wide_neutral_n: 0,
             wide_ceiling: 0.0, // lazy: set to upper+min_span on first use
             squeeze_floor: NATIVE_SQ_FLOOR,
             closed_ref: 0.40, // = default baseline 0.60 - blink_depth; derived while coupled
@@ -723,6 +898,8 @@ impl Default for EyeState {
             blink_dirty: false,
             reach_env: 0.60, // = default baseline; re-seeded on restore/recenter
             learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
             blink_candidate: None,
             blink_candidate_count: 0,
             blink_candidate_max: 0.0,
@@ -739,6 +916,9 @@ impl Default for EyeState {
             open_streak: 0,
             closed_streak: 0,
             squeeze_streak: 0,
+            native_squeeze_closed_frames: 0,
+            native_squeeze_peak: 0.0,
+            native_squeeze_envelope: 0.0,
             is_closed: false,
             is_wide: false,
             wide_frames: 0,
@@ -759,6 +939,13 @@ impl Default for EyeState {
             detect_grace: DETECT_GRACE_FRAMES,
             reopening: false,
             yoke_hold: false,
+            wink_arm: 0,
+            wink_active: false,
+            blink_pulse_active: false,
+            blink_pulse_bottom_frames: 0,
+            blink_pulse_age: 0,
+            blink_pulse_consumed: false,
+            response_snap_committed: false,
             kalman_x: 0.0,
             smooth_open: 1.0,
             kalman: ScalarKalman::default(),
@@ -787,6 +974,31 @@ pub struct CalibSnapshot {
     /// calib files written before this field existed.
     #[serde(default)]
     pub learned_once: bool,
+    /// Explicit per-eye endpoint fit is active. Old files default to adaptive mode.
+    #[serde(default)]
+    pub endpoint_locked: bool,
+    /// Unix timestamp of the explicit endpoint fit (0 = never).
+    #[serde(default)]
+    pub endpoint_calibrated_unix: u64,
+}
+
+impl CalibSnapshot {
+    /// Remove a guided open/closed result and restart adaptive endpoint learning.
+    ///
+    /// The mid-close curve belongs to a separate learner, so it is preserved.
+    /// The fitted endpoint numbers themselves are deliberately not retained as a
+    /// hidden seed: a user removing a bad fit must get a real reset.
+    pub fn without_explicit_endpoint(self) -> Self {
+        Self {
+            baseline: DEFAULT_BASELINE,
+            baseline_n: 0,
+            blink_depth: BLINK_OFFSET,
+            learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
+            ..self
+        }
+    }
 }
 
 fn default_blink_depth() -> f32 {
@@ -811,11 +1023,90 @@ pub fn load_calib(path: &str) -> Option<CalibStore> {
     toml::from_str(&text).ok()
 }
 
-/// Save calibration to a TOML file (best-effort; errors ignored).
-pub fn save_calib(path: &str, store: &CalibStore) {
-    if let Ok(text) = toml::to_string(store) {
-        let _ = std::fs::write(path, text);
+static CALIB_SAVE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// Atomically persist both eyes' calibration and report any failure to callers
+/// that must not claim a staged calibration was committed.
+pub fn save_calib_checked(path: &str, store: &CalibStore) -> std::io::Result<()> {
+    let lock = CALIB_SAVE_LOCK.get_or_init(|| std::sync::Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let text = toml::to_string(store).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let suffix = format!("{}-{nonce}", std::process::id());
+
+    let temp = path.with_extension(format!("tmp-{suffix}"));
+    std::fs::write(&temp, text)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+/// Why the live eyelid output is following or overriding the ordinary model ramp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClosureReason {
+    #[default]
+    Normal,
+    /// A fast/native close was detected but has not crossed the configured zero gate.
+    BlinkPending,
+    FastBlink,
+    NativeDisable,
+    Wink,
+    TrackingLost,
+}
+
+/// Small, copyable live diagnostic frame used by the endpoint-adjustment window.
+#[derive(Clone, Copy, Debug)]
+pub struct EyelidLiveDiag {
+    pub raw_openness: f32,
+    /// Endpoint- and curve-adjusted response before blink/wink/dropout overrides.
+    pub model_response: f32,
+    pub final_openness: f32,
+    /// Persisted/calibrated baseline; never includes the session-only reseat offset.
+    pub calibrated_baseline: f32,
+    /// Complete live coordinate, including appearance recovery.
+    pub effective_baseline: f32,
+    pub session_baseline_offset: f32,
+    pub effective_open_ref: f32,
+    pub effective_closed_ref: f32,
+    /// Raw openness where the SRanipal-derived Wide region begins.
+    pub wide_entry_ref: f32,
+    /// Adaptive raw-openness ceiling that currently represents full Wide.
+    pub wide_full_ref: f32,
+    pub reason: ClosureReason,
+}
+
+impl Default for EyelidLiveDiag {
+    fn default() -> Self {
+        Self {
+            raw_openness: 0.0,
+            model_response: 1.0,
+            final_openness: 1.0,
+            calibrated_baseline: DEFAULT_BASELINE,
+            effective_baseline: DEFAULT_BASELINE,
+            session_baseline_offset: 0.0,
+            effective_open_ref: DEFAULT_BASELINE - SQUEEZE_TOP_OFFSET,
+            effective_closed_ref: DEFAULT_BASELINE - BLINK_OFFSET,
+            wide_entry_ref: DEFAULT_BASELINE + UPPER_OFFSET,
+            wide_full_ref: DEFAULT_BASELINE + UPPER_OFFSET + WIDE_CEIL_MIN_SPAN,
+            reason: ClosureReason::Normal,
+        }
+    }
+}
+
+/// Save calibration best-effort for periodic runtime checkpoints.
+pub fn save_calib(path: &str, store: &CalibStore) {
+    let _ = save_calib_checked(path, store);
 }
 
 /// Per-frame post-processor internals exposed to the diagnostic CSV recorder.
@@ -857,8 +1148,33 @@ pub struct SRanipalState {
     /// Bilateral-wide engage envelope [0,1] (shared across eyes): smooths the
     /// both-eyes gate so wide ramps in/out instead of snapping (see WIDE_GATE_STEP).
     wide_gate: f32,
+    /// Per-HMD response trim. Identity values reproduce the legacy response.
+    response_manual_range: bool,
+    response_open_point_offset: [f32; 2],
+    response_closed_point_depth: [f32; 2],
+    response_close_depth_scale: [f32; 2],
+    response_curve_mid_output: [f32; 2],
+    response_blink_close_ms: f32,
+    response_snap_gate_open: f32,
+    response_auto_reseat: bool,
+    response_profile_installed: bool,
+    /// Session-only wearing-position correction. It is never copied to CalibSnapshot.
+    session_baseline_offset: [f32; 2],
+    /// Explicitly remembered wearing/lighting profile. This translation applies to
+    /// both open and closed coordinates; it is runtime-only and never contaminates
+    /// the continuously learned/persisted baseline.
+    appearance_profile_active: bool,
+    appearance_baseline_offset: [f32; 2],
+    appearance_wide_entry_shift: [f32; 2],
+    reseat_candidate: [f32; 2],
+    reseat_prev_raw: [f32; 2],
+    reseat_stable_frames: u16,
+    eyelid_live: [EyelidLiveDiag; 2],
     /// L/R curve-equalizer training pairs in flight (see PairPending).
     pend: PairPending,
+    /// Smoothed raw-domain lift from the gaze-dependent eyelid correction.
+    /// Runtime-only: a persisted profile is supplied by the pipeline each frame.
+    gaze_eyelid_lift: [f32; 2],
 }
 
 impl Default for SRanipalState {
@@ -873,12 +1189,381 @@ impl SRanipalState {
             eyes: [EyeState::default(); 2],
             tuning: Tuning::default(),
             wide_gate: 0.0,
+            response_manual_range: false,
+            response_open_point_offset: [0.03; 2],
+            response_closed_point_depth: [0.40; 2],
+            response_close_depth_scale: [1.0; 2],
+            response_curve_mid_output: [0.5; 2],
+            response_blink_close_ms: 0.0,
+            response_snap_gate_open: DEFAULT_SNAP_GATE_OPEN,
+            response_profile_installed: false,
+            response_auto_reseat: false,
+            session_baseline_offset: [0.0; 2],
+            appearance_profile_active: false,
+            appearance_baseline_offset: [0.0; 2],
+            appearance_wide_entry_shift: [0.0; 2],
+            reseat_candidate: [0.0; 2],
+            reseat_prev_raw: [DEFAULT_BASELINE; 2],
+            reseat_stable_frames: 0,
+            eyelid_live: [EyelidLiveDiag::default(); 2],
             pend: PairPending::default(),
+            gaze_eyelid_lift: [0.0; 2],
         }
     }
 
     pub fn baseline(&self, e: Eye) -> f32 {
         self.eyes[e.idx()].baseline
+    }
+
+    /// Install the live per-HMD eyelid-response profile. The pipeline calls this
+    /// every frame so modal preview changes take effect without restarting it.
+    pub fn set_eyelid_response_tuning(
+        &mut self,
+        manual_range: bool,
+        open_point_offset: [f32; 2],
+        closed_point_depth: [f32; 2],
+        close_depth_scale: [f32; 2],
+        curve_mid_output: [f32; 2],
+        blink_close_ms: f32,
+        snap_gate_open: f32,
+        auto_reseat: bool,
+    ) {
+        self.response_manual_range = manual_range;
+        for i in 0..2 {
+            self.response_open_point_offset[i] = if open_point_offset[i].is_finite() {
+                open_point_offset[i].clamp(0.03, 0.20)
+            } else {
+                0.03
+            };
+            self.response_closed_point_depth[i] = if closed_point_depth[i].is_finite() {
+                closed_point_depth[i]
+                    .clamp(0.08, 0.46)
+                    .max(self.response_open_point_offset[i] + MIN_CLOSE_SPAN)
+            } else {
+                0.40
+            };
+            self.response_close_depth_scale[i] = if close_depth_scale[i].is_finite() {
+                close_depth_scale[i].clamp(CLOSE_DEPTH_SCALE_MIN, CLOSE_DEPTH_SCALE_MAX)
+            } else {
+                1.0
+            };
+            self.response_curve_mid_output[i] = if curve_mid_output[i].is_finite() {
+                curve_mid_output[i].clamp(CURVE_MID_OUTPUT_MIN, CURVE_MID_OUTPUT_MAX)
+            } else {
+                0.5
+            };
+        }
+        self.response_blink_close_ms = if blink_close_ms.is_finite() {
+            blink_close_ms.clamp(0.0, BLINK_CLOSE_MS_MAX)
+        } else {
+            0.0
+        };
+        self.response_snap_gate_open = if snap_gate_open.is_finite() {
+            snap_gate_open.clamp(SNAP_GATE_OPEN_MIN, SNAP_GATE_OPEN_MAX)
+        } else {
+            DEFAULT_SNAP_GATE_OPEN
+        };
+        self.response_profile_installed = true;
+        self.response_auto_reseat = auto_reseat;
+        if !auto_reseat {
+            self.reset_session_reseat();
+        }
+    }
+
+    pub fn eyelid_live_diag(&self) -> [EyelidLiveDiag; 2] {
+        self.eyelid_live
+    }
+
+    /// Slew toward (or away from) one explicitly saved appearance-conditioned
+    /// calibration. `baseline` and `wide_entry_ref` are absolute raw-model
+    /// coordinates captured when the user confirmed that wearing position.
+    ///
+    /// This never mutates [`CalibSnapshot`]. Unknown/ambiguous appearance simply
+    /// passes `None`, which fades the transient correction back to zero.
+    pub fn update_appearance_profile(
+        &mut self,
+        baseline: Option<[f32; 2]>,
+        wide_entry_ref: Option<[f32; 2]>,
+    ) {
+        self.appearance_profile_active = baseline.is_some();
+        if self.appearance_profile_active {
+            // An explicit image match supersedes the weaker raw-value-only
+            // auto-reseat observer. Do not stack two independent corrections.
+            self.reset_session_reseat();
+        }
+        for i in 0..2 {
+            let desired_baseline = baseline
+                .map(|target| {
+                    (target[i] - self.eyes[i].baseline)
+                        .clamp(-APPEARANCE_OFFSET_CAP, APPEARANCE_OFFSET_CAP)
+                })
+                .unwrap_or(0.0);
+            self.appearance_baseline_offset[i] += (desired_baseline
+                - self.appearance_baseline_offset[i])
+                .clamp(-APPEARANCE_BASELINE_STEP, APPEARANCE_BASELINE_STEP);
+            if self.appearance_baseline_offset[i].abs() < 1e-6 {
+                self.appearance_baseline_offset[i] = 0.0;
+            }
+
+            let natural_wide = self.eyes[i].baseline
+                + self.appearance_baseline_offset[i]
+                + self.eyes[i].wide_entry_offset;
+            let desired_wide = wide_entry_ref
+                .map(|target| {
+                    (target[i] - natural_wide).clamp(-APPEARANCE_OFFSET_CAP, APPEARANCE_OFFSET_CAP)
+                })
+                .unwrap_or(0.0);
+            self.appearance_wide_entry_shift[i] += (desired_wide
+                - self.appearance_wide_entry_shift[i])
+                .clamp(-APPEARANCE_WIDE_STEP, APPEARANCE_WIDE_STEP);
+            if self.appearance_wide_entry_shift[i].abs() < 1e-6 {
+                self.appearance_wide_entry_shift[i] = 0.0;
+            }
+        }
+    }
+
+    pub fn clear_appearance_profile(&mut self) {
+        self.appearance_profile_active = false;
+        self.appearance_baseline_offset = [0.0; 2];
+        self.appearance_wide_entry_shift = [0.0; 2];
+    }
+
+    /// A direct endpoint edit adopts the visible coordinate as its manual base.
+    /// This avoids converting an appearance shift into an out-of-range offset.
+    pub fn adopt_appearance_baseline(&mut self, baseline: [f32; 2]) {
+        for i in 0..2 {
+            if baseline[i].is_finite() {
+                let delta = baseline[i] - self.eyes[i].baseline;
+                self.eyes[i].baseline = baseline[i];
+                self.eyes[i].closed_ref += delta;
+                self.eyes[i].wide_entry_offset += self.appearance_wide_entry_shift[i];
+            }
+        }
+        self.clear_appearance_profile();
+        self.reset_session_reseat();
+    }
+
+    pub fn adopt_current_appearance(&mut self) {
+        self.adopt_appearance_baseline([self.effective_baseline(0), self.effective_baseline(1)]);
+    }
+
+    fn effective_baseline(&self, i: usize) -> f32 {
+        self.eyes[i].baseline + self.appearance_baseline_offset[i] + self.session_baseline_offset[i]
+    }
+
+    fn effective_open_ref(&self, i: usize) -> f32 {
+        let offset = if self.response_profile_installed && self.response_manual_range {
+            self.response_open_point_offset[i]
+        } else {
+            self.tuning.open_deadzone.clamp(SQUEEZE_TOP_OFFSET, 0.20)
+        };
+        self.effective_baseline(i) - offset
+    }
+
+    fn effective_closed_ref(&self, i: usize) -> f32 {
+        // Automatic wearing-position recovery observes only a stable relaxed-open
+        // pose.  It therefore has evidence to move the 100% OPEN coordinate, but
+        // none that the physical full-close floor moved by the same amount.  Keep
+        // every close endpoint in the calibrated raw coordinate; otherwise a
+        // negative session offset progressively lowers the 0% point and makes a
+        // genuine full close stop reaching zero until Recenter clears the offset.
+        let baseline = self.eyes[i].baseline + self.appearance_baseline_offset[i];
+        if self.response_profile_installed && self.response_manual_range {
+            return baseline - self.response_closed_point_depth[i];
+        }
+        let learned_depth = if self.tuning.continuous_calib {
+            (self.eyes[i].baseline - self.eyes[i].closed_ref).clamp(0.05, 0.40)
+        } else {
+            BLINK_OFFSET
+        };
+        let depth = learned_depth * self.response_close_depth_scale[i];
+        baseline - depth.clamp(0.05, 0.46)
+    }
+
+    /// Ordinary endpoint/curve response without blink, wink or dropout overrides.
+    fn model_response_for_raw(&self, i: usize, raw: f32, native_absolute: bool) -> f32 {
+        if !raw.is_finite() {
+            return 0.0;
+        }
+        let open_full = self.effective_open_ref(i);
+        let closed_ref = self.effective_closed_ref(i).min(open_full - 1e-3);
+        let denom = (open_full - closed_ref).max(MIN_CLOSE_SPAN);
+        let pre = ((raw - closed_ref) / denom).clamp(0.0, 1.0);
+        let calibrated = if native_absolute {
+            pre
+        } else {
+            apply_anchor(pre, self.eyes[i].mid_anchor)
+        };
+        apply_response_curve(calibrated, self.response_curve_mid_output[i])
+    }
+
+    /// Resolve every special close detector through one user-adjustable zero gate.
+    /// Ordinary endpoint response (including a slow close to zero) is untouched.
+    fn resolve_snap_gate(&mut self, samples: &mut [PerEye; 2]) {
+        for (i, sample) in samples.iter_mut().enumerate() {
+            if !sample.present {
+                sample.openness_target = 0.0;
+                sample.closed = true;
+                sample.reason = ClosureReason::TrackingLost;
+                self.eyes[i].response_snap_committed = false;
+                continue;
+            }
+
+            if self.eyes[i].blink_pulse_active {
+                sample.openness_target = 0.0;
+                sample.closed = true;
+                sample.reason = ClosureReason::FastBlink;
+                self.eyes[i].response_snap_committed = true;
+                continue;
+            }
+
+            if sample.snap_requested {
+                if self.eyes[i].response_snap_committed
+                    || sample.model_response <= self.response_snap_gate_open
+                {
+                    self.eyes[i].response_snap_committed = true;
+                    sample.openness_target = 0.0;
+                    sample.closed = true;
+                    if sample.reason != ClosureReason::Wink {
+                        sample.reason = sample.snap_reason;
+                    }
+                } else {
+                    self.eyes[i].response_snap_committed = false;
+                    sample.openness_target = sample.model_response;
+                    sample.closed = sample.model_response < 0.08;
+                    if sample.reason != ClosureReason::Wink {
+                        sample.reason = ClosureReason::BlinkPending;
+                    }
+                }
+            } else {
+                self.eyes[i].response_snap_committed = false;
+                if sample.reason != ClosureReason::Wink {
+                    sample.reason = ClosureReason::Normal;
+                }
+            }
+        }
+    }
+
+    fn reset_session_reseat(&mut self) {
+        self.session_baseline_offset = [0.0; 2];
+        self.reseat_candidate = [0.0; 2];
+        self.reseat_prev_raw = [self.eyes[0].baseline, self.eyes[1].baseline];
+        self.reseat_stable_frames = 0;
+    }
+
+    fn gaze_is_near_center(gaze: [f32; 3], valid: bool) -> bool {
+        if !valid || !gaze.iter().all(|value| value.is_finite()) {
+            return false;
+        }
+        let transverse = (gaze[0] * gaze[0] + gaze[1] * gaze[1]).sqrt();
+        let forward = gaze[2].abs();
+        forward > 1e-4 && transverse.atan2(forward).to_degrees() <= AUTO_RESEAT_CENTER_DEG
+    }
+
+    /// Follow a stable bilateral wearing-position shift without mutating the
+    /// calibrated endpoint. Native Tobii open-state and centered gaze are used
+    /// only as conservative eligibility evidence; all learned values stay intact.
+    fn update_auto_reseat(&mut self, raw: [f32; 2], ml: &[[f32; 5]; 2], gaze: &GazeSample) {
+        if self.appearance_profile_active {
+            self.reset_session_reseat();
+            return;
+        }
+        if !self.response_auto_reseat {
+            self.reset_session_reseat();
+            return;
+        }
+
+        let mut eligible = true;
+        for e in Eye::ALL {
+            let i = e.idx();
+            let native = gaze.eye(e);
+            let state = &self.eyes[i];
+            let squeeze_rise = (ml[i][3] - state.squeeze_floor).max(0.0);
+            // Manual open/closed points are already a complete fixed range. They
+            // must not require a separate recorded endpoint lock before session-only
+            // wearing-position recovery can operate.
+            let fixed_range_ready = (self.response_profile_installed && self.response_manual_range)
+                || (state.learned_once && state.endpoint_locked);
+            eligible &= state.baseline_n >= BASELINE_BOOTSTRAP_N
+                && fixed_range_ready
+                && ml[i][0] > CH0_PRESENT_GATE
+                && raw[i].is_finite()
+                && raw[i] > BASELINE_RANGE_LO - 0.12
+                && raw[i] < BASELINE_RANGE_HI + 0.12
+                && native.openness_reported
+                && native.openness_valid
+                && native.openness.is_finite()
+                && native.openness >= AUTO_RESEAT_NATIVE_OPEN_MIN
+                && Self::gaze_is_near_center(native.gaze, native.gaze_valid)
+                && squeeze_rise <= AUTO_RESEAT_SQUEEZE_MAX
+                && !state.wink_active
+                && !state.blink_pulse_active;
+        }
+
+        let deltas = [
+            raw[0] - self.eyes[0].baseline,
+            raw[1] - self.eyes[1].baseline,
+        ];
+        let depth = [
+            self.eyes[0].blink_depth.max(0.05),
+            self.eyes[1].blink_depth.max(0.05),
+        ];
+        let coherent =
+            ((deltas[0] / depth[0]) - (deltas[1] / depth[1])).abs() <= AUTO_RESEAT_PAIR_COHERENCE;
+        let both_near_calibrated = deltas
+            .iter()
+            .all(|delta| delta.abs() <= AUTO_RESEAT_CANDIDATE_BAND);
+        let both_shifted_same_direction = deltas
+            .iter()
+            .all(|delta| delta.abs() > AUTO_RESEAT_CANDIDATE_BAND)
+            && deltas[0].signum() == deltas[1].signum();
+        let same_direction = both_near_calibrated || both_shifted_same_direction;
+        let low_motion = (raw[0] - self.reseat_prev_raw[0]).abs() <= AUTO_RESEAT_CANDIDATE_BAND
+            && (raw[1] - self.reseat_prev_raw[1]).abs() <= AUTO_RESEAT_CANDIDATE_BAND;
+        self.reseat_prev_raw = raw;
+
+        if !eligible || !coherent || !same_direction || !low_motion {
+            self.reseat_candidate = deltas;
+            self.reseat_stable_frames = 0;
+            return;
+        }
+
+        let candidate_matches = self.reseat_stable_frames == 0
+            || (0..2).all(|i| {
+                (deltas[i] - self.reseat_candidate[i]).abs() <= AUTO_RESEAT_CANDIDATE_BAND
+            });
+        if !candidate_matches {
+            self.reseat_candidate = deltas;
+            self.reseat_stable_frames = 1;
+            return;
+        }
+
+        if self.reseat_stable_frames == 0 {
+            self.reseat_candidate = deltas;
+        } else {
+            for i in 0..2 {
+                self.reseat_candidate[i] += 0.05 * (deltas[i] - self.reseat_candidate[i]);
+            }
+        }
+        self.reseat_stable_frames = self.reseat_stable_frames.saturating_add(1);
+        if self.reseat_stable_frames < AUTO_RESEAT_STABLE_FRAMES {
+            return;
+        }
+
+        for i in 0..2 {
+            let cap = AUTO_RESEAT_OFFSET_CAP
+                .min(AUTO_RESEAT_DEPTH_CAP_FRAC * self.eyes[i].blink_depth.max(0.05));
+            let mut target = self.reseat_candidate[i].clamp(-cap, cap);
+            if target.abs() <= AUTO_RESEAT_CANDIDATE_BAND {
+                target = 0.0;
+            }
+            let delta = (target - self.session_baseline_offset[i])
+                .clamp(-AUTO_RESEAT_OFFSET_STEP, AUTO_RESEAT_OFFSET_STEP);
+            self.session_baseline_offset[i] += delta;
+            if self.session_baseline_offset[i].abs() < 1e-5 {
+                self.session_baseline_offset[i] = 0.0;
+            }
+        }
     }
 
     /// Snapshot for persistence (one per eye).
@@ -891,6 +1576,8 @@ impl SRanipalState {
             blink_depth: s.blink_depth,
             mid_anchor: s.mid_anchor,
             learned_once: s.learned_once,
+            endpoint_locked: s.endpoint_locked,
+            endpoint_calibrated_unix: s.endpoint_calibrated_unix,
         }
     }
 
@@ -898,62 +1585,108 @@ impl SRanipalState {
     /// baseline is kept as a small prior (RECENTER_PRIOR_N samples) so one noisy /
     /// mid-expression frame can't become the baseline verbatim; the bootstrap mean
     /// still re-anchors within ~1s. Keeps frame_count so the eyes stay trusted.
+    fn arm_eye_recenter(s: &mut EyeState) {
+        s.baseline_n = RECENTER_PRIOR_N;
+        s.recenter_active = true;
+        s.wide_neutral_n = 0;
+        // Recenter pressed while a wide is LATCHED is the user asserting this
+        // wide is spurious (a stuck episode looks like rest to the user):
+        // pre-arm the breaker so the fast re-anchor starts immediately (~3-5s)
+        // instead of waiting out the full 15s detection — the press IS the
+        // detection. A healthy recenter (no latch) clears the counter; a
+        // pre-armed one drains harmlessly within ~0.4s of relaxed frames if
+        // the wide was somehow genuine (review 2026-07-07).
+        s.wide_frames = if s.is_wide { WIDE_STUCK_FRAMES } else { 0 };
+        s.fall_run = 0.0;
+        s.fall_updates = 0;
+        s.is_closed = false;
+        s.is_wide = false;
+        s.fast_blink_frames = 0;
+        s.fast_blink_arm = 0;
+        s.arm_updates = 0;
+        s.wink_arm = 0;
+        s.wink_active = false;
+        s.native_squeeze_closed_frames = 0;
+        s.native_squeeze_peak = 0.0;
+        s.native_squeeze_envelope = 0.0;
+        s.blink_pulse_active = false;
+        s.blink_pulse_bottom_frames = 0;
+        s.blink_pulse_age = 0;
+        s.blink_pulse_consumed = false;
+        s.response_snap_committed = false;
+        // Keep the LIVE raw history (prev_raw/rawu*) and grant NO detector
+        // grace: unlike new()/restore(), a mid-session recenter has genuine
+        // per-frame history, so there is no phantom step to guard against --
+        // and a graced detector would turn a natural blink in the 200ms
+        // after the button press into a half-blink (review 2026-07-09).
+        s.kalman_x = 0.0;
+        s.kalman.reset();
+        s.wide_ceiling = 0.0;
+        s.squeeze_floor = NATIVE_SQ_FLOOR;
+        // Blink depth and the mid-close curve anchor are physiological /
+        // per-camera properties: KEEP them across recenter (only learning in
+        // flight is abandoned) and re-derive the closed bound.
+        s.blink_len = 0;
+        s.mid_anchor_staged = None;
+        s.ep_clean_exit = None;
+        s.last_ramp_pre = -1.0;
+        // reach_env is transient and baseline-relative: re-seed it at the current
+        // baseline so the entry gate starts from the normal ~0.20 and re-learns this
+        // eye's floor live (learned_once + blink_depth are kept — physiological).
+        s.reach_env = s.baseline;
+        s.blink_candidate = None;
+        s.blink_candidate_count = 0;
+        s.blink_candidate_max = 0.0;
+        s.blink_candidate_frame = 0;
+        // Recenter only changes the open coordinate. Keep the endpoint travel
+        // budget so repeated Recenters cannot launder a bad floor adjustment
+        // into blink_depth and grant another full budget.
+        s.floor_last_commit_frame = s.frame_count;
+        s.closed_ref = (s.baseline - s.blink_depth).clamp(s.baseline - 0.40, s.baseline - 0.05);
+    }
+
     pub fn recenter(&mut self) {
         self.wide_gate = 0.0;
+        self.gaze_eyelid_lift = [0.0; 2];
+        self.reset_session_reseat();
+        self.clear_appearance_profile();
         for s in self.eyes.iter_mut() {
-            s.baseline_n = RECENTER_PRIOR_N;
-            // Recenter pressed while a wide is LATCHED is the user asserting this
-            // wide is spurious (a stuck episode looks like rest to the user):
-            // pre-arm the breaker so the fast re-anchor starts immediately (~3-5s)
-            // instead of waiting out the full 15s detection — the press IS the
-            // detection. A healthy recenter (no latch) clears the counter; a
-            // pre-armed one drains harmlessly within ~0.4s of relaxed frames if
-            // the wide was somehow genuine (review 2026-07-07).
-            s.wide_frames = if s.is_wide { WIDE_STUCK_FRAMES } else { 0 };
-            s.fall_run = 0.0;
-            s.fall_updates = 0;
-            s.is_closed = false;
-            s.is_wide = false;
-            s.fast_blink_frames = 0;
-            s.fast_blink_arm = 0;
-            s.arm_updates = 0;
-            // Keep the LIVE raw history (prev_raw/rawu*) and grant NO detector
-            // grace: unlike new()/restore(), a mid-session recenter has genuine
-            // per-frame history, so there is no phantom step to guard against --
-            // and a graced detector would turn a natural blink in the 200ms
-            // after the button press into a half-blink (review 2026-07-09).
-            s.kalman_x = 0.0;
-            s.kalman.reset();
-            s.wide_ceiling = 0.0;
-            s.squeeze_floor = NATIVE_SQ_FLOOR;
-            // Blink depth and the mid-close curve anchor are physiological /
-            // per-camera properties: KEEP them across recenter (only learning in
-            // flight is abandoned) and re-derive the closed bound.
-            s.blink_len = 0;
-            s.mid_anchor_staged = None;
-            s.ep_clean_exit = None;
-            s.last_ramp_pre = -1.0;
-            // reach_env is transient and baseline-relative: re-seed it at the current
-            // baseline so the entry gate starts from the normal ~0.20 and re-learns this
-            // eye's floor live (learned_once + blink_depth are kept — physiological).
-            s.reach_env = s.baseline;
-            s.blink_candidate = None;
-            s.blink_candidate_count = 0;
-            s.blink_candidate_max = 0.0;
-            s.blink_candidate_frame = 0;
-            // Recenter only changes the open coordinate. Keep the endpoint travel
-            // budget so repeated Recenters cannot launder a bad floor adjustment
-            // into blink_depth and grant another full budget.
-            s.floor_last_commit_frame = s.frame_count;
-            s.closed_ref = (s.baseline - s.blink_depth).clamp(s.baseline - 0.40, s.baseline - 0.05);
+            Self::arm_eye_recenter(s);
         }
+        self.pend = PairPending::default();
+    }
+
+    /// Re-learn only one eye's relaxed-open coordinate after its raw model source
+    /// changes. The other eye's calibrated baseline and temporal state stay intact.
+    pub fn recenter_eye(&mut self, eye: Eye) {
+        let i = eye.idx();
+        self.wide_gate = 0.0;
+        self.gaze_eyelid_lift[i] = 0.0;
+        self.session_baseline_offset[i] = 0.0;
+        self.appearance_baseline_offset[i] = 0.0;
+        self.appearance_wide_entry_shift[i] = 0.0;
+        // Auto-reseat observes the pair. Discard its in-flight candidate without
+        // touching the other eye's already-applied session offset.
+        self.reseat_candidate = [0.0; 2];
+        self.reseat_prev_raw = [self.eyes[0].baseline, self.eyes[1].baseline];
+        self.reseat_stable_frames = 0;
+        Self::arm_eye_recenter(&mut self.eyes[i]);
         self.pend = PairPending::default();
     }
 
     /// Restore a persisted snapshot (loaded calibration).
     pub fn restore(&mut self, e: Eye, snap: CalibSnapshot) {
+        let i = e.idx();
+        self.session_baseline_offset[i] = 0.0;
+        self.appearance_baseline_offset[i] = 0.0;
+        self.appearance_wide_entry_shift[i] = 0.0;
+        self.reseat_stable_frames = 0;
+        self.eyes[i].response_snap_committed = false;
         let s = &mut self.eyes[e.idx()];
         s.baseline = snap.baseline;
+        s.recenter_active = false;
+        s.wide_entry_offset = UPPER_OFFSET;
+        s.wide_neutral_n = 0;
         // A mature persisted baseline re-enters a SHORT bootstrap re-verification
         // (the value becomes a RESTORE_PRIOR_N-sample prior): confirmed in ~0.5s
         // when still accurate, re-anchored in ~1s when moderately stale (a reseat
@@ -983,6 +1716,8 @@ impl SRanipalState {
         s.learned_once = snap.learned_once
             || (snap.blink_depth.is_finite()
                 && (snap.blink_depth - default_blink_depth()).abs() > 1e-4);
+        s.endpoint_locked = snap.endpoint_locked;
+        s.endpoint_calibrated_unix = snap.endpoint_calibrated_unix;
         // Learned L/R curve anchor: sanitized like blink_depth (old files
         // serde-default it to identity).
         s.mid_anchor = if snap.mid_anchor.is_finite() {
@@ -1000,6 +1735,12 @@ impl SRanipalState {
         s.rawu1 = s.baseline;
         s.rawu2 = s.baseline;
         s.detect_grace = DETECT_GRACE_FRAMES;
+        s.wink_arm = 0;
+        s.wink_active = false;
+        s.blink_pulse_active = false;
+        s.blink_pulse_bottom_frames = 0;
+        s.blink_pulse_age = 0;
+        s.blink_pulse_consumed = false;
         // reach_env is transient (never persisted): re-seed at the restored baseline so
         // the entry gate starts from the normal ~0.20 and re-learns this eye's floor.
         s.reach_env = s.baseline;
@@ -1033,11 +1774,56 @@ impl SRanipalState {
         self.eyes[1].frame_count = fc;
     }
 
-    fn update_calibration(&mut self, i: usize, raw: f32, present: bool) {
+    /// Install one holdout-validated explicit endpoint without disturbing this
+    /// eye's mid-curve, smoothing, squeeze, gaze or the other eye.
+    pub fn apply_explicit_endpoint(
+        &mut self,
+        eye: Eye,
+        baseline: f32,
+        blink_depth: f32,
+        calibrated_unix: u64,
+    ) {
+        if !baseline.is_finite() || !blink_depth.is_finite() {
+            return;
+        }
+        let i = eye.idx();
+        self.session_baseline_offset[i] = 0.0;
+        self.appearance_baseline_offset[i] = 0.0;
+        self.appearance_wide_entry_shift[i] = 0.0;
+        self.reseat_stable_frames = 0;
+        self.eyes[i].response_snap_committed = false;
+        let s = &mut self.eyes[eye.idx()];
+        s.baseline = baseline.clamp(BASELINE_RANGE_LO, BASELINE_RANGE_HI);
+        // This is an in-session validated update, not a cold-start restore. Preserve a
+        // mature baseline's weight and all temporal detector state; only an immature
+        // state is promoted to ready so the accepted endpoint is not averaged away.
+        s.baseline_n = s.baseline_n.max(BASELINE_BOOTSTRAP_N);
+        s.blink_depth = blink_depth.clamp(0.05, 0.40);
+        s.learned_once = true;
+        s.endpoint_locked = true;
+        s.endpoint_calibrated_unix = calibrated_unix;
+        s.closed_ref = (s.baseline - s.blink_depth).clamp(s.baseline - 0.40, s.baseline - 0.05);
+    }
+
+    /// Remove one guided endpoint result and return that eye to cold adaptive
+    /// endpoint learning. `restore` also re-seeds detector history, preventing
+    /// the reset from looking like a synthetic fast blink.
+    pub fn remove_explicit_endpoint(&mut self, eye: Eye) {
+        let reset = self.snapshot(eye).without_explicit_endpoint();
+        self.restore(eye, reset);
+    }
+
+    fn update_calibration(
+        &mut self,
+        i: usize,
+        raw: f32,
+        present: bool,
+        exclude_close_learning: bool,
+    ) {
         // Coupling deliberately moves the mature baseline after this function.
         // Without an uncoupled coordinate snapshot, committing an endpoint would
         // bake that artificial displacement into persisted blink_depth.
-        let endpoint_learning_enabled = !self.tuning.couple_eyes;
+        let endpoint_learning_enabled = !self.tuning.couple_eyes && !self.eyes[i].endpoint_locked;
         let s = &mut self.eyes[i];
         s.frame_count += 1;
         // Stuck-wide breaker bookkeeping: accumulate while the sticky `is_wide` is
@@ -1063,11 +1849,28 @@ impl SRanipalState {
         if present && raw > BASELINE_RANGE_LO && raw < BASELINE_RANGE_HI {
             let stuck = s.is_wide && s.wide_frames >= WIDE_STUCK_FRAMES;
             if s.baseline_n < BASELINE_BOOTSTRAP_N {
-                if s.baseline_n < BOOTSTRAP_ANCHOR_N || (raw - s.baseline).abs() < WIDE_LEARN_CAP {
+                if s.recenter_active
+                    || s.baseline_n < BOOTSTRAP_ANCHOR_N
+                    || (raw - s.baseline).abs() < WIDE_LEARN_CAP
+                {
                     // Bootstrap running mean; after the uncapped anchor phase the
-                    // symmetric window keeps wide AND blink frames out of it.
+                    // symmetric window keeps wide AND blink frames out of it. An
+                    // explicit Recenter deliberately bypasses that window: the old
+                    // baseline remains an 8-sample prior, but a genuine HMD reseat
+                    // larger than 0.10 must still converge within this bootstrap.
+                    record_wide_neutral_sample(s, raw);
                     s.baseline_n += 1;
                     s.baseline += (raw - s.baseline) / s.baseline_n as f32;
+                    if s.baseline_n >= BASELINE_BOOTSTRAP_N {
+                        s.recenter_active = false;
+                        s.wide_entry_offset = wide_entry_offset_from_neutral(
+                            &s.wide_neutral_samples,
+                            usize::from(s.wide_neutral_n),
+                        );
+                        // Rebuild the adaptive full-Wide endpoint from the newly
+                        // learned entry threshold on its next use.
+                        s.wide_ceiling = 0.0;
+                    }
                 } else {
                     // NO zero-rate state even here: a steady level ABOVE the cap
                     // (a stale-low prior + recenter, or recenter mid-squint then
@@ -1096,12 +1899,12 @@ impl SRanipalState {
             }
         }
         let b = s.baseline;
-        s.upper = b + UPPER_OFFSET;
+        s.upper = b + s.wide_entry_offset;
         // Close-side auto-range: update the present-gated MIN-envelope of raw. It
         // attacks DOWN fast toward a new low and heals UP slowly, so it settles at this
         // eye's full-close bottom (squints ride above it). Only tracks raw within
         // ENV_SANITY_OFFSET of baseline, so a dropout / near-0 sample can't corrupt it.
-        if present && raw > b - ENV_SANITY_OFFSET {
+        if present && !exclude_close_learning && raw > b - ENV_SANITY_OFFSET {
             let rate = if raw < s.reach_env {
                 ENV_ATTACK
             } else {
@@ -1130,7 +1933,11 @@ impl SRanipalState {
         let entry = b - (GATE_FRAC * (b - s.reach_env)).clamp(GATE_MIN, BLINK_OFFSET);
         let release = b - BLINK_RELEASE_OFFSET;
         if s.blink_len == 0 {
-            if present && raw < entry && s.baseline_n >= BASELINE_BOOTSTRAP_N {
+            if present
+                && !exclude_close_learning
+                && raw < entry
+                && s.baseline_n >= BASELINE_BOOTSTRAP_N
+            {
                 s.blink_len = 1;
                 s.blink_smooth = raw;
                 s.blink_lo = raw;
@@ -1147,7 +1954,8 @@ impl SRanipalState {
             }
         } else {
             s.blink_len = s.blink_len.saturating_add(1);
-            if s.fast_blink_frames > 0 || s.fast_blink_arm > 0 || !present {
+            if exclude_close_learning || s.fast_blink_frames > 0 || s.fast_blink_arm > 0 || !present
+            {
                 s.blink_dirty = true;
             }
             if present {
@@ -1295,7 +2103,7 @@ impl SRanipalState {
         // re-enters this phase) and gives an unlearned eye a sane floor. MATURE
         // phase: closed_ref is independent — the episode teaching above is the only
         // writer, so baseline drift no longer moves the openness=0 point.
-        if !s.learned_once || s.baseline_n <= BASELINE_BOOTSTRAP_N {
+        if !s.learned_once || s.baseline_n <= BASELINE_BOOTSTRAP_N || s.endpoint_locked {
             s.closed_ref = (b - s.blink_depth).clamp(0.0, 1.0);
         } else if !s.closed_ref.is_finite() {
             s.closed_ref = (b - s.blink_depth).clamp(0.0, 1.0);
@@ -1343,28 +2151,46 @@ impl SRanipalState {
         native_absolute: bool,
     ) -> (f32, f32, f32) {
         let tuning = self.tuning;
+        let session_offset = self.session_baseline_offset[i];
+        let manual_range = self.response_profile_installed && self.response_manual_range;
+        let manual_open_offset = self.response_open_point_offset[i];
+        let manual_closed_depth = self.response_closed_point_depth[i];
+        let close_scale = self.response_close_depth_scale[i];
+        let response_mid = self.response_curve_mid_output[i];
         let s = &mut self.eyes[i];
         // No clean ramp sample unless the continuous-ramp branch below produces
         // one (wide / latch / legacy early-returns leave the sentinel).
         s.last_ramp_pre = -1.0;
-        let b = s.baseline;
-        let upper = b + UPPER_OFFSET;
-        let squeeze_top = b - SQUEEZE_TOP_OFFSET;
+        // The session-only reseat offset is an OPEN-side correction.  Wide and the
+        // full-open point follow it; blink/wink/squeeze gates and the zero point stay
+        // tied to the independently calibrated close coordinate.
+        let close_b = s.baseline + self.appearance_baseline_offset[i];
+        let open_b = s.baseline + session_offset;
+        let open_b = open_b + self.appearance_baseline_offset[i];
+        let upper = open_b + s.wide_entry_offset + self.appearance_wide_entry_shift[i];
+        let squeeze_top = close_b - SQUEEZE_TOP_OFFSET;
         // Openness saturates to 1.0 at `open_full` — a wider dead-zone below baseline than
         // squeeze_top. The baseline is the MEAN relaxed raw, so a too-tight full-open point
         // let ~half the relaxed noise read < 1.0 and the smoothed openness settled well
         // below full (the "one eye stuck ~half-open" report, 2026-07-04). squeeze_top is
         // kept as-is for the wide / fast-blink-latch guards (those are about narrowing
         // BELOW relaxed, not about where the eye counts as fully open).
-        let open_full = b - tuning.open_deadzone.clamp(SQUEEZE_TOP_OFFSET, 0.20);
+        let open_full = if manual_range {
+            open_b - manual_open_offset
+        } else {
+            open_b - tuning.open_deadzone.clamp(SQUEEZE_TOP_OFFSET, 0.20)
+        };
         // openness=0 point: per-eye learned blink minimum (continuous calib) or the fixed
         // offset. Kept just below `open_full` so the openness-ramp denominator is +ve.
-        let blink_top = if tuning.continuous_calib {
-            s.closed_ref.min(open_full - 1e-3)
+        let blink_top = if manual_range {
+            (close_b - manual_closed_depth).min(open_full - 1e-3)
+        } else if tuning.continuous_calib {
+            let learned_depth = (s.baseline - s.closed_ref).clamp(0.05, 0.40);
+            (close_b - learned_depth * close_scale).min(open_full - 1e-3)
         } else {
-            b - BLINK_OFFSET
+            close_b - BLINK_OFFSET * close_scale
         };
-        let blink_release = b - BLINK_RELEASE_OFFSET;
+        let blink_release = close_b - BLINK_RELEASE_OFFSET;
 
         // Blink hysteresis (legacy): stay closed until raw rises above blink_release.
         // Continuous-calib skips this sticky HOLD so reopen tracks smoothly (the
@@ -1404,7 +2230,8 @@ impl SRanipalState {
         let wide_gain = tuning.wide_gain;
 
         // Wide hysteresis (mirror of blink): stay wide until raw < upper - release.
-        let wide_release = upper - WIDE_RELEASE_OFFSET;
+        let wide_release = upper
+            - (s.wide_entry_offset * 0.5).clamp(WIDE_ENTRY_MIN_OFFSET * 0.5, WIDE_RELEASE_OFFSET);
         if s.is_wide {
             if raw < wide_release {
                 s.is_wide = false; // exit wide, fall through
@@ -1451,7 +2278,7 @@ impl SRanipalState {
                 s.latch_bottom = s.latch_bottom.min(raw);
                 let rise = (RELEASE_RISE_NORM * d).max(RELEASE_RISE_FLOOR);
                 let exit_zone = raw > blink_top + (LATCH_EXIT_NORM * d).clamp(0.03, 0.09);
-                let deep_now = (b - raw) >= SHALLOW_COMMIT_DIP * d;
+                let deep_now = (close_b - raw) >= SHALLOW_COMMIT_DIP * d;
                 let cap_hit = s.fast_blink_frames >= s.latch_cap && !deep_now;
                 if (raw > s.latch_bottom + rise && exit_zone) || cap_hit {
                     // Release -> fall through to the ramp, and RESET the descent
@@ -1490,7 +2317,7 @@ impl SRanipalState {
                         s.fast_blink_frames = 1;
                         s.squeeze_streak = 0;
                         s.latch_bottom = raw;
-                        s.latch_cap = if (b - raw) < SHALLOW_COMMIT_DIP * d {
+                        s.latch_cap = if (close_b - raw) < SHALLOW_COMMIT_DIP * d {
                             FAST_BLINK_CAP_SHALLOW
                         } else {
                             FAST_BLINK_MAX_FRAMES
@@ -1507,7 +2334,7 @@ impl SRanipalState {
                 let fall2 = s.rawu2 - raw;
                 let vel_thr = (BLINK_VEL_NORM * d).clamp(BLINK_VEL_FLOOR, BLINK_VEL_CAP);
                 let fall2_thr = (BLINK_FALL2_NORM * d).clamp(BLINK_FALL2_FLOOR, BLINK_FALL2_CAP);
-                let deep = (b - raw) >= FALL2_COMMIT_DEPTH * d;
+                let deep = (close_b - raw) >= FALL2_COMMIT_DEPTH * d;
                 if v1 >= vel_thr || (fall2 >= fall2_thr && deep) {
                     s.fast_blink_arm = 1;
                     s.fast_blink_arm_raw = raw;
@@ -1535,11 +2362,12 @@ impl SRanipalState {
             }
             // L/R mid-close curve equalization (identity until learned); skipped in
             // simple mode so a mis-learned per-eye anchor can't warp one eye.
-            let opn = if native_absolute {
+            let calibrated = if native_absolute {
                 opn_pre
             } else {
                 apply_anchor(opn_pre, s.mid_anchor)
             };
+            let opn = apply_response_curve(calibrated, response_mid);
             // Derived squeeze (only used when native_squeeze is off): rises as the
             // eye narrows below relaxed.
             let dz = tuning.squeeze_deadzone;
@@ -1573,6 +2401,7 @@ impl SRanipalState {
             } else {
                 1.0 - (t_raw / SQUEEZE_HARDCLOSE_T)
             };
+            let opn = apply_response_curve(opn, response_mid);
             let dz = tuning.squeeze_deadzone;
             let sqz = if t_raw <= dz || s.squeeze_streak < SQUEEZE_DWELL_MIN {
                 0.0
@@ -1628,7 +2457,124 @@ impl SRanipalState {
         gaze: &GazeSample,
         ml_loaded: bool,
     ) -> [EyeResult; 2] {
-        let raws = [ml[0][1], ml[1][1]]; // ch1 = openness
+        self.process_frame_with_gaze_eyelid(ml, gaze, ml_loaded, &GazeEyelidProfile::default())
+    }
+
+    /// Variant used by the production pipeline. The correction is deliberately
+    /// applied before baseline learning and blink decoding so a repeatable side-gaze
+    /// droop cannot teach the baseline or arm the fast-blink detector.
+    pub fn process_frame_with_gaze_eyelid(
+        &mut self,
+        ml: [[f32; 5]; 2],
+        gaze: &GazeSample,
+        ml_loaded: bool,
+        profile: &GazeEyelidProfile,
+    ) -> [EyeResult; 2] {
+        self.process_frame_with_profiles(ml, gaze, ml_loaded, profile, &WinkProfile::default())
+    }
+
+    pub fn process_frame_with_profiles(
+        &mut self,
+        ml: [[f32; 5]; 2],
+        gaze: &GazeSample,
+        ml_loaded: bool,
+        profile: &GazeEyelidProfile,
+        wink_profile: &WinkProfile,
+    ) -> [EyeResult; 2] {
+        self.process_frame_with_all_profiles(
+            ml,
+            gaze,
+            ml_loaded,
+            profile,
+            wink_profile,
+            &BlinkTimingProfile::default(),
+        )
+    }
+
+    pub fn process_frame_with_all_profiles(
+        &mut self,
+        ml: [[f32; 5]; 2],
+        gaze: &GazeSample,
+        ml_loaded: bool,
+        profile: &GazeEyelidProfile,
+        wink_profile: &WinkProfile,
+        blink_timing: &BlinkTimingProfile,
+    ) -> [EyeResult; 2] {
+        let mut raws = [ml[0][1], ml[1][1]]; // ch1 = openness
+        self.update_auto_reseat(raws, &ml, gaze);
+        for e in Eye::ALL {
+            let i = e.idx();
+            let native = gaze.eye(e);
+            let model_ready = profile.is_compatible()
+                && profile.eyes[i].enabled
+                && self.eyes[i].baseline_n >= BASELINE_BOOTSTRAP_N
+                && ml[i][0] > CH0_PRESENT_GATE;
+            let evidence_valid = model_ready
+                && native.gaze_valid
+                && native.gaze.iter().all(|value| value.is_finite())
+                && (!native.openness_reported || native.openness_valid);
+            let target = if evidence_valid {
+                profile.predicted_lift(i, native.gaze).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            // Native Disable is authoritative and clears the lift immediately.
+            // Other validity/provider transitions decay over ~50-100 ms instead of
+            // switching a raw offset on one frame.
+            if native.openness_reported && !native.openness_valid {
+                self.gaze_eyelid_lift[i] = 0.0;
+            } else {
+                let alpha = if target > self.gaze_eyelid_lift[i] {
+                    0.22
+                } else {
+                    0.14
+                };
+                self.gaze_eyelid_lift[i] += alpha * (target - self.gaze_eyelid_lift[i]);
+                if self.gaze_eyelid_lift[i].abs() < 1e-5 {
+                    self.gaze_eyelid_lift[i] = 0.0;
+                }
+            }
+
+            let raw = raws[i];
+            let baseline = self.effective_baseline(i);
+            let closed_ref = self.effective_closed_ref(i).min(baseline - 0.05);
+            let span = (baseline - closed_ref).max(0.05);
+            let normalized = (raw - closed_ref) / span;
+            // Smoothly disappear across the close side. At/below the calibrated
+            // closed endpoint the correction is exactly zero, so a real blink or
+            // wink can always reach 0 even when gaze remains valid.
+            let gate_x = ((normalized - 0.08) / 0.32).clamp(0.0, 1.0);
+            let close_gate = gate_x * gate_x * (3.0 - 2.0 * gate_x);
+            let lift = self.gaze_eyelid_lift[i] * close_gate;
+            // Restore relaxed-open invariance only. Never push the raw coordinate
+            // above this eye's current relaxed baseline, hence never manufacture
+            // EyeWide from a gaze correction.
+            if raw < baseline && lift > 0.0 {
+                raws[i] = raw + lift.min(baseline - raw);
+            }
+        }
+        // Classify squeeze-correlated unilateral closes before endpoint learning.
+        // Wink response itself is applied later, after both eyes are decoded, but
+        // a held wink must never pull the ordinary bilateral reach envelope or
+        // close endpoint toward its different model-space floor.
+        let squeeze_deltas: [f32; 2] =
+            std::array::from_fn(|i| (ml[i][3] - self.eyes[i].squeeze_floor).max(0.0));
+        let exclude_close_learning: [bool; 2] = std::array::from_fn(|i| {
+            let j = 1 - i;
+            let response = wink_profile.eyes[i];
+            let squeeze_threshold =
+                if wink_profile.is_compatible() && response.enabled && response.squeeze_enabled {
+                    response.squeeze_release_delta
+                } else {
+                    WINK_LEARN_SQUEEZE_DELTA
+                };
+            let own_present = ml[i][0] > CH0_PRESENT_GATE;
+            let partner_open =
+                ml[j][0] > CH0_PRESENT_GATE && raws[j] > self.effective_baseline(j) - 0.04;
+            self.eyes[i].wink_active
+                || (own_present && partner_open && squeeze_deltas[i] >= squeeze_threshold)
+        });
         let mut pe = [PerEye::default(); 2];
 
         for e in Eye::ALL {
@@ -1638,10 +2584,16 @@ impl SRanipalState {
             let present = ml[i][0] > CH0_PRESENT_GATE;
 
             // Step 1: online calibration.
-            self.update_calibration(i, raw, present);
+            let transient_reseat = self.session_baseline_offset[i].abs() > 0.005;
+            self.update_calibration(
+                i,
+                raw,
+                present,
+                exclude_close_learning[i] || transient_reseat,
+            );
 
             // Step 2: blink gate + streaks.
-            let blink_threshold = self.eyes[i].baseline - 0.20;
+            let blink_threshold = self.eyes[i].baseline - 0.20 * self.response_close_depth_scale[i];
             if raw < blink_threshold {
                 self.eyes[i].closed_streak += 1;
                 self.eyes[i].open_streak = 0;
@@ -1656,6 +2608,7 @@ impl SRanipalState {
             let trusted = self.eyes[i].open_streak >= OPEN_TRUST_FRAMES
                 || self.eyes[i].frame_count >= WARMUP_FRAMES;
             let native_absolute = gaze.eye(e).openness_reported;
+            let model_response = self.model_response_for_raw(i, raw, native_absolute);
 
             // Step 3+4: region decode (or hold smoothed value until trusted).
             let (opn, wide_mag, sqz_mag) = if trusted {
@@ -1672,7 +2625,7 @@ impl SRanipalState {
                 self.eyes[i].last_ramp_pre = -1.0; // normalize() skipped: no ramp sample
                                                    // Hold the smoothed value, but still force 0 on a clear close so
                                                    // blinks register before trust is reached.
-                let held = if raw < self.eyes[i].baseline - BLINK_OFFSET {
+                let held = if model_response <= 0.001 {
                     0.0
                 } else {
                     self.eyes[i].smooth_open
@@ -1686,7 +2639,7 @@ impl SRanipalState {
             // sensitivity knob.
             let squeeze_out = if self.tuning.native_squeeze {
                 let s3 = ml[i][3];
-                if raw >= self.eyes[i].baseline {
+                if raw >= self.effective_baseline(i) {
                     let f = &mut self.eyes[i].squeeze_floor;
                     *f += SQ_FLOOR_TRACK * (s3 - *f);
                     *f = f.clamp(0.0, 0.4);
@@ -1704,8 +2657,17 @@ impl SRanipalState {
             pe[i] = PerEye {
                 raw,
                 openness_target: opn.clamp(0.0, 1.0),
+                model_response,
+                snap_requested: self.eyes[i].fast_blink_frames > 0,
+                snap_reason: ClosureReason::FastBlink,
+                reason: if present {
+                    ClosureReason::Normal
+                } else {
+                    ClosureReason::TrackingLost
+                },
                 wide_out: wide_mag,
                 squeeze_out,
+                squeeze_delta: squeeze_deltas[i],
                 gaze: es.gaze,
                 gaze_v: es.gaze_valid,
                 pupil_mm: es.pupil_mm,
@@ -1745,6 +2707,167 @@ impl SRanipalState {
             self.eyes[i].prev_raw = raw;
         }
 
+        // Step 4.2: held-wink response. Bilateral endpoints remain untouched.
+        // The shallower wink floor is admitted only after the opposite eye has
+        // remained clearly open for several frames (or native Tobii explicitly
+        // reports one eye disabled and the other enabled).
+        if wink_profile.is_compatible() {
+            for e in Eye::ALL {
+                let (i, j) = (e.idx(), e.opposite().idx());
+                let response = wink_profile.eyes[i];
+                if !response.enabled {
+                    self.eyes[i].wink_arm = 0;
+                    self.eyes[i].wink_active = false;
+                    continue;
+                }
+                let own_native = gaze.eye(e);
+                let partner_native = gaze.eye(e.opposite());
+                let native_wink = own_native.openness_reported
+                    && !own_native.openness_valid
+                    && partner_native.openness_reported
+                    && partner_native.openness_valid;
+                let partner_open = pe[j].present
+                    && pe[j].openness_target >= WINK_PARTNER_OPEN
+                    && pe[j].draw > -0.01;
+                let squeeze_enter =
+                    response.squeeze_enabled && pe[i].squeeze_delta >= response.squeeze_enter_delta;
+                let squeeze_held = response.squeeze_enabled
+                    && pe[i].squeeze_delta >= response.squeeze_release_delta;
+                let partner_response = wink_profile.eyes[j];
+                let partner_squeeze_threshold = if partner_response.squeeze_enabled {
+                    partner_response.squeeze_release_delta
+                } else {
+                    WINK_LEARN_SQUEEZE_DELTA
+                };
+                let unilateral_squeeze =
+                    squeeze_enter && pe[j].squeeze_delta < partner_squeeze_threshold;
+                let own_enter_open = if unilateral_squeeze {
+                    WINK_SQUEEZE_ENTER_OPEN
+                } else {
+                    WINK_OWN_ENTER_OPEN
+                };
+                let own_narrow = pe[i].present
+                    && pe[i].openness_target <= own_enter_open
+                    && pe[i].raw < self.eyes[i].baseline - 0.06;
+
+                if self.eyes[i].wink_active {
+                    if !pe[i].present
+                        || (!native_wink && !partner_open)
+                        || (pe[i].openness_target >= WINK_RELEASE_OPEN
+                            && pe[i].raw > self.effective_baseline(i) - 0.04
+                            && !squeeze_held)
+                    {
+                        self.eyes[i].wink_active = false;
+                        self.eyes[i].wink_arm = 0;
+                    }
+                } else if native_wink {
+                    self.eyes[i].wink_active = true;
+                    self.eyes[i].wink_arm = WINK_ARM_FRAMES;
+                } else if own_narrow && partner_open {
+                    let step = if unilateral_squeeze { 2 } else { 1 };
+                    self.eyes[i].wink_arm = self.eyes[i].wink_arm.saturating_add(step);
+                    if self.eyes[i].wink_arm >= WINK_ARM_FRAMES {
+                        self.eyes[i].wink_active = true;
+                    }
+                } else {
+                    self.eyes[i].wink_arm = 0;
+                }
+
+                if self.eyes[i].wink_active {
+                    pe[i].reason = ClosureReason::Wink;
+                }
+                if self.eyes[i].wink_active && response.floor_enabled {
+                    let baseline = self.eyes[i].baseline;
+                    let open_full = self.effective_open_ref(i);
+                    let wink_depth =
+                        response.wink_depth.clamp(0.05, 0.40) * self.response_close_depth_scale[i];
+                    let wink_ref = baseline - wink_depth;
+                    let wink_open_pre = ((pe[i].raw - wink_ref)
+                        / (open_full - wink_ref).max(MIN_CLOSE_SPAN))
+                    .clamp(0.0, 1.0);
+                    let wink_open =
+                        apply_response_curve(wink_open_pre, self.response_curve_mid_output[i]);
+                    pe[i].openness_target = pe[i].openness_target.min(wink_open);
+                    pe[i].closed = pe[i].closed || wink_open < 0.08;
+                }
+            }
+        } else {
+            for eye in &mut self.eyes {
+                eye.wink_arm = 0;
+                eye.wink_active = false;
+            }
+        }
+
+        // A real bilateral blink can start one or two samples earlier in one eye,
+        // leaving the two per-eye histories on different ramp/latch states even
+        // after the raw lids converge. If both eyes are now narrow, both carry the
+        // close/squeeze signature, and neither was classified as a wink, use the
+        // lower of the two targets for both. This closes the short gap before
+        // Tobii's absolute validity transition without turning a unilateral wink
+        // (whose partner stays open) into a blink.
+        let bilateral_squeezed_close = (0..2).all(|i| {
+            let response = wink_profile.eyes[i];
+            let squeeze_threshold =
+                if wink_profile.is_compatible() && response.enabled && response.squeeze_enabled {
+                    response.squeeze_release_delta
+                } else {
+                    WINK_LEARN_SQUEEZE_DELTA
+                };
+            pe[i].present
+                && pe[i].raw < self.eyes[i].baseline - 0.06
+                && pe[i].squeeze_delta >= squeeze_threshold
+                && !self.eyes[i].wink_active
+        });
+        if bilateral_squeezed_close {
+            // The ordinary bilateral assist below intentionally requires a
+            // recent per-eye fall. With a one/two-frame lead, the leading eye
+            // can already be committed while the following eye no longer has
+            // the same history window. The bilateral squeeze signature is the
+            // missing pair evidence: mirror an EXISTING fast latch, but never
+            // create one for a slow close where neither eye committed.
+            let committed_frames = self
+                .eyes
+                .iter()
+                .map(|eye| eye.fast_blink_frames)
+                .max()
+                .unwrap_or(0);
+            if committed_frames > 0 {
+                let pair_cap = if (0..2).any(|i| {
+                    self.eyes[i].baseline - pe[i].raw
+                        >= SHALLOW_COMMIT_DIP * self.eyes[i].blink_depth
+                }) {
+                    FAST_BLINK_MAX_FRAMES
+                } else {
+                    FAST_BLINK_CAP_SHALLOW
+                };
+                for i in 0..2 {
+                    self.eyes[i].fast_blink_frames = committed_frames;
+                    self.eyes[i].fast_blink_arm = 0;
+                    self.eyes[i].squeeze_streak = 0;
+                    self.eyes[i].latch_bottom = self.eyes[i].latch_bottom.min(pe[i].raw);
+                    self.eyes[i].latch_cap = pair_cap;
+                    pe[i].openness_target = 0.0;
+                    pe[i].snap_requested = true;
+                    pe[i].snap_reason = ClosureReason::FastBlink;
+                    pe[i].closed = true;
+                }
+            }
+            let pair_snap = pe.iter().any(|sample| sample.snap_requested);
+            let target = pe[0].openness_target.min(pe[1].openness_target);
+            for sample in &mut pe {
+                sample.openness_target = target;
+                sample.closed = sample.closed || target < 0.08;
+                if pair_snap && target <= 0.001 {
+                    sample.snap_requested = true;
+                    sample.snap_reason = ClosureReason::FastBlink;
+                }
+            }
+        }
+        let bilateral_invalid_fast_close = bilateral_squeezed_close
+            && (0..2).any(|i| {
+                !pe[i].gaze_v && self.eyes[i].smooth_open > 0.4 && pe[i].draw <= FAST_CLOSING_RAW
+            });
+
         // Step 4.3: Tobii absolute-openness classifier. The native validity transition is
         // the authoritative "lid fully closed" event, while the unfiltered ML descent tells
         // us HOW it closed:
@@ -1781,6 +2904,8 @@ impl SRanipalState {
 
             if self.eyes[i].native_disable_latch {
                 pe[i].openness_target = 0.0;
+                pe[i].snap_requested = true;
+                pe[i].snap_reason = ClosureReason::NativeDisable;
                 pe[i].closed = true;
             }
         }
@@ -1793,6 +2918,8 @@ impl SRanipalState {
             for i in 0..2 {
                 self.eyes[i].native_disable_latch = true;
                 pe[i].openness_target = 0.0;
+                pe[i].snap_requested = true;
+                pe[i].snap_reason = ClosureReason::NativeDisable;
                 pe[i].closed = true;
             }
         }
@@ -1834,18 +2961,121 @@ impl SRanipalState {
                             FAST_BLINK_MAX_FRAMES
                         };
                         pe[j].openness_target = 0.0;
+                        pe[j].snap_requested = true;
+                        pe[j].snap_reason = ClosureReason::FastBlink;
                         pe[j].closed = true;
                     }
                 }
             }
         }
+
+        // Gather the remaining legacy/invalid-gaze fast-close intents here so
+        // no later emit-stage predicate can bypass the shared endpoint gate.
+        for i in 0..2 {
+            let legacy_streak = !self.tuning.continuous_calib && self.eyes[i].closed_streak >= 2;
+            let gaze_loss_fast =
+                !pe[i].gaze_v && self.eyes[i].smooth_open > 0.4 && pe[i].draw <= FAST_CLOSING_RAW;
+            if legacy_streak || gaze_loss_fast || bilateral_invalid_fast_close {
+                pe[i].snap_requested = true;
+                pe[i].snap_reason = ClosureReason::FastBlink;
+                pe[i].openness_target = 0.0;
+                pe[i].closed = true;
+            }
+        }
+        self.resolve_snap_gate(&mut pe);
+
+        // Step 4.45: visible-bottom guarantee for a CONFIRMED BILATERAL fast
+        // blink. General close smoothing can otherwise leave the emitted lid
+        // halfway down when the raw blink has already reopened. Once both eyes
+        // have independently committed (or native Tobii committed both), hold
+        // the target at zero until each emitted lid actually reaches zero and
+        // remains there briefly. A one-eye wink and a deliberate slow close
+        // never satisfy this trigger.
+        let blink_timing_enabled = blink_timing.is_compatible() && blink_timing.enabled;
+        if blink_timing_enabled {
+            let bilateral_fast = self.eyes.iter().all(|eye| eye.response_snap_committed);
+            let no_wink = self.eyes.iter().all(|eye| !eye.wink_active);
+            if !bilateral_fast
+                && pe
+                    .iter()
+                    .all(|eye| eye.present && eye.openness_target > 0.85)
+            {
+                for eye in &mut self.eyes {
+                    eye.blink_pulse_consumed = false;
+                }
+            }
+            if bilateral_fast
+                && no_wink
+                && pe.iter().all(|eye| eye.present)
+                && self.eyes.iter().all(|eye| !eye.blink_pulse_consumed)
+            {
+                for eye in &mut self.eyes {
+                    eye.blink_pulse_active = true;
+                    eye.blink_pulse_bottom_frames = 0;
+                    eye.blink_pulse_age = 0;
+                    eye.blink_pulse_consumed = true;
+                }
+            }
+            for (eye, sample) in self.eyes.iter_mut().zip(pe.iter_mut()) {
+                if eye.blink_pulse_active {
+                    eye.blink_pulse_age = eye.blink_pulse_age.saturating_add(1);
+                    if eye.blink_pulse_age > BLINK_PULSE_MAX_FRAMES {
+                        eye.blink_pulse_active = false;
+                        eye.blink_pulse_bottom_frames = 0;
+                    } else {
+                        sample.openness_target = 0.0;
+                        sample.reason = ClosureReason::FastBlink;
+                        eye.response_snap_committed = true;
+                        sample.closed = true;
+                    }
+                }
+            }
+        } else {
+            for eye in &mut self.eyes {
+                eye.blink_pulse_active = false;
+                eye.blink_pulse_bottom_frames = 0;
+                eye.blink_pulse_age = 0;
+                eye.blink_pulse_consumed = false;
+            }
+        }
+
+        // A bilateral squeezed close may reach a per-eye hard-close path on
+        // different frames: the ML-only fast latch can commit one eye first,
+        // and the invalid-gaze safety gate in the emit pass can see a larger
+        // current-frame drop only on the eye that followed. Once both eyes have
+        // independently supplied the narrow+squeeze evidence above, propagate
+        // that close commit to the pair. This is intentionally downstream of
+        // native/ML blink classification, but still upstream of smoothing.
+        // A real wink cannot enter this path because its partner remains open
+        // and therefore cannot satisfy `bilateral_squeezed_close`.
+        let bilateral_squeezed_commit = bilateral_squeezed_close
+            && (0..2).any(|i| {
+                let gaze_loss_fast_close = !pe[i].gaze_v
+                    && self.eyes[i].smooth_open > 0.4
+                    && pe[i].draw <= FAST_CLOSING_RAW;
+                pe[i].openness_target < 0.05 || gaze_loss_fast_close
+            });
+        if bilateral_squeezed_commit {
+            for i in 0..2 {
+                pe[i].openness_target = 0.0;
+                pe[i].snap_requested = true;
+                pe[i].snap_reason = ClosureReason::FastBlink;
+                pe[i].closed = true;
+                self.eyes[i].wink_arm = 0;
+                self.eyes[i].wink_active = false;
+            }
+        }
+        if bilateral_squeezed_commit {
+            self.resolve_snap_gate(&mut pe);
+        }
+
         // Shift the distinct-ML-update history AFTER the assist (the fall2 tests
         // above and inside normalize must span the last 2 updates EXCLUDING the
         // current frame; the duplicated cadence makes per-emit deltas unusable).
-        for i in 0..2 {
-            if pe[i].draw.abs() > 1e-6 {
+        for (i, sample) in pe.iter().enumerate() {
+            if sample.draw.abs() > 1e-6 {
                 self.eyes[i].rawu2 = self.eyes[i].rawu1;
-                self.eyes[i].rawu1 = pe[i].raw;
+                self.eyes[i].rawu1 = sample.raw;
             }
         }
 
@@ -1863,6 +3093,10 @@ impl SRanipalState {
         // wink pairs differ by ~1.0 (PAIR_MAX_DIFF), and a wink never yields two
         // synchronized clean episodes (EP_SYNC_SKEW).
         if self.tuning.continuous_calib
+            && self
+                .session_baseline_offset
+                .iter()
+                .all(|value| value.abs() <= 0.005)
             && !gaze.left.openness_reported
             && !gaze.right.openness_reported
         {
@@ -1950,17 +3184,86 @@ impl SRanipalState {
 
         // Step 4.5: cross-eye baseline coupling (opt-in — off by default so each
         // eye self-calibrates and L/R openness stays symmetric; see Tuning).
-        if self.tuning.couple_eyes {
+        if self.tuning.couple_eyes
+            && self
+                .session_baseline_offset
+                .iter()
+                .all(|value| value.abs() <= 0.005)
+        {
             self.couple_baselines(pe[0].raw, pe[1].raw);
         }
 
         // Squeeze is a closed-eye expression, not an alternate openness signal.
-        // Gate the native channel before the wide/squeeze chain so open-eye noise
-        // can neither leak to EyeSquint nor attenuate a genuine EyeWide reading.
-        // Tracking loss also reports closed, but is not a real squeeze gesture.
-        for eye in &mut pe {
-            if !eye.closed || !eye.present {
-                eye.squeeze_out = 0.0;
+        // Native ch3 commonly peaks while the lid is travelling, then becomes weaker
+        // at full closure. Capture that closing-stroke peak, but expose nothing until
+        // a short, present closed-eye hold has elapsed. Natural blinks therefore do
+        // not leak squeeze, while a deliberate squeeze does not lose its best model
+        // evidence merely because the lid has already reached the bottom.
+        if self.tuning.native_squeeze {
+            for i in 0..2 {
+                let state = &mut self.eyes[i];
+                if !pe[i].present {
+                    state.native_squeeze_closed_frames = 0;
+                    state.native_squeeze_peak = 0.0;
+                    state.native_squeeze_envelope = 0.0;
+                    pe[i].squeeze_out = 0.0;
+                    continue;
+                }
+
+                let observed = pe[i].squeeze_out;
+                // Start a fresh episode once the eye is comfortably open. During
+                // descent/closure, use a peak follower: instant attack preserves the
+                // model's short-lived maximum; slow release still permits a held
+                // squeeze to relax without reopening.
+                if !pe[i].closed && pe[i].openness_target >= 0.80 {
+                    state.native_squeeze_closed_frames = 0;
+                    state.native_squeeze_peak = 0.0;
+                    state.native_squeeze_envelope = 0.0;
+                    pe[i].squeeze_out = 0.0;
+                    continue;
+                }
+                if observed >= state.native_squeeze_peak {
+                    state.native_squeeze_peak = observed;
+                } else {
+                    state.native_squeeze_peak +=
+                        NATIVE_SQUEEZE_PEAK_RELEASE_ALPHA * (observed - state.native_squeeze_peak);
+                }
+
+                if !pe[i].closed {
+                    state.native_squeeze_closed_frames = 0;
+                    state.native_squeeze_envelope = 0.0;
+                    pe[i].squeeze_out = 0.0;
+                    continue;
+                }
+
+                state.native_squeeze_closed_frames =
+                    state.native_squeeze_closed_frames.saturating_add(1);
+                if state.native_squeeze_closed_frames <= NATIVE_SQUEEZE_CLOSED_DELAY {
+                    state.native_squeeze_envelope = 0.0;
+                    pe[i].squeeze_out = 0.0;
+                    continue;
+                }
+
+                let target = state.native_squeeze_peak;
+                let alpha = if target >= state.native_squeeze_envelope {
+                    NATIVE_SQUEEZE_ATTACK_ALPHA
+                } else {
+                    NATIVE_SQUEEZE_RELEASE_ALPHA
+                };
+                state.native_squeeze_envelope += alpha * (target - state.native_squeeze_envelope);
+                if state.native_squeeze_envelope < 1e-4 {
+                    state.native_squeeze_envelope = 0.0;
+                }
+                pe[i].squeeze_out = state.native_squeeze_envelope.clamp(0.0, 1.0);
+            }
+        } else {
+            for i in 0..2 {
+                self.eyes[i].native_squeeze_closed_frames = 0;
+                self.eyes[i].native_squeeze_peak = 0.0;
+                self.eyes[i].native_squeeze_envelope = 0.0;
+                if !pe[i].closed || !pe[i].present {
+                    pe[i].squeeze_out = 0.0;
+                }
             }
         }
 
@@ -2047,19 +3350,16 @@ impl SRanipalState {
             let s = pe[i];
             let target = s.openness_target;
             let prev = self.eyes[i].smooth_open;
-            let gaze_invalid = !s.gaze_v;
             // Raw-domain: map- and noise-invariant (see FAST_CLOSING_RAW — the
             // old corrected-target test flapped on ordinary mid-close jitter).
-            let fast_closing = s.draw <= FAST_CLOSING_RAW;
             // In continuous mode, blink-to-0 is driven by the continuous openness
             // itself (target<0.05 at/near closed_ref) — NOT the fixed baseline-0.20
             // streak gate, which sits above closed_ref and would re-introduce the
             // reopen dead-zone/jump.
-            let streak_gate = !self.tuning.continuous_calib && self.eyes[i].closed_streak >= 2;
-            let forced_closed = streak_gate
-                || target < 0.05
+            let forced_closed = target < 0.05
                 || !s.present
-                || (gaze_invalid && prev > 0.4 && fast_closing);
+                || self.eyes[i].response_snap_committed
+                || self.eyes[i].blink_pulse_active;
             let mut openness_out = if forced_closed {
                 // Unconditional reset: avoids a stale openness jump if adaptive
                 // mode is toggled across a forced-closed period.
@@ -2103,14 +3403,45 @@ impl SRanipalState {
             // over at least this long (the gentle close a low-pass gave), independent of
             // `smoothing`. Only bites when the close is FASTER than the cap; a slow squint
             // falls slower than `step` and passes through untouched. 0 = off (instant).
-            let close_ms = self.tuning.blink_close_ms;
+            let close_ms = if self.response_profile_installed {
+                self.response_blink_close_ms
+            } else {
+                self.tuning.blink_close_ms.clamp(0.0, BLINK_CLOSE_MS_MAX)
+            };
             if close_ms >= 1.0 {
                 let step = 1000.0 / (120.0 * close_ms); // full range per emit frame
                 if openness_out < prev - step {
                     openness_out = prev - step;
                 }
             }
+            if self.eyes[i].blink_pulse_active {
+                if openness_out <= 0.001 {
+                    self.eyes[i].blink_pulse_bottom_frames =
+                        self.eyes[i].blink_pulse_bottom_frames.saturating_add(1);
+                    if self.eyes[i].blink_pulse_bottom_frames >= blink_timing.minimum_frames() {
+                        self.eyes[i].blink_pulse_active = false;
+                    }
+                } else {
+                    self.eyes[i].blink_pulse_bottom_frames = 0;
+                }
+            }
             self.eyes[i].smooth_open = openness_out;
+            self.eyelid_live[i] = EyelidLiveDiag {
+                raw_openness: s.raw,
+                model_response: s.model_response,
+                final_openness: openness_out,
+                calibrated_baseline: self.eyes[i].baseline,
+                effective_baseline: self.effective_baseline(i),
+                session_baseline_offset: self.session_baseline_offset[i],
+                effective_open_ref: self.effective_open_ref(i),
+                effective_closed_ref: self.effective_closed_ref(i),
+                wide_entry_ref: (self.effective_baseline(i)
+                    + self.eyes[i].wide_entry_offset
+                    + self.appearance_wide_entry_shift[i])
+                    .clamp(0.0, 1.0),
+                wide_full_ref: self.eyes[i].wide_ceiling.clamp(0.0, 1.0),
+                reason: s.reason,
+            };
 
             // Gaze-yoke hysteresis: engage BEFORE XR5 loses the pupil under a shallow
             // squint, or after the native gaze has genuinely aged invalid. `fresh_gaze`
@@ -2217,8 +3548,17 @@ impl SRanipalState {
 struct PerEye {
     raw: f32,
     openness_target: f32,
+    /// Endpoint/curve response before special detector overrides.
+    model_response: f32,
+    snap_requested: bool,
+    snap_reason: ClosureReason,
+    /// Resolved live reason after the shared snap gate.
+    reason: ClosureReason,
+
     wide_out: f32,
     squeeze_out: f32,
+    /// Raw native-squeeze rise above this eye's adaptive relaxed floor.
+    squeeze_delta: f32,
     gaze: [f32; 3],
     gaze_v: bool,
     pupil_mm: f32,
@@ -2244,6 +3584,50 @@ mod tests {
             last = st.process_frame(ml, &g, true);
         }
         last
+    }
+
+    #[test]
+    fn wide_neutral_capture_learns_independent_per_eye_noise_bands() {
+        let mut state = SRanipalState::new();
+        let gaze = GazeSample::default();
+        let left_noise = [-0.001, 0.0, 0.001, 0.0];
+        let right_noise = [-0.008, -0.004, 0.0, 0.004, 0.008];
+
+        for frame in 0..110 {
+            let left = 0.62 + left_noise[frame % left_noise.len()];
+            let right = 0.62 + right_noise[frame % right_noise.len()];
+            state.process_frame(
+                [[1.0, left, 0.0, 0.0, 0.0], [1.0, right, 0.0, 0.0, 0.0]],
+                &gaze,
+                true,
+            );
+        }
+
+        let left = state.eyes[0].wide_entry_offset;
+        let right = state.eyes[1].wide_entry_offset;
+        assert!(
+            (left - WIDE_ENTRY_MIN_OFFSET).abs() < 1e-4,
+            "quiet eye should use the safe minimum, got {left}"
+        );
+        assert!(
+            right > left + 0.008 && right <= WIDE_ENTRY_MAX_OFFSET,
+            "noisy eye should receive its own wider band, left={left} right={right}"
+        );
+    }
+
+    #[test]
+    fn wide_neutral_single_close_outlier_does_not_desensitize_entry() {
+        let mut samples = [0.0; WIDE_NEUTRAL_SAMPLE_CAP];
+        for (i, sample) in samples.iter_mut().enumerate() {
+            *sample = 0.62 + [-0.001, 0.0, 0.001, 0.0][i % 4];
+        }
+        samples[17] = 0.40; // one blink/saccade contaminating the neutral capture
+
+        let offset = wide_entry_offset_from_neutral(&samples, samples.len());
+        assert!(
+            offset <= 0.008,
+            "one close outlier must not make Wide unreachable, got {offset}"
+        );
     }
 
     fn native_gaze(left_enabled: bool, right_enabled: bool) -> GazeSample {
@@ -2310,7 +3694,16 @@ mod tests {
         assert_eq!([closed[0].openness, closed[1].openness], [0.0, 0.0]);
         let held = native_step(&mut st, 0.48, 0.49, false, false);
         assert_eq!([held[0].openness, held[1].openness], [0.0, 0.0]);
-        let reopened = native_step(&mut st, 0.62, 0.62, true, true);
+        let first_enable = native_step(&mut st, 0.62, 0.62, true, true);
+        assert_eq!(
+            [first_enable[0].openness, first_enable[1].openness],
+            [0.0, 0.0],
+            "confirmed bilateral blink keeps its short visible bottom"
+        );
+        let mut reopened = first_enable;
+        for _ in 0..12 {
+            reopened = native_step(&mut st, 0.62, 0.62, true, true);
+        }
         assert!(reopened[0].openness > 0.5 && reopened[1].openness > 0.5);
     }
 
@@ -2403,7 +3796,7 @@ mod tests {
 
     #[test]
     fn native_squeeze_from_channel() {
-        // s3/s4 drive squeeze only while the corresponding eye is closed.
+        // s3/s4 drive squeeze only after the corresponding eye has stayed closed.
         let mut st = SRanipalState::new();
         st.tuning.squeeze_gain = 1.0; // unity gain to verify the raw channel mapping
         feed(&mut st, 0.62, 260); // warm up open
@@ -2437,6 +3830,110 @@ mod tests {
             last[1].blink && last[1].squeeze > 0.7,
             "closed right squeeze should fire, got {}",
             last[1].squeeze
+        );
+    }
+
+    #[test]
+    fn native_squeeze_starts_after_close_and_rises_smoothly() {
+        let mut st = SRanipalState::new();
+        st.tuning.squeeze_gain = 1.0;
+        feed(&mut st, 0.62, 260);
+        let g = GazeSample::default();
+        let mut closed_values = Vec::new();
+
+        for _ in 0..48 {
+            let ml = [[1.0, 0.30, 0.0, 0.60, 0.0], [1.0, 0.30, 0.0, 0.60, 0.0]];
+            let out = st.process_frame(ml, &g, true);
+            if out[0].blink {
+                closed_values.push(out[0].squeeze);
+            }
+        }
+
+        assert!(
+            closed_values.len() > NATIVE_SQUEEZE_CLOSED_DELAY as usize + 4,
+            "sustained close must produce enough closed frames"
+        );
+        assert!(
+            closed_values
+                .iter()
+                .take(NATIVE_SQUEEZE_CLOSED_DELAY as usize)
+                .all(|value| *value == 0.0),
+            "native squeeze must stay zero during the initial closed hold: {closed_values:?}"
+        );
+        let first_active = closed_values[NATIVE_SQUEEZE_CLOSED_DELAY as usize];
+        assert!(
+            first_active > 0.0 && first_active < 0.30,
+            "first active squeeze frame must be intermediate, got {first_active}"
+        );
+        assert!(
+            closed_values.last().copied().unwrap_or_default() > 0.7,
+            "held squeeze must still reach full response"
+        );
+
+        // As soon as the decoder reports the eye open again, no closed-session
+        // envelope may leak into the next expression.
+        let mut saw_open = false;
+        for _ in 0..30 {
+            let ml = [[1.0, 0.62, 0.0, 0.60, 0.0], [1.0, 0.62, 0.0, 0.60, 0.0]];
+            let out = st.process_frame(ml, &g, true);
+            if !out[0].blink {
+                saw_open = true;
+                assert_eq!(out[0].squeeze, 0.0, "reopen must clear squeeze");
+                break;
+            }
+        }
+        assert!(saw_open, "eye should reopen during the test window");
+    }
+
+    #[test]
+    fn short_native_close_does_not_emit_squeeze() {
+        let mut st = SRanipalState::new();
+        st.tuning.squeeze_gain = 1.0;
+        feed(&mut st, 0.62, 260);
+        let g = GazeSample::default();
+        let mut peak = 0.0f32;
+
+        for _ in 0..NATIVE_SQUEEZE_CLOSED_DELAY.saturating_sub(2) {
+            let ml = [[1.0, 0.20, 0.0, 0.70, 0.0], [1.0, 0.20, 0.0, 0.70, 0.0]];
+            let out = st.process_frame(ml, &g, true);
+            peak = peak.max(out[0].squeeze).max(out[1].squeeze);
+        }
+        for _ in 0..24 {
+            let ml = [[1.0, 0.62, 0.0, 0.05, 0.0], [1.0, 0.62, 0.0, 0.05, 0.0]];
+            let out = st.process_frame(ml, &g, true);
+            peak = peak.max(out[0].squeeze).max(out[1].squeeze);
+        }
+
+        assert_eq!(peak, 0.0, "short close leaked squeeze {peak}");
+    }
+
+    #[test]
+    fn native_squeeze_keeps_the_closing_stroke_peak_until_the_closed_gate() {
+        let mut st = SRanipalState::new();
+        st.tuning.squeeze_gain = 1.0;
+        feed(&mut st, 0.62, 260);
+        let g = GazeSample::default();
+
+        // The model sees a strong squeeze during lid travel, before the eyelid
+        // decoder calls it closed. Nothing may be emitted yet.
+        for _ in 0..4 {
+            let ml = [[1.0, 0.52, 0.0, 0.63, 0.0], [1.0, 0.52, 0.0, 0.63, 0.0]];
+            let out = st.process_frame(ml, &g, true);
+            assert_eq!(out[0].squeeze, 0.0);
+            assert_eq!(out[1].squeeze, 0.0);
+        }
+
+        // At full closure the live native channel becomes weak. The delayed
+        // output must nevertheless use the captured closing-stroke evidence.
+        let mut peak = 0.0f32;
+        for _ in 0..24 {
+            let ml = [[1.0, 0.20, 0.0, 0.24, 0.0], [1.0, 0.20, 0.0, 0.24, 0.0]];
+            let out = st.process_frame(ml, &g, true);
+            peak = peak.max(out[0].squeeze).max(out[1].squeeze);
+        }
+        assert!(
+            peak > 0.45,
+            "closing-stroke squeeze peak was lost at full closure: {peak}"
         );
     }
 
@@ -3291,6 +4788,8 @@ mod tests {
             blink_depth: 0.20,
             mid_anchor: 0.5,
             learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
         };
         st.restore_all(&CalibStore {
             left: snap,
@@ -3360,6 +4859,69 @@ mod tests {
     }
 
     #[test]
+    fn recenter_reanchors_across_the_ordinary_outlier_window() {
+        // A real HMD reseat can move the relaxed model coordinate by >0.10. That is
+        // intentionally rejected during automatic bootstrap, but Recenter is an
+        // explicit user confirmation and must not fall into the 50x slow path.
+        let mut st = SRanipalState::new();
+        feed(&mut st, 0.62, 400);
+        st.recenter();
+        feed(&mut st, 0.43, 100);
+
+        let baseline = st.baseline(Eye::Left);
+        assert!(
+            (baseline - 0.43).abs() < 0.02,
+            "explicit recenter did not acquire the reseated level: {baseline}"
+        );
+        assert!(
+            !st.eyes[0].recenter_active,
+            "explicit acquisition must end after the bounded bootstrap"
+        );
+    }
+
+    #[test]
+    fn recenter_ignores_closed_frames_then_acquires_relaxed_open() {
+        // Recenter remains armed through a blink/held close. The absolute sanity
+        // band still protects the baseline; valid relaxed frames then complete it.
+        let mut st = SRanipalState::new();
+        feed(&mut st, 0.62, 400);
+        st.recenter();
+        feed(&mut st, 0.20, 60);
+        assert!((st.baseline(Eye::Left) - 0.62).abs() < 1e-5);
+        assert!(st.eyes[0].recenter_active);
+
+        feed(&mut st, 0.43, 100);
+        assert!((st.baseline(Eye::Left) - 0.43).abs() < 0.02);
+        assert!(!st.eyes[0].recenter_active);
+    }
+
+    #[test]
+    fn one_eye_recenter_preserves_the_other_eye_baseline_and_state() {
+        let mut state = SRanipalState::new();
+        state.eyes[0].baseline = 0.53;
+        state.eyes[0].baseline_n = 321;
+        state.eyes[0].recenter_active = false;
+        state.eyes[1].baseline = 0.44;
+        state.eyes[1].baseline_n = 654;
+        state.eyes[1].recenter_active = false;
+        state.session_baseline_offset = [0.03, -0.02];
+
+        state.recenter_eye(Eye::Right);
+
+        assert_eq!(state.eyes[0].baseline.to_bits(), 0.53_f32.to_bits());
+        assert_eq!(state.eyes[0].baseline_n, 321);
+        assert!(!state.eyes[0].recenter_active);
+        assert_eq!(
+            state.session_baseline_offset[0].to_bits(),
+            0.03_f32.to_bits()
+        );
+        assert_eq!(state.eyes[1].baseline.to_bits(), 0.44_f32.to_bits());
+        assert_eq!(state.eyes[1].baseline_n, RECENTER_PRIOR_N);
+        assert!(state.eyes[1].recenter_active);
+        assert_eq!(state.session_baseline_offset[1], 0.0);
+    }
+
+    #[test]
     fn burst_wide_spam_does_not_trip_breaker() {
         // Repeated deliberate wide bursts with short relaxed gaps must NOT
         // accumulate into the stuck-wide breaker (review 2026-07-06): a >=0.4s
@@ -3398,6 +4960,8 @@ mod tests {
             blink_depth: 0.20,
             mid_anchor: 0.5,
             learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
         };
         st.restore_all(&CalibStore {
             left: snap,
@@ -3862,6 +5426,8 @@ mod tests {
             blink_depth: 0.12,
             mid_anchor: 0.5,
             learned_once: true,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
         };
         st.restore_all(&CalibStore {
             left: snap,
@@ -4121,6 +5687,8 @@ mod tests {
             blink_depth: 0.20,
             mid_anchor: f32::NAN,
             learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
         };
         st2.restore(Eye::Left, bad);
         assert_eq!(
@@ -4216,6 +5784,8 @@ mod tests {
             blink_depth: 0.29,
             mid_anchor: 0.5,
             learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
         };
         let mut st2 = SRanipalState::new();
         st2.restore_all(&CalibStore {
@@ -4515,6 +6085,46 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_fast_blink_reaches_zero_before_reopening_with_close_slew() {
+        let mut st = SRanipalState::new();
+        st.tuning.blink_close_ms = 100.0;
+        feed(&mut st, 0.62, 400);
+        let g = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let mut samples = Vec::new();
+        for raw in [0.50f32, 0.38, 0.38] {
+            for _ in 0..2 {
+                let ml = [[1.0, raw, 0.0, 0.0, 0.0]; 2];
+                samples.push(st.process_frame(ml, &g, true)[0].openness);
+            }
+        }
+        // Raw is already open again. The pulse must finish the visual close
+        // before allowing the ordinary reopen path to resume.
+        for _ in 0..60 {
+            let ml = [[1.0, 0.62, 0.0, 0.0, 0.0]; 2];
+            samples.push(st.process_frame(ml, &g, true)[0].openness);
+        }
+        let first_zero = samples
+            .iter()
+            .position(|value| *value <= 0.001)
+            .expect("the close slew must still reach a visible zero");
+        let zero_run = samples[first_zero..]
+            .iter()
+            .take_while(|value| **value <= 0.001)
+            .count();
+        assert!(
+            zero_run >= BlinkTimingProfile::default().minimum_frames() as usize,
+            "visible bottom lasted only {zero_run} frames"
+        );
+        assert!(
+            samples
+                .iter()
+                .skip(first_zero + zero_run)
+                .any(|value| *value > 0.5),
+            "the eye must reopen after the guaranteed bottom"
+        );
+    }
+
+    #[test]
     fn held_wink_does_not_bounce() {
         // "Closes fully, then bounces back a little" (user 2026-07-09): a held
         // wink's bottom typically sits a few hundredths ABOVE the learned
@@ -4785,6 +6395,8 @@ mod tests {
             blink_depth: 0.20,
             mid_anchor: 0.5,
             learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
         };
         st.restore_all(&CalibStore {
             left: snap,
@@ -4817,6 +6429,8 @@ mod tests {
             blink_depth: 0.20,
             mid_anchor: 0.5,
             learned_once: false,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
         };
         st.restore_all(&CalibStore {
             left: snap,
@@ -5062,5 +6676,1078 @@ mod tests {
             after, 0.0,
             "dropout must not disable the shallow-eye close, got {after}"
         );
+    }
+
+    #[test]
+    fn explicit_endpoint_lock_survives_blinks_recenter_and_serde() {
+        let mut state = SRanipalState::new();
+        feed(&mut state, 0.62, 400);
+        let mature_weight = state.snapshot(Eye::Left).baseline_n;
+        state.apply_explicit_endpoint(Eye::Left, 0.60, 0.16, 1234);
+        let applied = state.snapshot(Eye::Left);
+        assert!(applied.endpoint_locked);
+        assert_eq!(applied.endpoint_calibrated_unix, 1234);
+        assert_eq!(applied.baseline_n, mature_weight);
+
+        // Repeated deeper and shallower episodes must not rewrite explicit depth.
+        for _ in 0..4 {
+            slow_close_min(&mut state, 0.34, 40);
+            slow_close_min(&mut state, 0.48, 40);
+        }
+        assert!((state.snapshot(Eye::Left).blink_depth - 0.16).abs() < 1e-5);
+
+        state.recenter();
+        feed(&mut state, 0.64, 180);
+        let recentered = state.snapshot(Eye::Left);
+        assert!(recentered.endpoint_locked);
+        assert!((recentered.blink_depth - 0.16).abs() < 1e-5);
+        assert!((state.closed_ref(Eye::Left) - (state.baseline(Eye::Left) - 0.16)).abs() < 1e-4);
+
+        let store = state.snapshot_all();
+        let encoded = toml::to_string(&store).unwrap();
+        let decoded: CalibStore = toml::from_str(&encoded).unwrap();
+        assert!(decoded.left.endpoint_locked);
+        assert_eq!(decoded.left.endpoint_calibrated_unix, 1234);
+    }
+
+    #[test]
+    fn removing_explicit_endpoint_restarts_adaptive_defaults_without_touching_other_eye() {
+        let mut state = SRanipalState::new();
+        state.apply_explicit_endpoint(Eye::Left, 0.72, 0.11, 1234);
+        state.apply_explicit_endpoint(Eye::Right, 0.57, 0.18, 5678);
+        let right_before = state.snapshot(Eye::Right);
+        let left_mid_anchor = state.snapshot(Eye::Left).mid_anchor;
+
+        state.remove_explicit_endpoint(Eye::Left);
+
+        let left = state.snapshot(Eye::Left);
+        assert!(!left.endpoint_locked);
+        assert_eq!(left.endpoint_calibrated_unix, 0);
+        assert_eq!(left.baseline.to_bits(), DEFAULT_BASELINE.to_bits());
+        assert_eq!(left.baseline_n, 0);
+        assert_eq!(left.blink_depth.to_bits(), BLINK_OFFSET.to_bits());
+        assert!(!left.learned_once);
+        assert_eq!(left.mid_anchor.to_bits(), left_mid_anchor.to_bits());
+
+        let right_after = state.snapshot(Eye::Right);
+        assert_eq!(
+            right_after.baseline.to_bits(),
+            right_before.baseline.to_bits()
+        );
+        assert_eq!(
+            right_after.blink_depth.to_bits(),
+            right_before.blink_depth.to_bits()
+        );
+        assert!(right_after.endpoint_locked);
+        assert_eq!(right_after.endpoint_calibrated_unix, 5678);
+    }
+
+    #[test]
+    fn old_calibration_toml_defaults_to_adaptive_endpoints() {
+        let text = r#"
+[left]
+baseline = 0.6
+baseline_n = 100
+frame_count = 500
+blink_depth = 0.2
+mid_anchor = 0.5
+learned_once = true
+
+[right]
+baseline = 0.59
+baseline_n = 100
+frame_count = 500
+blink_depth = 0.19
+mid_anchor = 0.5
+learned_once = true
+"#;
+        let store: CalibStore = toml::from_str(text).unwrap();
+        assert!(!store.left.endpoint_locked);
+        assert!(!store.right.endpoint_locked);
+        assert_eq!(store.left.endpoint_calibrated_unix, 0);
+    }
+
+    #[test]
+    fn gaze_eyelid_lift_restores_open_but_never_lifts_closed() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        let mut profile = GazeEyelidProfile::default();
+        for eye in &mut profile.eyes {
+            eye.enabled = true;
+            eye.coefficients = [0.0, 0.0, 0.0, 0.08, 0.0];
+            eye.max_lift = 0.09;
+        }
+        let angle = 20f32.to_radians();
+        let sample = crate::core::types::EyeSample {
+            gaze: [angle.sin(), 0.0, angle.cos()],
+            gaze_valid: true,
+            gaze_reported: true,
+            ..crate::core::types::EyeSample::default()
+        };
+        let gaze = GazeSample {
+            left: sample,
+            right: sample,
+            ..GazeSample::default()
+        };
+        let side_open = [[1.0, 0.53, 0.0, 0.0, 0.0]; 2];
+        let mut open = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        for _ in 0..40 {
+            open = state.process_frame_with_gaze_eyelid(side_open, &gaze, true, &profile);
+        }
+        assert!(
+            open[0].openness > 0.92,
+            "repeatable side gaze should return close to relaxed open: {}",
+            open[0].openness
+        );
+
+        let closed = [[1.0, 0.35, 0.0, 0.0, 0.0]; 2];
+        let mut shut = open;
+        for _ in 0..8 {
+            shut = state.process_frame_with_gaze_eyelid(closed, &gaze, true, &profile);
+        }
+        assert_eq!(shut[0].openness, 0.0);
+        assert_eq!(shut[1].openness, 0.0);
+    }
+
+    #[test]
+    fn held_wink_profile_closes_only_the_instructed_eye() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        state.tuning.alpha_close = 1.0;
+        state.tuning.alpha_open = 1.0;
+        state.tuning.smoothing = 0.0;
+        state.tuning.blink_close_ms = 0.0;
+        let mut wink = WinkProfile::default();
+        wink.eyes[0].enabled = true;
+        wink.eyes[0].floor_enabled = true;
+        wink.eyes[0].wink_depth = 0.15;
+        let gaze = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let no_gaze_profile = GazeEyelidProfile::default();
+
+        for _ in 0..120 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.60, 0.0, 0.0, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        for step in 0..=15 {
+            let left = 0.60 - 0.01 * step as f32;
+            state.process_frame_with_profiles(
+                [[1.0, left, 0.0, 0.0, 0.0], [1.0, 0.60, 0.0, 0.0, 0.0]],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        let mut result = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        for _ in 0..12 {
+            result = state.process_frame_with_profiles(
+                [[1.0, 0.45, 0.0, 0.0, 0.0], [1.0, 0.60, 0.0, 0.0, 0.0]],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        assert!(state.eyes[0].wink_active);
+        assert!(
+            result[0].openness <= 0.02,
+            "wink output {} baseline {} closed_ref {} raw {}",
+            result[0].openness,
+            state.baseline(Eye::Left),
+            state.closed_ref(Eye::Left),
+            state.eyes[0].prev_raw,
+        );
+        assert!(result[1].openness > 0.95);
+        assert!(!state.eyes[1].wink_active);
+    }
+
+    #[test]
+    fn wink_profile_does_not_reclassify_a_bilateral_slow_close() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        state.tuning.alpha_close = 1.0;
+        state.tuning.alpha_open = 1.0;
+        state.tuning.smoothing = 0.0;
+        state.tuning.blink_close_ms = 0.0;
+        let mut wink = WinkProfile::default();
+        for eye in &mut wink.eyes {
+            eye.enabled = true;
+            eye.wink_depth = 0.15;
+        }
+        let gaze = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let no_gaze_profile = GazeEyelidProfile::default();
+        let mut result = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        for _ in 0..120 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.60, 0.0, 0.0, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        for step in 0..=15 {
+            let raw = 0.60 - 0.01 * step as f32;
+            result = state.process_frame_with_profiles(
+                [[1.0, raw, 0.0, 0.0, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        assert!(!state.eyes[0].wink_active);
+        assert!(!state.eyes[1].wink_active);
+        assert!(result[0].openness > 0.20);
+        assert!((result[0].openness - result[1].openness).abs() < 1e-5);
+    }
+
+    #[test]
+    fn calibrated_unilateral_squeeze_accelerates_wink_entry() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        state.tuning.alpha_close = 1.0;
+        state.tuning.alpha_open = 1.0;
+        state.tuning.smoothing = 0.0;
+        state.tuning.blink_close_ms = 0.0;
+        let mut wink = WinkProfile::default();
+        wink.eyes[0].enabled = true;
+        wink.eyes[0].wink_depth = 0.15;
+        wink.eyes[0].squeeze_enabled = true;
+        wink.eyes[0].squeeze_enter_delta = 0.12;
+        wink.eyes[0].squeeze_release_delta = 0.06;
+        let gaze = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let no_gaze_profile = GazeEyelidProfile::default();
+
+        for _ in 0..120 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.60, 0.0, 0.12, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        for _ in 0..3 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.50, 0.0, 0.56, 0.0], [1.0, 0.60, 0.0, 0.12, 0.0]],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        assert!(
+            state.eyes[0].wink_active,
+            "repeatable unilateral squeeze should corroborate the shallow wink onset"
+        );
+        assert!(!state.eyes[1].wink_active);
+    }
+
+    #[test]
+    fn signature_only_wink_profile_is_openness_bit_identical_to_no_profile() {
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        let mut plain = SRanipalState::new();
+        let mut signature = SRanipalState::new();
+        for state in [&mut plain, &mut signature] {
+            state.restore(Eye::Left, endpoint);
+            state.restore(Eye::Right, endpoint);
+            state.tuning.alpha_close = 1.0;
+            state.tuning.alpha_open = 1.0;
+            state.tuning.smoothing = 0.0;
+            state.tuning.blink_close_ms = 0.0;
+            // Keep the test about wink classification, not convergence of the
+            // adaptive relaxed-squeeze floor.
+            state.eyes[0].squeeze_floor = 0.12;
+            state.eyes[1].squeeze_floor = 0.12;
+        }
+
+        let no_wink = WinkProfile::default();
+        let mut signature_only = WinkProfile::default();
+        signature_only.eyes[0].enabled = true;
+        signature_only.eyes[0].floor_enabled = false;
+        signature_only.eyes[0].wink_depth = 0.15;
+        signature_only.eyes[0].squeeze_enabled = true;
+        // Deliberately below the generic 0.10 fallback: the calibrated
+        // signature must classify and protect learning without becoming an
+        // output transform.
+        signature_only.eyes[0].squeeze_enter_delta = 0.06;
+        signature_only.eyes[0].squeeze_release_delta = 0.03;
+        let gaze = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let no_gaze_profile = GazeEyelidProfile::default();
+
+        for _ in 0..16 {
+            let ml = [[1.0, 0.60, 0.0, 0.12, 0.0]; 2];
+            let a = plain.process_frame_with_profiles(ml, &gaze, true, &no_gaze_profile, &no_wink);
+            let b = signature.process_frame_with_profiles(
+                ml,
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &signature_only,
+            );
+            for eye in 0..2 {
+                assert_eq!(a[eye].openness.to_bits(), b[eye].openness.to_bits());
+            }
+        }
+
+        // A shallow unilateral close with a repeatable squeeze signature.
+        // The signature path enters wink_active, while floor_enabled=false
+        // requires every emitted openness sample to remain bit-identical.
+        for raw in [0.56f32, 0.53, 0.50, 0.48, 0.47, 0.47, 0.47, 0.47] {
+            let ml = [[1.0, raw, 0.0, 0.20, 0.0], [1.0, 0.60, 0.0, 0.12, 0.0]];
+            let a = plain.process_frame_with_profiles(ml, &gaze, true, &no_gaze_profile, &no_wink);
+            let b = signature.process_frame_with_profiles(
+                ml,
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &signature_only,
+            );
+            for eye in 0..2 {
+                assert_eq!(
+                    a[eye].openness.to_bits(),
+                    b[eye].openness.to_bits(),
+                    "signature-only profile changed eye {eye} openness at raw {raw}"
+                );
+            }
+        }
+        assert!(
+            signature.eyes[0].wink_active,
+            "signature-only profiles must still run wink classification"
+        );
+        assert!(!plain.eyes[0].wink_active);
+        assert_eq!(
+            signature.eyes[0].reach_env.to_bits(),
+            0.60f32.to_bits(),
+            "validated low squeeze threshold must protect the reach learner"
+        );
+        assert_ne!(
+            plain.eyes[0].reach_env.to_bits(),
+            0.60f32.to_bits(),
+            "control sequence should exercise the otherwise-unprotected reach learner"
+        );
+        assert_eq!(
+            signature.eyes[0].blink_depth.to_bits(),
+            0.25f32.to_bits(),
+            "signature-only protection must not rewrite the ordinary endpoint"
+        );
+    }
+
+    #[test]
+    fn two_frame_asymmetric_lead_into_bilateral_squeezed_close_is_not_a_wink() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        state.tuning.alpha_close = 1.0;
+        state.tuning.alpha_open = 1.0;
+        state.tuning.smoothing = 0.0;
+        state.tuning.blink_close_ms = 0.0;
+        for eye in &mut state.eyes {
+            eye.squeeze_floor = 0.12;
+        }
+
+        let mut wink = WinkProfile::default();
+        for eye in &mut wink.eyes {
+            eye.enabled = true;
+            eye.floor_enabled = true;
+            eye.wink_depth = 0.15;
+            eye.squeeze_enabled = true;
+            eye.squeeze_enter_delta = 0.12;
+            eye.squeeze_release_delta = 0.06;
+        }
+        // Keep the native absolute-openness classifier enabled so this test
+        // isolates wink classification from the separate ML-only fast latch.
+        let gaze = native_gaze(true, true);
+        let no_gaze_profile = GazeEyelidProfile::default();
+        for _ in 0..16 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.60, 0.0, 0.12, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+
+        // Real bilateral closes are not perfectly synchronous. Let the left
+        // eye lead by exactly two frames; this may arm, but must not latch, a
+        // unilateral wink before the right eye follows.
+        for raw in [0.54f32, 0.50] {
+            state.process_frame_with_profiles(
+                [[1.0, raw, 0.0, 0.30, 0.0], [1.0, 0.60, 0.0, 0.12, 0.0]],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+            assert!(!state.eyes[0].wink_active);
+            assert!(!state.eyes[1].wink_active);
+        }
+
+        let mut out = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
+        for raw in [0.48f32, 0.44, 0.40, 0.36, 0.36, 0.36, 0.36] {
+            out = state.process_frame_with_profiles(
+                [[1.0, raw, 0.0, 0.30, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+            assert!(!state.eyes[0].wink_active);
+            assert!(!state.eyes[1].wink_active);
+            assert_eq!(
+                out[0].openness.to_bits(),
+                out[1].openness.to_bits(),
+                "bilateral squeezed close became unilateral at raw {raw}"
+            );
+        }
+        assert!(
+            out[0].openness <= 0.08 && out[1].openness <= 0.08,
+            "bilateral close did not settle near closed: L={} R={}",
+            out[0].openness,
+            out[1].openness
+        );
+    }
+
+    #[test]
+    fn ml_only_bilateral_squeeze_mirrors_fast_latch_without_creating_a_wink() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        state.tuning.alpha_close = 1.0;
+        state.tuning.alpha_open = 1.0;
+        state.tuning.smoothing = 0.0;
+        state.tuning.blink_close_ms = 0.0;
+        for eye in &mut state.eyes {
+            eye.squeeze_floor = 0.12;
+        }
+
+        let mut wink = WinkProfile::default();
+        for eye in &mut wink.eyes {
+            eye.enabled = true;
+            eye.floor_enabled = true;
+            eye.wink_depth = 0.15;
+            eye.squeeze_enabled = true;
+            eye.squeeze_enter_delta = 0.12;
+            eye.squeeze_release_delta = 0.06;
+        }
+        // Gaze is valid, but native absolute openness is unavailable: this
+        // exercises normalize()'s per-eye fast latch and the pair mirror.
+        let gaze = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let no_gaze_profile = GazeEyelidProfile::default();
+        for _ in 0..24 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.60, 0.0, 0.12, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        for raw in [0.54f32, 0.50] {
+            state.process_frame_with_profiles(
+                [[1.0, raw, 0.0, 0.30, 0.0], [1.0, 0.60, 0.0, 0.12, 0.0]],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+            assert!(!state.eyes[0].wink_active);
+            assert!(!state.eyes[1].wink_active);
+        }
+
+        let mut saw_fast_commit = false;
+        for raw in [0.48f32, 0.44, 0.40, 0.36, 0.36, 0.36, 0.36] {
+            let out = state.process_frame_with_profiles(
+                [[1.0, raw, 0.0, 0.30, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+            assert!(!state.eyes[0].wink_active);
+            assert!(!state.eyes[1].wink_active);
+            assert_eq!(out[0].openness.to_bits(), out[1].openness.to_bits());
+            if state.eyes.iter().any(|eye| eye.fast_blink_frames > 0) {
+                saw_fast_commit = true;
+                assert!(
+                    state.eyes.iter().all(|eye| eye.fast_blink_frames > 0),
+                    "a bilateral squeezed close left one per-eye fast latch behind"
+                );
+            }
+        }
+        assert!(
+            saw_fast_commit,
+            "test sequence never exercised the fast latch"
+        );
+    }
+
+    #[test]
+    fn bilateral_squeeze_never_becomes_two_winks() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: true,
+            endpoint_calibrated_unix: 1,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        state.tuning.alpha_close = 1.0;
+        state.tuning.alpha_open = 1.0;
+        state.tuning.smoothing = 0.0;
+        let mut wink = WinkProfile::default();
+        for eye in &mut wink.eyes {
+            eye.enabled = true;
+            eye.wink_depth = 0.15;
+            eye.squeeze_enabled = true;
+            eye.squeeze_enter_delta = 0.12;
+            eye.squeeze_release_delta = 0.06;
+        }
+        let gaze = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let no_gaze_profile = GazeEyelidProfile::default();
+        for _ in 0..120 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.60, 0.0, 0.12, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        for step in 1..=10 {
+            let raw = 0.60 - 0.01 * step as f32;
+            state.process_frame_with_profiles(
+                [[1.0, raw, 0.0, 0.56, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        for _ in 0..8 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.50, 0.0, 0.56, 0.0]; 2],
+                &gaze,
+                true,
+                &no_gaze_profile,
+                &wink,
+            );
+        }
+        assert!(!state.eyes[0].wink_active);
+        assert!(!state.eyes[1].wink_active);
+    }
+
+    #[test]
+    fn squeeze_correlated_wink_cannot_retrain_bilateral_endpoint() {
+        let mut state = SRanipalState::new();
+        let endpoint = CalibSnapshot {
+            baseline: 0.60,
+            baseline_n: 100,
+            frame_count: 1000,
+            blink_depth: 0.25,
+            mid_anchor: 0.5,
+            learned_once: true,
+            endpoint_locked: false,
+            endpoint_calibrated_unix: 0,
+        };
+        state.restore(Eye::Left, endpoint);
+        state.restore(Eye::Right, endpoint);
+        state.tuning.continuous_calib = true;
+        let gaze = gaze_lr([0.0, 0.0, -1.0], [0.0, 0.0, -1.0]);
+        let profile = GazeEyelidProfile::default();
+        let wink = WinkProfile::default();
+        for _ in 0..120 {
+            state.process_frame_with_profiles(
+                [[1.0, 0.60, 0.0, 0.12, 0.0]; 2],
+                &gaze,
+                true,
+                &profile,
+                &wink,
+            );
+        }
+        let before_depth = state.eyes[0].blink_depth;
+        let before_ref = state.eyes[0].closed_ref;
+        let before_reach = state.eyes[0].reach_env;
+
+        for _ in 0..4 {
+            for step in 1..=15 {
+                let left = 0.60 - 0.01 * step as f32;
+                state.process_frame_with_profiles(
+                    [[1.0, left, 0.0, 0.56, 0.0], [1.0, 0.60, 0.0, 0.12, 0.0]],
+                    &gaze,
+                    true,
+                    &profile,
+                    &wink,
+                );
+            }
+            for _ in 0..30 {
+                state.process_frame_with_profiles(
+                    [[1.0, 0.45, 0.0, 0.56, 0.0], [1.0, 0.60, 0.0, 0.12, 0.0]],
+                    &gaze,
+                    true,
+                    &profile,
+                    &wink,
+                );
+            }
+            for _ in 0..35 {
+                state.process_frame_with_profiles(
+                    [[1.0, 0.60, 0.0, 0.12, 0.0]; 2],
+                    &gaze,
+                    true,
+                    &profile,
+                    &wink,
+                );
+            }
+        }
+        assert_eq!(state.eyes[0].blink_depth.to_bits(), before_depth.to_bits());
+        assert_eq!(state.eyes[0].closed_ref.to_bits(), before_ref.to_bits());
+        assert_eq!(state.eyes[0].reach_env.to_bits(), before_reach.to_bits());
+    }
+
+    #[test]
+    fn response_curve_identity_and_fixed_endpoints() {
+        for x in [0.0f32, 0.1, 0.49, 0.5, 0.73, 1.0] {
+            assert_eq!(apply_response_curve(x, 0.5).to_bits(), x.to_bits());
+        }
+        for midpoint in [CURVE_MID_OUTPUT_MIN, CURVE_MID_OUTPUT_MAX] {
+            assert_eq!(apply_response_curve(0.0, midpoint), 0.0);
+            assert_eq!(apply_response_curve(0.5, midpoint), midpoint);
+            assert_eq!(apply_response_curve(1.0, midpoint), 1.0);
+        }
+    }
+
+    #[test]
+    fn identity_response_profile_is_output_bit_identical() {
+        let mut legacy = SRanipalState::new();
+        let mut profiled = SRanipalState::new();
+        profiled.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, false,
+        );
+        let gaze = GazeSample::default();
+        let sequence = [
+            0.62f32, 0.62, 0.58, 0.52, 0.46, 0.39, 0.39, 0.48, 0.58, 0.62,
+        ];
+        for _ in 0..30 {
+            for raw in sequence {
+                let ml = [[1.0, raw, 0.0, 0.0, 0.0]; 2];
+                let a = legacy.process_frame(ml, &gaze, true);
+                let b = profiled.process_frame(ml, &gaze, true);
+                for i in 0..2 {
+                    assert_eq!(a[i].openness.to_bits(), b[i].openness.to_bits());
+                    assert_eq!(a[i].blink, b[i].blink);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_close_scale_moves_only_the_close_endpoint() {
+        let mut state = SRanipalState::new();
+        for eye in &mut state.eyes {
+            eye.baseline = 0.60;
+            eye.closed_ref = 0.40;
+            eye.blink_depth = 0.20;
+            eye.baseline_n = BASELINE_BOOTSTRAP_N;
+            eye.learned_once = true;
+        }
+        state.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, false,
+        );
+        let ordinary = state.model_response_for_raw(0, 0.46, false);
+        state.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.15; 2], [0.5; 2], 0.0, 1.0, false,
+        );
+        let deeper = state.model_response_for_raw(0, 0.46, false);
+        assert!(deeper > ordinary, "deeper zero point should close later");
+        let effective_close = state.effective_closed_ref(0);
+        assert_eq!(state.model_response_for_raw(0, effective_close, false), 0.0);
+        assert_eq!(state.model_response_for_raw(0, 0.60, false), 1.0);
+        assert_eq!(
+            state.eyes[0].closed_ref, 0.40,
+            "trim must not rewrite calibration"
+        );
+    }
+
+    #[test]
+    fn visual_range_auto_reseat_moves_only_the_open_point() {
+        let mut state = SRanipalState::new();
+        for eye in &mut state.eyes {
+            eye.baseline = 0.60;
+            eye.closed_ref = 0.41;
+            eye.blink_depth = 0.19;
+        }
+        state.set_eyelid_response_tuning(
+            true,
+            [0.03, 0.05],
+            [0.40, 0.32],
+            [1.0; 2],
+            [0.5; 2],
+            0.0,
+            1.0,
+            false,
+        );
+        assert!((state.effective_open_ref(0) - 0.57).abs() < 1e-6);
+        assert!((state.effective_closed_ref(0) - 0.20).abs() < 1e-6);
+        assert!((state.model_response_for_raw(0, 0.57, false) - 1.0).abs() < 1e-5);
+        assert!(state.model_response_for_raw(0, 0.20, false).abs() < 1e-5);
+        assert!((state.effective_open_ref(1) - 0.55).abs() < 1e-6);
+        assert!((state.effective_closed_ref(1) - 0.28).abs() < 1e-6);
+
+        state.session_baseline_offset = [0.04, -0.02];
+        assert!((state.effective_open_ref(0) - 0.61).abs() < 1e-6);
+        assert!((state.effective_closed_ref(0) - 0.20).abs() < 1e-6);
+        assert!((state.effective_open_ref(1) - 0.53).abs() < 1e-6);
+        assert!((state.effective_closed_ref(1) - 0.28).abs() < 1e-6);
+        assert_eq!(
+            state.model_response_for_raw(0, 0.20, false),
+            0.0,
+            "auto reseat must never make the calibrated full close harder to reach"
+        );
+        assert_eq!(
+            state.model_response_for_raw(1, 0.28, false),
+            0.0,
+            "the close floor remains fixed for either offset direction"
+        );
+    }
+
+    #[test]
+    fn shared_snap_gate_delays_special_zero_but_not_tracking_loss() {
+        let mut state = SRanipalState::new();
+        state.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 0.35, false,
+        );
+        let mut samples = [PerEye::default(); 2];
+        for sample in &mut samples {
+            sample.present = true;
+            sample.openness_target = 1.0;
+            sample.model_response = 1.0;
+        }
+        samples[0].openness_target = 0.0;
+        samples[0].model_response = 0.60;
+        samples[0].snap_requested = true;
+        samples[0].snap_reason = ClosureReason::NativeDisable;
+        state.resolve_snap_gate(&mut samples);
+        assert_eq!(samples[0].reason, ClosureReason::BlinkPending);
+        assert_eq!(samples[0].openness_target, 0.60);
+        assert!(!state.eyes[0].response_snap_committed);
+
+        samples[0].openness_target = 0.0;
+        samples[0].model_response = 0.20;
+        samples[0].snap_requested = true;
+        state.resolve_snap_gate(&mut samples);
+        assert_eq!(samples[0].reason, ClosureReason::NativeDisable);
+        assert_eq!(samples[0].openness_target, 0.0);
+        assert!(state.eyes[0].response_snap_committed);
+
+        samples[0].present = false;
+        samples[0].model_response = 0.90;
+        samples[0].snap_requested = false;
+        samples[0].openness_target = 0.90;
+        state.resolve_snap_gate(&mut samples);
+        assert_eq!(samples[0].reason, ClosureReason::TrackingLost);
+        assert_eq!(samples[0].openness_target, 0.0);
+    }
+
+    #[test]
+    fn response_profile_close_time_limits_a_tracking_loss_drop() {
+        let mut instant = SRanipalState::new();
+        let mut slowed = SRanipalState::new();
+        instant.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, false,
+        );
+        slowed.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 120.0, 1.0, false,
+        );
+        feed(&mut instant, 0.62, 240);
+        feed(&mut slowed, 0.62, 240);
+        let lost = [[0.0, 0.62, 0.0, 0.0, 0.0]; 2];
+        let a = instant.process_frame(lost, &GazeSample::default(), true);
+        let b = slowed.process_frame(lost, &GazeSample::default(), true);
+        assert_eq!(a[0].openness, 0.0);
+        assert!(b[0].openness > 0.0 && b[0].openness < 1.0);
+        assert_eq!(
+            slowed.eyelid_live_diag()[0].reason,
+            ClosureReason::TrackingLost
+        );
+    }
+
+    #[test]
+    fn auto_reseat_offset_is_transient_and_never_changes_snapshot() {
+        let mut state = SRanipalState::new();
+        for eye in &mut state.eyes {
+            eye.baseline = 0.60;
+            eye.closed_ref = 0.40;
+            eye.blink_depth = 0.20;
+            eye.baseline_n = BASELINE_BOOTSTRAP_N;
+            eye.learned_once = true;
+            eye.endpoint_locked = true;
+        }
+        state.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, true,
+        );
+        let eye = crate::core::types::EyeSample {
+            gaze: [0.0, 0.0, -1.0],
+            gaze_valid: true,
+            openness: 1.0,
+            openness_valid: true,
+            openness_reported: true,
+            ..Default::default()
+        };
+        let gaze = GazeSample {
+            left: eye,
+            right: eye,
+            ..Default::default()
+        };
+        let ml = [[1.0, 0.54, 0.0, NATIVE_SQ_FLOOR, 0.0]; 2];
+        let before = state.snapshot_all();
+        for _ in 0..540 {
+            state.update_auto_reseat([0.54; 2], &ml, &gaze);
+        }
+        assert!(state.session_baseline_offset[0] < -0.01);
+        assert!(state.session_baseline_offset[1] < -0.01);
+        let after = state.snapshot_all();
+        assert_eq!(
+            before.left.baseline.to_bits(),
+            after.left.baseline.to_bits()
+        );
+        assert_eq!(
+            before.left.blink_depth.to_bits(),
+            after.left.blink_depth.to_bits()
+        );
+        assert_eq!(
+            before.right.baseline.to_bits(),
+            after.right.baseline.to_bits()
+        );
+        assert_eq!(
+            before.right.blink_depth.to_bits(),
+            after.right.blink_depth.to_bits()
+        );
+
+        state.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, false,
+        );
+        assert_eq!(state.session_baseline_offset, [0.0; 2]);
+    }
+
+    #[test]
+    fn appearance_profile_translates_both_endpoints_without_persisting() {
+        let mut state = SRanipalState::new();
+        let before = state.snapshot_all();
+        let open_before = state.effective_open_ref(0);
+        let closed_before = state.effective_closed_ref(0);
+        let baseline_target = [before.left.baseline + 0.06, before.right.baseline - 0.04];
+        for _ in 0..120 {
+            state.update_appearance_profile(Some(baseline_target), Some([0.82, 0.79]));
+        }
+        let open_shift = state.effective_open_ref(0) - open_before;
+        let closed_shift = state.effective_closed_ref(0) - closed_before;
+        assert!((open_shift - 0.06).abs() < 0.002, "{open_shift}");
+        assert!((closed_shift - 0.06).abs() < 0.002, "{closed_shift}");
+        let after = state.snapshot_all();
+        assert_eq!(
+            before.left.baseline.to_bits(),
+            after.left.baseline.to_bits()
+        );
+        assert_eq!(
+            before.right.baseline.to_bits(),
+            after.right.baseline.to_bits()
+        );
+    }
+
+    #[test]
+    fn appearance_profile_fades_out_and_never_stacks_auto_reseat() {
+        let mut state = SRanipalState::new();
+        let target = [state.eyes[0].baseline + 0.05, state.eyes[1].baseline + 0.05];
+        for _ in 0..80 {
+            state.update_appearance_profile(Some(target), None);
+        }
+        assert!(state.appearance_profile_active);
+        state.session_baseline_offset = [0.03, 0.03];
+        state.update_appearance_profile(Some(target), None);
+        assert_eq!(state.session_baseline_offset, [0.0; 2]);
+        for _ in 0..80 {
+            state.update_appearance_profile(None, None);
+        }
+        assert!(!state.appearance_profile_active);
+        assert_eq!(state.appearance_baseline_offset, [0.0; 2]);
+    }
+
+    #[test]
+    fn adopting_recovered_coordinates_preserves_both_endpoints() {
+        let mut state = SRanipalState::new();
+        state.eyes[0].baseline = 0.50;
+        state.eyes[1].baseline = 0.55;
+        state.set_eyelid_response_tuning(
+            true, [0.03; 2], [0.30; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, false,
+        );
+        for _ in 0..120 {
+            state.update_appearance_profile(Some([0.60, 0.45]), None);
+        }
+        let open = [state.effective_open_ref(0), state.effective_open_ref(1)];
+        let close = [state.effective_closed_ref(0), state.effective_closed_ref(1)];
+        state.adopt_current_appearance();
+        assert_eq!(state.appearance_baseline_offset, [0.0; 2]);
+        for i in 0..2 {
+            assert!((state.effective_open_ref(i) - open[i]).abs() < 1e-6);
+            assert!((state.effective_closed_ref(i) - close[i]).abs() < 1e-6);
+        }
+        assert!((state.effective_open_ref(0) - 0.57).abs() < 1e-5);
+    }
+
+    #[test]
+    fn auto_reseat_accepts_manual_range_without_recorded_endpoint_lock() {
+        let mut state = SRanipalState::new();
+        for eye in &mut state.eyes {
+            eye.baseline = 0.60;
+            eye.closed_ref = 0.40;
+            eye.blink_depth = 0.20;
+            eye.baseline_n = BASELINE_BOOTSTRAP_N;
+            assert!(!eye.learned_once);
+            assert!(!eye.endpoint_locked);
+        }
+        state.set_eyelid_response_tuning(
+            true, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, true,
+        );
+        let eye = crate::core::types::EyeSample {
+            gaze: [0.0, 0.0, -1.0],
+            gaze_valid: true,
+            openness: 1.0,
+            openness_valid: true,
+            openness_reported: true,
+            ..Default::default()
+        };
+        let gaze = GazeSample {
+            left: eye,
+            right: eye,
+            ..Default::default()
+        };
+        let ml = [[1.0, 0.54, 0.0, NATIVE_SQ_FLOOR, 0.0]; 2];
+        for _ in 0..540 {
+            state.update_auto_reseat([0.54; 2], &ml, &gaze);
+        }
+        assert!(state.session_baseline_offset[0] < -0.01);
+        assert!(state.session_baseline_offset[1] < -0.01);
+    }
+
+    #[test]
+    fn auto_reseat_rejects_a_stable_unilateral_partial_close() {
+        let mut state = SRanipalState::new();
+        for eye in &mut state.eyes {
+            eye.baseline = 0.60;
+            eye.closed_ref = 0.40;
+            eye.blink_depth = 0.20;
+            eye.baseline_n = BASELINE_BOOTSTRAP_N;
+            eye.learned_once = true;
+            eye.endpoint_locked = true;
+        }
+        state.set_eyelid_response_tuning(
+            false, [0.03; 2], [0.40; 2], [1.0; 2], [0.5; 2], 0.0, 1.0, true,
+        );
+        let open = crate::core::types::EyeSample {
+            gaze: [0.0, 0.0, -1.0],
+            gaze_valid: true,
+            openness: 1.0,
+            openness_valid: true,
+            openness_reported: true,
+            ..Default::default()
+        };
+        let gaze = GazeSample {
+            left: open,
+            right: open,
+            ..Default::default()
+        };
+        let ml = [
+            [1.0, 0.55, 0.0, NATIVE_SQ_FLOOR, 0.0],
+            [1.0, 0.60, 0.0, NATIVE_SQ_FLOOR, 0.0],
+        ];
+        for _ in 0..600 {
+            state.update_auto_reseat([0.55, 0.60], &ml, &gaze);
+        }
+        assert_eq!(state.session_baseline_offset, [0.0; 2]);
+        assert_eq!(state.reseat_stable_frames, 0);
     }
 }

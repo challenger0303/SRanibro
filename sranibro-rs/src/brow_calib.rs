@@ -203,6 +203,8 @@ pub struct BrowCalib {
     captured: u32,
     /// Wall-clock instant the current phase was entered (rest countdown source).
     entered: Instant,
+    /// Pausing freezes preparation timers and rejects source-history frames until resume.
+    paused_at: Option<Instant>,
     /// Monotonic per-session sequence counter for unique filenames.
     seq: u64,
     /// True once the NEUTRAL reference frames have been written (one-shot).
@@ -228,6 +230,7 @@ impl BrowCalib {
             idx: None,
             captured: 0,
             entered: Instant::now(),
+            paused_at: None,
             seq: 0,
             ref_saved: false,
             rows: Vec::new(),
@@ -292,6 +295,7 @@ impl BrowCalib {
         self.idx = Some(0);
         self.captured = 0;
         self.entered = Instant::now();
+        self.paused_at = None;
         self.seq = 0;
         self.ref_saved = false;
         self.rows.clear();
@@ -303,6 +307,7 @@ impl BrowCalib {
     pub fn abort(&mut self) {
         let _ = self.clear_capture_artifacts();
         self.idx = None;
+        self.paused_at = None;
         self.captured = 0;
         self.rows.clear();
         self.ref_saved = false;
@@ -311,11 +316,45 @@ impl BrowCalib {
 
     /// Advance wall-clock-driven phases (REST). Call every UI frame. Capture phases advance
     /// via [`BrowCalib::on_frame`]; this is a no-op for them.
+    pub fn pause(&mut self) {
+        if self.is_running() && self.paused_at.is_none() {
+            self.paused_at = Some(Instant::now());
+        }
+    }
+
+    pub fn resume(&mut self) {
+        let Some(paused_at) = self.paused_at.take() else {
+            return;
+        };
+        let now = Instant::now();
+        let paused_for = now.saturating_duration_since(paused_at);
+        self.entered = self.entered.checked_add(paused_for).unwrap_or(now);
+    }
+
+    pub fn suspend_for(&mut self, duration: Duration) {
+        if !self.is_running() || self.paused_at.is_some() || duration.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        self.entered = self.entered.checked_add(duration).unwrap_or(now);
+    }
+
     pub fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    pub fn tick_at(&mut self, now: Instant) {
+        if self.paused_at.is_some() {
+            return;
+        }
         let Some(i) = self.idx else { return };
         if let Phase::Rest { secs, .. } = PHASES[i] {
-            if self.entered.elapsed() >= Duration::from_secs_f32(secs) {
-                self.advance();
+            let deadline = self
+                .entered
+                .checked_add(Duration::from_secs_f32(secs))
+                .unwrap_or(now);
+            if now >= deadline {
+                self.advance_at(deadline);
             }
         }
     }
@@ -326,6 +365,18 @@ impl BrowCalib {
     ///
     /// `l`/`r` are `(w, h, grayscale_bytes)` at the frame's own resolution.
     pub fn on_frame(&mut self, l: Option<(u32, u32, &[u8])>, r: Option<(u32, u32, &[u8])>) -> u32 {
+        self.on_frame_at(Instant::now(), l, r)
+    }
+
+    pub fn on_frame_at(
+        &mut self,
+        captured_at: Instant,
+        l: Option<(u32, u32, &[u8])>,
+        r: Option<(u32, u32, &[u8])>,
+    ) -> u32 {
+        if self.paused_at.is_some() {
+            return 0;
+        }
         let Some(i) = self.idx else { return 0 };
         let Phase::Capture { spec, .. } = PHASES[i] else {
             return 0;
@@ -371,7 +422,7 @@ impl BrowCalib {
             self.seq += 1;
             self.captured += 1;
             if self.captured >= spec.target {
-                self.advance();
+                self.advance_at(captured_at);
             }
         }
         written
@@ -405,7 +456,7 @@ impl BrowCalib {
     }
 
     /// Move to the next phase; on entering DONE, flush labels.csv.
-    fn advance(&mut self) {
+    fn advance_at(&mut self, entered: Instant) {
         let Some(i) = self.idx else { return };
         let next = i + 1;
         if next >= PHASES.len() {
@@ -414,7 +465,7 @@ impl BrowCalib {
             self.idx = Some(next);
         }
         self.captured = 0;
-        self.entered = Instant::now();
+        self.entered = entered;
         if self.is_done() {
             if let Err(e) = self.flush_labels() {
                 self.last_error = Some(format!("labels.csv: {e}"));
@@ -440,7 +491,9 @@ impl BrowCalib {
         };
         match PHASES[i] {
             Phase::Rest { secs, instruction } => {
-                let remaining = (secs - self.entered.elapsed().as_secs_f32()).max(0.0);
+                let now = self.paused_at.unwrap_or_else(Instant::now);
+                let elapsed = now.saturating_duration_since(self.entered).as_secs_f32();
+                let remaining = (secs - elapsed).max(0.0);
                 Status::Rest {
                     instruction,
                     remaining,

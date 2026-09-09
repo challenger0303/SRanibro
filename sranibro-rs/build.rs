@@ -8,6 +8,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=assets/sranibro.ico");
     println!("cargo:rerun-if-env-changed=PROFILE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PSVR2_ONLY");
     let profile = std::env::var("PROFILE").expect("Cargo did not provide PROFILE to build.rs");
     println!("cargo:rustc-env=SRANIBRO_BUILD_PROFILE={profile}");
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
@@ -19,8 +20,18 @@ fn main() {
     watch_git_identity(manifest_dir);
     #[cfg(windows)]
     {
+        let psvr2_only = std::env::var_os("CARGO_FEATURE_PSVR2_ONLY").is_some();
+        let (product, filename) = if psvr2_only {
+            ("SRanibro PSVR2 Beta", "SRanibro-PSVR2-Beta.exe")
+        } else {
+            ("SRanibro", "SRanibro.exe")
+        };
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/sranibro.ico");
+        res.set("ProductName", product)
+            .set("FileDescription", product)
+            .set("OriginalFilename", filename)
+            .set("LegalCopyright", "Copyright © 2026 challenger0303");
         if let Err(e) = res.compile() {
             println!("cargo:warning=app icon not embedded ({e})");
         }

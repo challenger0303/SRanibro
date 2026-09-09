@@ -1,4 +1,10 @@
 /target
+/target_*/
+/target-*/
+/src/private_*
+*.dll
+*.exe
+*.pdb
 /research-output
 __pycache__/
 *.pyc

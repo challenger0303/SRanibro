@@ -75,10 +75,12 @@ pub struct BrokenEyeStatus {
     pub frames: AtomicU64,
     /// Live filter window sent to the VRCFT module in every JSON frame.
     pub filter_samples: AtomicU32,
+    /// Live native-SRanipal-style EyeWide/EyeSquint -> eyebrow mapping request.
+    pub sranipal_brow_link: AtomicBool,
 }
 
 /// One eye's already-clamped values, ready to serialize (BrokenEye convention:
-/// gaze X is negated, openness 0 on blink, everything clamped).
+/// gaze X is negated and every numeric field is clamped).
 #[derive(Clone, Copy)]
 struct EyeJson {
     gaze: [f32; 2],
@@ -117,6 +119,18 @@ fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
     v.max(lo).min(hi)
 }
 
+/// The core has already resolved blink/dropout policy and any user-selected close
+/// slew into `EyeResult::openness`. `blink` remains semantic state for gaze gating;
+/// forcing zero again in a sink would bypass the configured minimum closing time.
+fn emitted_openness(r: &EyeResult) -> f32 {
+    let openness = clamp(r.openness, 0.0, 1.0);
+    if r.blink && openness < 0.08 {
+        0.0
+    } else {
+        openness
+    }
+}
+
 fn append_eye(buf: &mut String, e: &EyeJson) {
     use std::fmt::Write;
     let _ = write!(
@@ -147,7 +161,7 @@ fn eye_json(r: &EyeResult) -> EyeJson {
         gaze_valid: r.gaze_valid && (!r.blink || r.gaze_yoked),
         pupil_mm: r.pupil_mm.max(0.0),
         pupil_valid: r.pupil_valid,
-        openness: clamp(if r.blink { 0.0 } else { r.openness }, 0.0, 1.0),
+        openness: emitted_openness(r),
         openness_valid: r.openness_valid || r.blink,
         wide: clamp(r.wide, 0.0, 1.0),
         squeeze: clamp(r.squeeze, 0.0, 1.0),
@@ -177,6 +191,19 @@ mod broken_eye_json_tests {
     }
 
     #[test]
+    fn brokeneye_loopback_server_reports_and_releases_ephemeral_port() {
+        let sink = BrokenEyeSink::new(0, 0).unwrap();
+        let port = sink.status().port;
+        assert_ne!(port, 0);
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert!(client.local_addr().unwrap().ip().is_loopback());
+        drop(client);
+        drop(sink);
+        TcpListener::bind(("127.0.0.1", port))
+            .expect("dropping the VRCFT sink must release its loopback port");
+    }
+
+    #[test]
     fn brokeneye_stereo_frame_publishes_both_wide_values_together() {
         let mut sink = BrokenEyeSink::new(0, 0).unwrap();
         let mut left = EyeResult::new(Eye::Left);
@@ -189,6 +216,60 @@ mod broken_eye_json_tests {
         let frame = *sink.data.lock().unwrap();
         assert_eq!(frame[0].wide, 0.75);
         assert_eq!(frame[1].wide, 0.75);
+    }
+
+    #[test]
+    fn brokeneye_stream_switches_sranipal_brow_link_live() {
+        fn read_json(stream: &mut TcpStream) -> String {
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).unwrap();
+            assert_eq!(header[0], MODE_JSON);
+            let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload).unwrap();
+            String::from_utf8(payload).unwrap()
+        }
+
+        let sink = BrokenEyeSink::new(0, 0).unwrap();
+        let status = sink.status();
+        let mut client = TcpStream::connect(("127.0.0.1", status.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client.write_all(&[MODE_JSON]).unwrap();
+
+        assert!(
+            read_json(&mut client).contains("\"sranipal_brow_link\":false"),
+            "the safe default must leave eyebrow shapes untouched"
+        );
+
+        status.sranipal_brow_link.store(true, Ordering::Relaxed);
+        let switched =
+            (0..4).any(|_| read_json(&mut client).contains("\"sranipal_brow_link\":true"));
+        assert!(
+            switched,
+            "the VRCFT control flag must change without reconnecting"
+        );
+    }
+
+    #[test]
+    fn blink_semantics_do_not_bypass_the_core_close_slew() {
+        let mut result = EyeResult::new(Eye::Left);
+        result.openness = 0.625;
+        result.openness_valid = true;
+        result.gaze_valid = true;
+        result.blink = true;
+
+        let encoded = eye_json(&result);
+        assert_eq!(encoded.openness, 0.625);
+        assert!(encoded.openness_valid);
+        assert!(
+            !encoded.gaze_valid,
+            "blink remains available for gaze gating"
+        );
+
+        result.openness = 0.04;
+        assert_eq!(eye_json(&result).openness, 0.0);
     }
 }
 
@@ -209,7 +290,10 @@ const MODE_JSON: u8 = 0x00;
 
 impl BrokenEyeSink {
     pub fn new(port: u16, filter_samples: u8) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
+        // VRCFaceTracking is a same-machine consumer. Eye/gaze/expression data must
+        // never be exposed to the LAN merely because the host has a public interface.
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
+        let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let data = Arc::new(Mutex::new([EyeJson::default(); 2]));
         let status = Arc::new(BrokenEyeStatus {
@@ -236,7 +320,7 @@ impl BrokenEyeSink {
                 }
                 // listener drops here (loop exited) -> port freed.
             })?;
-        eprintln!("[vrcft] VRCFT server listening on 0.0.0.0:{port}");
+        eprintln!("[vrcft] VRCFT server listening on 127.0.0.1:{port}");
         Ok(Self {
             data,
             status,
@@ -295,7 +379,11 @@ fn spawn_client(
             json.clear();
             use std::fmt::Write as _;
             let samples = status.filter_samples.load(Ordering::Relaxed).min(30);
-            let _ = write!(json, "{{\"noise_filter_samples\":{samples},\"left\":");
+            let brow_link = status.sranipal_brow_link.load(Ordering::Relaxed);
+            let _ = write!(
+                json,
+                "{{\"noise_filter_samples\":{samples},\"sranipal_brow_link\":{brow_link},\"left\":"
+            );
             append_eye(&mut json, &l);
             json.push_str(",\"right\":");
             append_eye(&mut json, &r);
@@ -334,7 +422,7 @@ impl OutputSink for BrokenEyeSink {
             gaze_valid: r.gaze_valid && (!r.blink || r.gaze_yoked),
             pupil_mm: r.pupil_mm.max(0.0),
             pupil_valid: r.pupil_valid,
-            openness: clamp(if r.blink { 0.0 } else { r.openness }, 0.0, 1.0),
+            openness: emitted_openness(r),
             openness_valid: r.openness_valid || r.blink,
             wide: clamp(r.wide, 0.0, 1.0),
             squeeze: clamp(r.squeeze, 0.0, 1.0),
@@ -467,10 +555,7 @@ impl OutputSink for OscSink {
         let gx = clamp(-r.gaze[0], -1.0, 1.0);
         let gy = clamp(r.gaze[1], -1.0, 1.0);
         if self.eyes_enabled {
-            self.send(
-                &format!("EyeLid{side}"),
-                clamp(if r.blink { 0.0 } else { r.openness }, 0.0, 1.0),
-            );
+            self.send(&format!("EyeLid{side}"), emitted_openness(r));
             self.send(&format!("EyeWide{side}"), clamp(r.wide, 0.0, 1.0));
             self.send(&format!("EyeSquint{side}"), clamp(r.squeeze, 0.0, 1.0));
 

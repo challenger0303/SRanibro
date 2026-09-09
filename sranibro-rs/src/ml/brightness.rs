@@ -1,14 +1,8 @@
-//! Adaptive per-user brightness + contrast normalization for the eye ML input.
+//! Fixed manual brightness plus legacy adaptive-normalization helpers.
 //!
-//! Lens-to-eye distance varies per person (and per HMD reseat), so the IR image's overall
-//! brightness/contrast drifts — and the openness model reads "brighter = more open" (per
-//! the response heatmap), so that drift biases openness. We hold the input at a learned
-//! target with an affine `out = a*in + b`, where the SOURCE is a SLOWLY-adapted per-user
-//! baseline (so lens-distance drift is corrected) and fast changes — blinks — pass through
-//! unchanged (the transform is fixed on the slow baseline, so a darker blink frame maps
-//! below the target = still dark). Robust stats (median + inter-percentile spread) over a
-//! central ROI make it insensitive to the few remaining specular pixels. Runs AFTER
-//! despeckle, on the native-resolution frame. See [`crate::core::types::BrightnessNorm`].
+//! Production composes only `manual_gain`; it never adapts brightness from live images.
+//! The older adaptive functions remain isolated here for config compatibility and research
+//! tests, but the ML pipeline does not call them.
 
 use crate::core::types::BrightnessNorm;
 
@@ -16,6 +10,33 @@ use crate::core::types::BrightnessNorm;
 const ROI: f32 = 0.625;
 /// Frames (~60Hz ML) the baseline settles before the target is auto-captured (~1.5s).
 pub const WARMUP: u32 = 90;
+
+/// Bounded manual exposure range. This is intentionally wider on the bright side because
+/// a larger lens-to-eye distance can make the whole IR image substantially dimmer.
+pub const MANUAL_GAIN_MIN: f32 = 0.5;
+pub const MANUAL_GAIN_MAX: f32 = 2.0;
+
+/// Resolve a persisted manual exposure value safely. Missing and non-finite values use
+/// the current standard from [`BrightnessNorm::default`].
+pub fn sanitize_manual_gain(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MANUAL_GAIN_MIN, MANUAL_GAIN_MAX)
+    } else {
+        BrightnessNorm::default().manual_gain
+    }
+}
+
+/// Compose the fixed manual exposure after the adaptive affine. If adaptive correction
+/// produced `a*x + b`, the actual model input becomes `gain * (a*x + b)`. Keeping the
+/// composed affine in the shared snapshot makes previews and calibration recordings match
+/// live inference exactly.
+pub fn compose_manual_gain(affine: &mut [(f32, f32); 2], value: f32) {
+    let gain = sanitize_manual_gain(value);
+    for (a, b) in affine {
+        *a *= gain;
+        *b *= gain;
+    }
+}
 
 /// Runtime (non-persisted) per-eye baseline the normalizer adapts — the SOURCE. The
 /// persisted target + params live in [`BrightnessNorm`] (config); this is transient state
@@ -34,6 +55,9 @@ pub struct BrightState {
     omax_init: bool,
     /// Consecutive frames this eye has been a GOOD capture frame (open + relaxed brightness).
     good_streak: u32,
+    /// The runtime has observed a captured target. A later `captured = false` is therefore
+    /// an explicit recapture request and must also clear this otherwise-stale baseline.
+    target_seen: bool,
 }
 
 impl Default for BrightState {
@@ -47,6 +71,7 @@ impl Default for BrightState {
             omax: 0.5,
             omax_init: false,
             good_streak: 0,
+            target_seen: false,
         }
     }
 }
@@ -111,7 +136,7 @@ pub fn update(st: &mut BrightState, frame: &[u8], w: usize, h: usize, adapt: f32
     // the affine then BRIGHTENED a closed eye (openness spiked up while shut) or DIMMED a wide
     // eye (wide stopped firing after a few tries) — the two reported regressions. A genuine
     // reseat is a PERSISTENT shift, so the slow out-of-band rate still re-anchors it over ~a
-    // minute (or hit "Recapture reference" for instant).
+    // minute (or use "Recapture reference" to rebuild a fresh baseline in ~2s).
     let dev = lvl - st.base_level;
     let gate = (0.8 * st.base_spread).clamp(6.0, 22.0);
     st.in_band = dev.abs() <= gate;
@@ -176,6 +201,12 @@ pub fn step(
     if !norm.enabled {
         return [(1.0, 0.0), (1.0, 0.0)];
     }
+    // The UI requests a recapture by clearing `captured`. Previously this kept the old
+    // runtime baseline, so a genuine reseat was classified as a held expression and could
+    // remain outside the capture band for minutes. Reset transient evidence exactly once.
+    if !norm.captured && states.iter().any(|state| state.target_seen) {
+        *states = [BrightState::default(); 2];
+    }
     for i in 0..2 {
         let (f, w, h) = frames[i];
         update(&mut states[i], f, w, h, norm.adapt);
@@ -225,6 +256,9 @@ pub fn step(
                 norm.strength,
             );
         }
+    }
+    for state in states.iter_mut() {
+        state.target_seen = norm.captured;
     }
     out
 }
@@ -284,6 +318,45 @@ mod tests {
             mapped > 130.0,
             "dim baseline brightened toward target, got {mapped}"
         );
+    }
+
+    #[test]
+    fn manual_gain_is_post_adaptive_and_safely_bounded() {
+        let mut affine = [(1.2, -8.0), (0.8, 12.0)];
+        compose_manual_gain(&mut affine, 1.25);
+        assert_eq!(affine, [(1.5, -10.0), (1.0, 15.0)]);
+
+        let mut invalid = [(1.0, 3.0), (2.0, -4.0)];
+        compose_manual_gain(&mut invalid, f32::NAN);
+        assert_eq!(invalid, [(1.6, 4.8), (3.2, -6.4)]);
+        assert_eq!(sanitize_manual_gain(0.1), MANUAL_GAIN_MIN);
+        assert_eq!(sanitize_manual_gain(9.0), MANUAL_GAIN_MAX);
+    }
+
+    #[test]
+    fn recapture_clears_the_stale_runtime_baseline_once() {
+        let mut norm = BrightnessNorm {
+            enabled: true,
+            captured: true,
+            ..BrightnessNorm::default()
+        };
+        let frame = vec![80u8; 200 * 200];
+        let pair = [
+            (&frame[..], 200usize, 200usize),
+            (&frame[..], 200usize, 200usize),
+        ];
+        let mut states = [BrightState::default(); 2];
+        step(&mut states, pair, [0.8, 0.8], &mut norm);
+        assert!(states.iter().all(|state| state.target_seen));
+
+        norm.captured = false;
+        step(&mut states, pair, [0.8, 0.8], &mut norm);
+        assert!(states.iter().all(|state| state.warm == 1));
+        assert!(states.iter().all(|state| !state.target_seen));
+
+        // The next frame advances normally instead of resetting on every frame.
+        step(&mut states, pair, [0.8, 0.8], &mut norm);
+        assert!(states.iter().all(|state| state.warm == 2));
     }
 
     #[test]

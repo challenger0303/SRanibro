@@ -1,51 +1,102 @@
-//! Brow post-processing: turn the raw brow CNN output into the emitted signed brow
-//! expression per eye. Runs in the emit thread (which owns the blink flag + recenter).
+//! Brow post-processing: turn the raw brow CNN output into the emitted signed
+//! expression per eye. This runs in the 120 Hz emit thread, but advances only
+//! when the event-driven brow worker publishes a genuinely new stereo inference.
 //!
-//! The signal is "deviation of your eye-shape from neutral". This stage:
-//! 1. EMA-smooths the RAW output, but ONLY on a new, NON-blink inference — a blink
-//!    deforms the eye, so a blink sample must never enter the filter or the baseline
-//!    (otherwise the eye spikes on reopening).
-//! 2. Subtracts a frozen NEUTRAL baseline captured (from the smoothed value) on the
-//!    first open frame and re-captured on recenter.
-//! 3. BLINK-GATES: during a blink hold the last open value briefly, then decay to neutral.
-//! 4. Applies an optional power curve (deadzone).
+//! The old standalone eyebrow tracker was stable because it used a continuous,
+//! fixed-response EMA and a real neutral deadzone. The previous in-app path used
+//! a fast/calm EMA switch plus a moving output deadband; noisy CLAHE input could
+//! therefore sit still for several frames and then jump ("stick-slip"). This
+//! implementation restores the old signal shape without changing the input
+//! preprocessing expected by the current trained model:
 //!
-//! `process` returns `None` until the first real inference + neutral are available, so the
-//! pipeline never emits a brow value derived from a zero placeholder.
+//! 1. EMA response is time-based, so 60, 90 and 120 Hz camera sources have the
+//!    same latency.
+//! 2. Neutral is averaged from a short run of open-eye samples, not one frame.
+//! 3. A fixed neutral deadzone removes small noise continuously; there is no
+//!    moving deadband at the destination.
+//! 4. Blink samples never enter the EMA or baseline. The last open expression is
+//!    held for the entire blink instead of decaying and visibly twitching.
+//!
+//! `process` returns `None` until a stable neutral baseline exists, so the
+//! pipeline never emits a value derived from a zero placeholder.
 
-/// Frames (at the ~120 Hz emit rate) to HOLD the last value when a blink starts
-/// (~125 ms), then to DECAY it to neutral over (~375 ms more).
-const HOLD_FRAMES: u16 = 15;
-const DECAY_FRAMES: u16 = 45;
-/// A raw-model residual above this is deliberate motion and keeps the fast EMA.
-const MOTION_RAW: f32 = 0.10;
-/// Position-independent output hysteresis. Unlike the neutral deadzone this follows the
-/// expression across the whole range, suppressing small oscillation after the brow arrives.
-const SETTLE_DEADBAND: f32 = 0.015;
+/// Old tracker setting `smooth = 68` meant alpha=0.32 at its effective 100 Hz
+/// update rate (about 26 ms). The current model must retain its noisier CLAHE
+/// preprocessing, so replay of its recorded sequences uses twice that constant:
+/// still responsive, but with old-tracker-like peak step noise.
+const DEFAULT_EMA_TAU_S: f32 = 0.052;
+/// Match the old tracker's per-eye neutral deadzone.
+const DEFAULT_DEADZONE: f32 = 0.10;
+/// Roughly 100 ms at 120 Hz: long enough not to use a noisy single frame, short
+/// enough that brow output becomes ready immediately after startup/recenter.
+const BASELINE_SAMPLES: u16 = 12;
+/// If the filtered signal moves substantially while neutral is being captured,
+/// restart the short window instead of averaging an eyebrow gesture into neutral.
+const BASELINE_MAX_SPAN: f32 = 0.12;
+const FALLBACK_INFER_DT_S: f32 = 1.0 / 120.0;
 
 #[derive(Default)]
 struct Eye {
     ema: f32,
     have_ema: bool,
     neutral: Option<f32>,
-    last: f32, // last non-blink centered value (held through a blink)
-    have_last: bool,
-    blink_frames: u16,
+    neutral_sum: f32,
+    neutral_samples: u16,
+    neutral_min: f32,
+    neutral_max: f32,
     output: f32,
     have_output: bool,
 }
 
+impl Eye {
+    fn reset_neutral(&mut self) {
+        self.neutral = None;
+        self.neutral_sum = 0.0;
+        self.neutral_samples = 0;
+        self.neutral_min = 0.0;
+        self.neutral_max = 0.0;
+        self.output = 0.0;
+        self.have_output = false;
+    }
+
+    fn add_neutral_sample(&mut self) {
+        let value = self.ema;
+        if self.neutral_samples == 0 {
+            self.neutral_sum = value;
+            self.neutral_samples = 1;
+            self.neutral_min = value;
+            self.neutral_max = value;
+            return;
+        }
+
+        let min = self.neutral_min.min(value);
+        let max = self.neutral_max.max(value);
+        if max - min > BASELINE_MAX_SPAN {
+            // Start a fresh stable suffix at the newest value.
+            self.neutral_sum = value;
+            self.neutral_samples = 1;
+            self.neutral_min = value;
+            self.neutral_max = value;
+            return;
+        }
+
+        self.neutral_sum += value;
+        self.neutral_samples += 1;
+        self.neutral_min = min;
+        self.neutral_max = max;
+        if self.neutral_samples >= BASELINE_SAMPLES {
+            self.neutral = Some(self.neutral_sum / self.neutral_samples as f32);
+        }
+    }
+}
+
 pub struct BrowState {
     eyes: [Eye; 2],
-    /// EMA factor per NEW inference (0..1).
-    alpha: f32,
-    /// Stronger smoothing for small residuals around a held expression.
-    calm_alpha: f32,
-    /// Exact neutral zone before the power curve.
+    /// Continuous-time EMA constant in seconds.
+    tau_s: f32,
+    /// Exact neutral zone before the response curve.
     deadzone: f32,
-    /// Moving deadband around the last published non-neutral expression.
-    settle_deadband: f32,
-    /// Power-curve exponent. Guarded: non-finite or <=0 falls back to linear.
+    /// Same optional power curve used by the old tracker (default Curve=5).
     gamma: f32,
 }
 
@@ -53,27 +104,34 @@ impl Default for BrowState {
     fn default() -> Self {
         Self {
             eyes: Default::default(),
-            alpha: 0.5,
-            calm_alpha: 0.08,
-            deadzone: 0.03,
-            settle_deadband: SETTLE_DEADBAND,
-            // Matches vr_eyebrow's default Curve=5 (gamma=1.5): small model noise is
-            // compressed while full gestures still reach exactly +/-1.
+            tau_s: DEFAULT_EMA_TAU_S,
+            deadzone: DEFAULT_DEADZONE,
             gamma: 1.5,
         }
     }
 }
 
 impl BrowState {
-    /// Re-capture the neutral baseline (and clear blink/hold state) on the next open
-    /// sample for both eyes. Keeps the EMA (only the baseline is re-learned).
+    /// Re-capture the neutral baseline on the next stable run of open samples.
+    /// The EMA itself is retained so recenter never introduces a filter jump.
     pub fn recenter(&mut self) {
-        for e in &mut self.eyes {
-            e.neutral = None;
-            e.have_last = false;
-            e.blink_frames = 0;
-            e.have_output = false;
+        for eye in &mut self.eyes {
+            eye.reset_neutral();
         }
+    }
+
+    fn alpha(&self, infer_dt_s: f32) -> f32 {
+        let tau = self.tau_s;
+        if !tau.is_finite() || tau <= 1.0e-6 {
+            return 1.0;
+        }
+        let dt = if infer_dt_s.is_finite() && infer_dt_s > 0.0 {
+            infer_dt_s
+        } else {
+            FALLBACK_INFER_DT_S
+        }
+        .clamp(1.0 / 1000.0, 0.100);
+        (1.0 - (-dt / tau).exp()).clamp(0.0, 1.0)
     }
 
     fn curve(&self, x: f32) -> f32 {
@@ -88,17 +146,19 @@ impl BrowState {
             return 0.0;
         }
         let magnitude = ((magnitude - deadzone) / (1.0 - deadzone)).clamp(0.0, 1.0);
-        let g = self.gamma;
-        if !g.is_finite() || g <= 0.0 || (g - 1.0).abs() < 1e-3 {
+        let gamma = self.gamma;
+        if !gamma.is_finite() || gamma <= 0.0 || (gamma - 1.0).abs() < 1.0e-3 {
             x.signum() * magnitude
         } else {
-            x.signum() * magnitude.powf(g)
+            x.signum() * magnitude.powf(gamma)
         }
     }
 
-    /// Process one eye. `is_new` = a fresh inference arrived this tick (gate the EMA so
-    /// it advances once per inference, not per emit tick). `blink` holds/decays the
-    /// output and is excluded from the EMA + baseline. Returns `None` until ready.
+    /// Process one eye.
+    ///
+    /// `is_new` means the worker produced a new stereo inference; `infer_dt_s`
+    /// is the elapsed time since the previous inference. Emit-only ticks never
+    /// advance the EMA. Blink frames are held and excluded from all learning.
     pub fn process(
         &mut self,
         eye: usize,
@@ -106,85 +166,45 @@ impl BrowState {
         is_new: bool,
         blink: bool,
         recenter: bool,
+        infer_dt_s: f32,
     ) -> Option<f32> {
         if recenter {
-            let e = &mut self.eyes[eye];
-            e.neutral = None;
-            e.have_last = false;
-            e.blink_frames = 0;
-            e.have_output = false;
+            self.eyes[eye].reset_neutral();
         }
-        // Advance the EMA + capture neutral ONLY on a fresh, non-blink, finite sample.
-        if is_new && !blink && raw.is_finite() {
-            let e = &mut self.eyes[eye];
-            if e.have_ema {
-                let residual = raw - e.ema;
-                let alpha = if residual.abs() >= MOTION_RAW {
-                    self.alpha
-                } else {
-                    self.calm_alpha.min(self.alpha)
-                }
-                .clamp(0.0, 1.0);
-                e.ema += alpha * residual;
-            } else {
-                e.ema = raw;
-                e.have_ema = true;
-            }
-            if e.neutral.is_none() {
-                e.neutral = Some(e.ema);
-            }
-        }
-        let (ema, neutral) = match (self.eyes[eye].have_ema, self.eyes[eye].neutral) {
-            (true, Some(n)) => (self.eyes[eye].ema, n),
-            _ => return None, // not ready: no open inference / baseline yet
-        };
-        if !blink {
-            let c = (ema - neutral).clamp(-1.0, 1.0);
-            let target = self.curve(c);
-            let settle_deadband = if self.settle_deadband.is_finite() {
-                self.settle_deadband.clamp(0.0, 0.10)
-            } else {
-                0.0
-            };
-            let e = &mut self.eyes[eye];
-            e.blink_frames = 0;
-            e.last = c;
-            e.have_last = true;
 
-            // A neutral target must remain an exact zero. Away from neutral, hold the
-            // previous output inside a narrow moving deadband. When deliberate motion
-            // exceeds it, consume only the deadband portion and follow the remainder;
-            // therefore small noise cannot twitch the avatar, while larger changes do
-            // not acquire an accumulating time lag.
-            if !e.have_output || target == 0.0 {
-                e.output = target;
-                e.have_output = true;
+        if is_new && !blink && raw.is_finite() {
+            let alpha = self.alpha(infer_dt_s);
+            let state = &mut self.eyes[eye];
+            if state.have_ema {
+                state.ema += alpha * (raw - state.ema);
             } else {
-                let delta = target - e.output;
-                if delta.abs() > settle_deadband {
-                    e.output = target - delta.signum() * settle_deadband;
-                }
+                state.ema = raw;
+                state.have_ema = true;
             }
-            return Some(e.output);
+            if state.neutral.is_none() {
+                state.add_neutral_sample();
+            }
         }
-        // Blink: hold the last OPEN value, then decay to neutral. If we've never seen an
-        // open frame since (re)start, just sit at neutral.
-        let e = &mut self.eyes[eye];
-        if !e.have_last {
-            return Some(0.0);
-        }
-        let bf = e.blink_frames;
-        e.blink_frames = bf.saturating_add(1);
-        // `output` is already curved + settled. Holding that exact published value avoids
-        // a one-frame jump when a blink begins.
-        let held = e.output;
-        let v = if bf < HOLD_FRAMES {
-            held
-        } else {
-            let t = ((bf - HOLD_FRAMES + 1) as f32 / DECAY_FRAMES as f32).min(1.0);
-            held * (1.0 - t)
+
+        let (ema, neutral) = match (self.eyes[eye].have_ema, self.eyes[eye].neutral) {
+            (true, Some(neutral)) => (self.eyes[eye].ema, neutral),
+            _ => return None,
         };
-        Some(v)
+
+        let state = &mut self.eyes[eye];
+        if blink {
+            // The brow model sees an eye-shaped crop and is not trained to interpret
+            // eyelid occlusion. Holding the last open result is safer than allowing a
+            // blink to pull the brow down and then spring back.
+            return Some(if state.have_output { state.output } else { 0.0 });
+        }
+
+        let centered = (ema - neutral).clamp(-1.0, 1.0);
+        let output = self.curve(centered);
+        let state = &mut self.eyes[eye];
+        state.output = output;
+        state.have_output = true;
+        Some(output)
     }
 }
 
@@ -192,106 +212,173 @@ impl BrowState {
 mod tests {
     use super::*;
 
+    const DT_120: f32 = 1.0 / 120.0;
+
+    fn establish_neutral(state: &mut BrowState, eye: usize, raw: f32) {
+        for index in 0..BASELINE_SAMPLES {
+            let output = state.process(eye, raw, true, false, false, DT_120);
+            if index + 1 < BASELINE_SAMPLES {
+                assert!(output.is_none());
+            } else {
+                assert!(output.unwrap().abs() < 1.0e-6);
+            }
+        }
+    }
+
     #[test]
-    fn not_ready_until_first_open_inference() {
-        let mut b = BrowState::default();
-        // No inference yet -> None.
-        assert!(b.process(0, 0.0, false, false, false).is_none());
-        // A blink-only inference must not establish a baseline.
-        assert!(b.process(0, 0.4, true, true, false).is_none());
-        // First OPEN inference establishes ema+neutral -> ~0.
-        assert!(b.process(0, 0.4, true, false, false).unwrap().abs() < 1e-6);
+    fn not_ready_until_short_open_baseline_exists() {
+        let mut state = BrowState::default();
+        assert!(state.process(0, 0.0, false, false, false, 0.0).is_none());
+        assert!(state.process(0, 0.4, true, true, false, DT_120).is_none());
+        establish_neutral(&mut state, 0, 0.4);
     }
 
     #[test]
     fn neutral_subtracts_and_recenters() {
-        let mut b = BrowState::default();
-        b.alpha = 1.0; // make the EMA track exactly for the test
-        b.deadzone = 0.0;
-        b.settle_deadband = 0.0;
-        b.gamma = 1.0;
-        assert!(b.process(0, 0.4, true, false, false).unwrap().abs() < 1e-6); // neutral=0.4
-        assert!((b.process(0, 0.7, true, false, false).unwrap() - 0.3).abs() < 1e-6);
-        // Recenter re-baselines to the next open sample.
-        assert!(b.process(0, 0.7, true, false, true).unwrap().abs() < 1e-6);
+        let mut state = BrowState::default();
+        state.tau_s = 0.0;
+        state.deadzone = 0.0;
+        state.gamma = 1.0;
+        establish_neutral(&mut state, 0, 0.4);
+        assert!((state.process(0, 0.7, true, false, false, DT_120).unwrap() - 0.3).abs() < 1.0e-6);
+
+        assert!(state.process(0, 0.7, true, false, true, DT_120).is_none());
+        for _ in 1..BASELINE_SAMPLES {
+            state.process(0, 0.7, true, false, false, DT_120);
+        }
+        assert!(
+            state
+                .process(0, 0.7, false, false, false, 0.0)
+                .unwrap()
+                .abs()
+                < 1.0e-6
+        );
     }
 
     #[test]
-    fn blink_holds_then_decays_and_excludes_ema() {
-        let mut b = BrowState::default();
-        b.alpha = 1.0;
-        b.deadzone = 0.0;
-        b.settle_deadband = 0.0;
-        b.gamma = 1.0;
-        b.process(0, 0.0, true, false, false); // neutral 0
-        assert!((b.process(0, 0.8, true, false, false).unwrap() - 0.8).abs() < 1e-6);
-        // A blink sample with a wild raw must NOT move the EMA.
-        for _ in 0..HOLD_FRAMES {
-            assert!((b.process(0, 5.0, true, true, false).unwrap() - 0.8).abs() < 1e-6);
+    fn blink_holds_forever_and_never_contaminates_ema() {
+        let mut state = BrowState::default();
+        state.tau_s = 0.0;
+        state.deadzone = 0.0;
+        state.gamma = 1.0;
+        establish_neutral(&mut state, 0, 0.0);
+        assert_eq!(state.process(0, 0.8, true, false, false, DT_120), Some(0.8));
+        for _ in 0..240 {
+            assert_eq!(state.process(0, 5.0, true, true, false, DT_120), Some(0.8));
         }
-        let d = b.process(0, 5.0, true, true, false).unwrap();
-        assert!(d < 0.8, "decaying: {d}");
-        // On reopen the EMA is still 0.8 (blink excluded), not contaminated by 5.0.
-        let r = b.process(0, 0.8, true, false, false).unwrap();
-        assert!((r - 0.8).abs() < 1e-6, "post-blink {r}");
+        assert_eq!(state.process(0, 0.8, true, false, false, DT_120), Some(0.8));
     }
 
     #[test]
     fn neutral_jitter_is_an_exact_zero() {
-        let mut b = BrowState::default();
-        b.process(0, 0.40, true, false, false);
-        for i in 0..200 {
-            let noise = ((i % 5) as f32 - 2.0) * 0.008;
-            let out = b.process(0, 0.40 + noise, true, false, false).unwrap();
-            assert_eq!(out, 0.0, "sample {i}: {out}");
+        let mut state = BrowState::default();
+        establish_neutral(&mut state, 0, 0.40);
+        for index in 0..200 {
+            let noise = ((index % 5) as f32 - 2.0) * 0.008;
+            let output = state
+                .process(0, 0.40 + noise, true, false, false, DT_120)
+                .unwrap();
+            assert_eq!(output, 0.0, "sample {index}: {output}");
         }
     }
 
     #[test]
     fn deliberate_brow_motion_remains_responsive() {
-        let mut b = BrowState::default();
-        b.process(0, 0.0, true, false, false);
-        let mut out = 0.0;
-        for _ in 0..4 {
-            out = b.process(0, 0.8, true, false, false).unwrap();
-        }
-        assert!(out > 0.5, "four inferences should be visibly raised: {out}");
-    }
-
-    #[test]
-    fn held_expression_rejects_destination_jitter() {
-        let mut b = BrowState::default();
-        b.process(0, 0.0, true, false, false);
-        for _ in 0..120 {
-            b.process(0, 0.65, true, false, false);
-        }
-
-        let mut lo = f32::INFINITY;
-        let mut hi = f32::NEG_INFINITY;
-        for i in 0..240 {
-            let noise = ((i % 7) as f32 - 3.0) * 0.006;
-            let out = b.process(0, 0.65 + noise, true, false, false).unwrap();
-            lo = lo.min(out);
-            hi = hi.max(out);
-        }
-        assert!(hi - lo < 0.006, "held output still jitters: {lo}..{hi}");
-    }
-
-    #[test]
-    fn settle_deadband_does_not_block_a_small_deliberate_move() {
-        let mut b = BrowState::default();
-        b.process(0, 0.0, true, false, false);
-        for _ in 0..20 {
-            b.process(0, 0.45, true, false, false);
-        }
-        let before = b.process(0, 0.45, true, false, false).unwrap();
-        let mut after = before;
+        let mut state = BrowState::default();
+        establish_neutral(&mut state, 0, 0.0);
+        let mut output = 0.0;
         for _ in 0..12 {
-            after = b.process(0, 0.60, true, false, false).unwrap();
+            output = state.process(0, 0.8, true, false, false, DT_120).unwrap();
         }
         assert!(
-            after > before + 0.08,
-            "small deliberate move was stuck: {before} -> {after}"
+            output > 0.5,
+            "100 ms of 120 Hz inferences should visibly move the brow: {output}"
+        );
+    }
+
+    #[test]
+    fn held_expression_noise_stays_small_without_stick_slip() {
+        let mut state = BrowState::default();
+        establish_neutral(&mut state, 0, 0.0);
+        for _ in 0..120 {
+            state.process(0, 0.65, true, false, false, DT_120);
+        }
+
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        for index in 0..240 {
+            let noise = ((index % 7) as f32 - 3.0) * 0.006;
+            let output = state
+                .process(0, 0.65 + noise, true, false, false, DT_120)
+                .unwrap();
+            low = low.min(output);
+            high = high.max(output);
+        }
+        assert!(
+            high - low < 0.025,
+            "filtered expression still jitters too much: {low}..{high}"
+        );
+    }
+
+    #[test]
+    fn slow_motion_advances_continuously_instead_of_sticking_then_jumping() {
+        let mut state = BrowState::default();
+        state.gamma = 1.0;
+        establish_neutral(&mut state, 0, 0.0);
+        let mut previous = 0.0;
+        let mut changed = 0;
+        let mut largest_step = 0.0f32;
+        for index in 0..60 {
+            let raw = 0.20 + 0.60 * index as f32 / 59.0;
+            let output = state.process(0, raw, true, false, false, DT_120).unwrap();
+            let step = (output - previous).abs();
+            if step > 1.0e-5 {
+                changed += 1;
+            }
+            largest_step = largest_step.max(step);
+            previous = output;
+        }
+        assert!(
+            changed > 50,
+            "slow motion stuck on too many frames: {changed}"
+        );
+        assert!(
+            largest_step < 0.06,
+            "slow motion produced a visible jump: {largest_step}"
+        );
+    }
+
+    #[test]
+    fn ema_response_is_rate_independent() {
+        fn response(rate: usize) -> f32 {
+            let mut state = BrowState::default();
+            state.deadzone = 0.0;
+            state.gamma = 1.0;
+            establish_neutral(&mut state, 0, 0.0);
+            let dt = 1.0 / rate as f32;
+            let mut output = 0.0;
+            for _ in 0..(rate / 10) {
+                output = state.process(0, 1.0, true, false, false, dt).unwrap();
+            }
+            output
+        }
+
+        let at_60 = response(60);
+        let at_120 = response(120);
+        assert!(
+            (at_60 - at_120).abs() < 0.01,
+            "time response changed with rate: 60 Hz={at_60}, 120 Hz={at_120}"
+        );
+    }
+
+    #[test]
+    fn non_finite_sample_is_ignored() {
+        let mut state = BrowState::default();
+        establish_neutral(&mut state, 0, 0.2);
+        let before = state.process(0, 0.6, true, false, false, DT_120);
+        assert_eq!(
+            state.process(0, f32::NAN, true, false, false, DT_120),
+            before
         );
     }
 }

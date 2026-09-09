@@ -195,6 +195,7 @@ pub struct WideCalib {
     total_captured: u32,
     entered: Instant,
     last_saved: Instant,
+    paused_at: Option<Instant>,
     seq: u64,
     rows: Vec<String>,
     pub last_error: Option<String>,
@@ -220,6 +221,7 @@ impl WideCalib {
             total_captured: 0,
             entered: Instant::now(),
             last_saved: Instant::now() - CAPTURE_INTERVAL,
+            paused_at: None,
             seq: 0,
             rows: Vec::new(),
             last_error: None,
@@ -256,6 +258,7 @@ impl WideCalib {
         self.total_captured = 0;
         self.entered = Instant::now();
         self.last_saved = Instant::now() - CAPTURE_INTERVAL;
+        self.paused_at = None;
         self.seq = 0;
         self.rows.clear();
         self.last_error = None;
@@ -272,6 +275,7 @@ impl WideCalib {
         }
         self.session = None;
         self.idx = None;
+        self.paused_at = None;
         self.captured = 0;
         self.total_captured = 0;
         self.rows.clear();
@@ -296,11 +300,57 @@ impl WideCalib {
         Ok(())
     }
 
+    pub fn pause(&mut self) {
+        if self.is_running() && self.paused_at.is_none() {
+            self.paused_at = Some(Instant::now());
+        }
+    }
+
+    pub fn resume(&mut self) {
+        let Some(paused_at) = self.paused_at.take() else {
+            return;
+        };
+        let now = Instant::now();
+        let paused_for = now.saturating_duration_since(paused_at);
+        self.entered = self.entered.checked_add(paused_for).unwrap_or(now);
+        self.last_saved = self.last_saved.checked_add(paused_for).unwrap_or(now);
+    }
+
+    pub fn suspend_for(&mut self, duration: Duration) {
+        if !self.is_running() || self.paused_at.is_some() || duration.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        self.entered = self.entered.checked_add(duration).unwrap_or(now);
+        self.last_saved = self.last_saved.checked_add(duration).unwrap_or(now);
+    }
+
+    fn phase_elapsed_at(&self, now: Instant) -> Duration {
+        self.paused_at
+            .unwrap_or(now)
+            .saturating_duration_since(self.entered)
+    }
+
+    fn phase_elapsed(&self) -> Duration {
+        self.phase_elapsed_at(Instant::now())
+    }
+
     pub fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    pub fn tick_at(&mut self, now: Instant) {
+        if self.paused_at.is_some() {
+            return;
+        }
         let Some(i) = self.idx else { return };
         if let Phase::Rest { secs, .. } = PHASES[i] {
-            if self.entered.elapsed() >= Duration::from_secs_f32(secs) {
-                self.advance();
+            let deadline = self
+                .entered
+                .checked_add(Duration::from_secs_f32(secs))
+                .unwrap_or(now);
+            if now >= deadline {
+                self.advance_at(deadline);
             }
         }
     }
@@ -310,11 +360,23 @@ impl WideCalib {
         left: Option<(u32, u32, &[u8])>,
         right: Option<(u32, u32, &[u8])>,
     ) -> u32 {
+        self.on_frame_at(Instant::now(), left, right)
+    }
+
+    pub fn on_frame_at(
+        &mut self,
+        captured_at: Instant,
+        left: Option<(u32, u32, &[u8])>,
+        right: Option<(u32, u32, &[u8])>,
+    ) -> u32 {
+        if self.paused_at.is_some() {
+            return 0;
+        }
         let Some(i) = self.idx else { return 0 };
         let Phase::Capture { spec, .. } = PHASES[i] else {
             return 0;
         };
-        if self.last_saved.elapsed() < CAPTURE_INTERVAL {
+        if captured_at.saturating_duration_since(self.last_saved) < CAPTURE_INTERVAL {
             return 0;
         }
         let (Some((lw, lh, lp)), Some((rw, rh, rp))) = (left, right) else {
@@ -337,11 +399,15 @@ impl WideCalib {
                 self.rows.push(lrow);
                 self.rows.push(rrow);
                 self.seq += 1;
-                self.last_saved = Instant::now();
+                self.last_saved = self
+                    .last_saved
+                    .checked_add(CAPTURE_INTERVAL)
+                    .filter(|scheduled| *scheduled <= captured_at)
+                    .unwrap_or(captured_at);
                 self.captured += 1;
                 self.total_captured += 1;
                 if self.captured >= spec.target {
-                    self.advance();
+                    self.advance_at(captured_at);
                 }
                 2
             }
@@ -375,12 +441,12 @@ impl WideCalib {
         ))
     }
 
-    fn advance(&mut self) {
+    fn advance_at(&mut self, entered: Instant) {
         let Some(i) = self.idx else { return };
         self.idx = Some((i + 1).min(PHASES.len() - 1));
         self.captured = 0;
-        self.entered = Instant::now();
-        self.last_saved = Instant::now() - CAPTURE_INTERVAL;
+        self.entered = entered;
+        self.last_saved = entered.checked_sub(CAPTURE_INTERVAL).unwrap_or(entered);
         if matches!(self.idx, Some(i) if matches!(PHASES[i], Phase::Done)) {
             if let Err(e) = self.flush() {
                 self.last_error = Some(format!("labels.csv: {e}"));
@@ -411,7 +477,7 @@ impl WideCalib {
         match PHASES[i] {
             Phase::Rest { secs, instruction } => Status::Rest {
                 instruction,
-                remaining: (secs - self.entered.elapsed().as_secs_f32()).max(0.0),
+                remaining: (secs - self.phase_elapsed().as_secs_f32()).max(0.0),
             },
             Phase::Capture { spec, instruction } => Status::Capture {
                 instruction,

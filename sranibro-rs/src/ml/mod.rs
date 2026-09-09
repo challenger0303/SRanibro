@@ -4,6 +4,8 @@ pub mod brow_calfit;
 pub mod brow_fit;
 pub mod brow_net;
 pub mod eye_net;
+#[cfg(windows)]
+pub(crate) mod eye_net_gpu;
 pub(crate) mod eyelid_model;
 pub mod heatmap;
 pub mod preprocess;

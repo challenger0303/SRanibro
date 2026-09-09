@@ -318,6 +318,8 @@ impl CalibrationReport {
             blink_depth: self.blink_depth[i],
             mid_anchor: old.mid_anchor,
             learned_once: true,
+            endpoint_locked: old.endpoint_locked,
+            endpoint_calibrated_unix: old.endpoint_calibrated_unix,
         };
         CalibStore {
             left: make(0, prev.left),
@@ -334,6 +336,8 @@ fn default_calib_store() -> CalibStore {
         blink_depth: 0.2,
         mid_anchor: 0.5,
         learned_once: false,
+        endpoint_locked: false,
+        endpoint_calibrated_unix: 0,
     };
     CalibStore {
         left: snap,
@@ -600,6 +604,7 @@ mod tests {
             e.openness_valid = native_enabled;
             e.pupil_pos = [0.5, 0.5];
             e.pupil_pos_valid = true;
+            e.pupil_pos_reported = true;
         }
         g
     }
@@ -671,6 +676,8 @@ mod tests {
                 blink_depth: 0.2,
                 mid_anchor: 0.43,
                 learned_once: true,
+                endpoint_locked: false,
+                endpoint_calibrated_unix: 0,
             },
             right: CalibSnapshot {
                 baseline: 0.6,
@@ -679,6 +686,8 @@ mod tests {
                 blink_depth: 0.2,
                 mid_anchor: 0.56,
                 learned_once: true,
+                endpoint_locked: false,
+                endpoint_calibrated_unix: 0,
             },
         };
         let report = CalibrationReport {

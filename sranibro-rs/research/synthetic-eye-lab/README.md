@@ -303,6 +303,190 @@ enter the search only after its own raw-evidence gates, and neither can be appli
 without the existing EyeNet guards and untouched holdout improvement.
 The command above is read-only and never changes application configuration.
 
+## XR5 photometric replay
+
+`xr5-photometric-replay` is a research-only counterfactual replay of an exported
+Safe Geometry Fit recording. It reconstructs the recorded despeckle, flatten, and
+per-frame adaptive-brightness affine first. Bounded research interventions are then
+applied at one explicit seam: **after captured adaptive brightness and before
+geometry**. This avoids reusing an affine learned from the original pixels on a
+different pre-normalization image. The recording does not contain the complete
+initial history of the stateful brightness controller, so the tool deliberately does
+not claim to recompute it under each hypothesis.
+
+That seam is also a validity gate. A replay result is evidence only for a future
+implementation in which the adaptive-brightness controller remains entirely upstream
+of the new intervention and its captured output is the intervention's input. Moving
+the intervention before that controller, or allowing the controller to adapt to the
+modified pixels, defines a different feedback system and invalidates this replay; it
+must be recorded and tested again at the new seam.
+
+At that post-normalization seam the search covers shared and per-eye affine
+brightness/contrast, flattening, and smooth low-frequency gain fields for either eye.
+It separately tests shared and per-eye horizontal/vertical crop translation, X/Y
+scale, and rotation. A fourth, landmark-independent family tests bounded full-frame
+coordinate warps: a zero-mean vertical bow and first-order radial distortion, each at
+multiple signed doses and for left-only, right-only, and shared application. Gain-field
+coordinates are anchored to the recorded baseline crop but evaluated smoothly over the
+complete frame; warp coordinates are normalized over the complete recorded frame. Both
+occur before candidate geometry, so moving a crop cannot introduce a hard correction
+seam. Probe names and CSV columns use the `postnorm_` prefix, and `manifest.txt` records
+the intervention seam and warp bounds. These results compare intervention classes; a
+successful intervention does
+not by itself prove that the original physical cause belonged to that class. The tool
+never changes live or saved SRanibro configuration and the current production pipeline
+does not gain a field or warp merely because a probe passes.
+
+Exploration ranks candidates using training frames only. Untouched holdout frames
+are report-only and are checked for closed/open reference preservation, slow-close
+variation, saturation, monotonicity, gaze retention, and false squeeze. Static phase
+labels are recovered from an anchored stable suffix rather than a fixed time trim;
+invalid Closed phases and gaze phases without a nearby Neutral anchor are excluded
+instead of being silently used as evidence. Exploration writes the baseline diagnostic
+and stops before ranking candidates when at least two static phases are invalid or
+either split has no valid Closed phase.
+
+"Untouched" here means that code never optimizes on the holdout inside that run. Once
+its values have been displayed and a person uses them to revise a candidate family,
+threshold, or implementation, that holdout has been statistically consumed for those
+later hypotheses. It is not a fresh sealed confirmation set. Final confirmation needs
+new evidence whose candidate, thresholds, preprocessing seam, EyeNet byte fingerprint,
+and decision rule were externally frozen before the archive was opened. This reuse
+rule applies equally to Safe Geometry Fit, the photometric replay, and the landmark /
+residual audit.
+
+```powershell
+cargo run --release --features research-synthetic-eye-lab `
+  --bin xr5-photometric-replay -- `
+  --recording C:\path\to\extracted-recording `
+  --model C:\path\to\00-0000.params_opencl.params `
+  --out research-output\xr5-photometric-exploration
+```
+
+The former hard-coded confirmation probes are intentionally invalidated. They were
+discovered when candidate fields were applied before the captured adaptive-brightness
+affine; moving to the honest post-normalization seam makes them different hypotheses.
+`--confirmation` therefore writes baseline diagnostics and stops with an explanation.
+A new post-normalization candidate must first be selected from independent discovery
+recordings and frozen in an externally sealed specification before confirmation code is
+enabled again. Promotion remains separate: it will require fresh re-wear sessions,
+at least 2--3 additional users/units, and fresh sealed safety evidence. Until then
+every result is a diagnostic candidate, not a production transformation.
+
+The sealed specification includes the exact EyeNet bytes. Any model-byte change (and
+therefore any CRC32/byte-count fingerprint update) creates a new experimental condition
+and invalidates earlier confirmation as confirmation for that condition. The old
+archive may still be shown as a diagnostic replay, but it cannot promote the new model.
+
+## XR5 landmark and residual audit
+
+The app's separate nine-point research recorder exports versioned evidence without
+running Safe Geometry Fit or changing geometry. `xr5-landmark-residual-audit` replays
+the recorded baseline through the production preprocessing/inference seam and writes a
+read-only audit of gaze-direction residuals and candidate-independent photometric
+features. Left and right eyes remain separate, selection uses discovery-train evidence
+only, and holdout/confirmation sessions are report-only.
+
+Each repeated relaxed-open target remains visible for 2.20 seconds. After the fixed
+reaction trim this leaves at least one valid one-second analysis block for every
+non-centre target; the former 1.60-second phase could not do so. The archive also
+records per-phase quotas (17 relaxed-open, 30 slow-close/open, and 16 natural-blink
+frames). Commanded-target mode and discovery pooling are disabled unless all 56 phase
+counts match the observed dataset and every required phase is complete.
+
+Protocol v3 adds one unrecorded rehearsal before each relaxed-open, slow-close/open,
+and natural-blink section in both passes. The rehearsal uses the real target and action
+timing, but its frames are never sampled or exported. This reduces the first-pass
+learning effect without changing the 56 labelled evidence phases or their quotas.
+
+Every one-second analysis block must contain at least 10 frames, span at least 0.90
+seconds, and contain no adjacent-frame gap greater than 0.20 seconds. Thus two dense
+bursts on opposite sides of a worker/UI stall cannot masquerade as continuous evidence;
+the measured 64 ms capture cadence remains comfortably inside the gate.
+
+Real-image pupil and lid landmarks are currently `UNCALIBRATED_QA_ONLY`. They are
+reported for detector quality control but cannot enter feature selection, regression,
+candidate ranking, or a production decision. Schema-v3-and-later commanded targets are enabled
+only when the exact recorder protocol contains every nine-point target in both train
+and holdout with the required repeated phases. Model replay parity likewise requires
+the supplied model's CRC32 and byte length to match the exact bytes fingerprinted when
+the live EyeNet was loaded.
+
+The stability flag is computed once from recorded raw camera pixels, protocol labels,
+and the immutable capture geometry. It does not consume Tobii gaze/openness/pupil data
+or EyeNet output. Likewise, all 36 global/3x3 photometric predictors are computed
+directly from each raw, pre-preprocessing and pre-intervention recorded frame. EyeNet
+is used only to construct the response being audited; it cannot leak into stability or
+the explanatory features by construction.
+
+```powershell
+cargo run --release --features research-synthetic-eye-lab `
+  --bin xr5-landmark-residual-audit -- `
+  --recording C:\path\to\extracted-nine-point-recording `
+  --model C:\path\to\00-0000.params_opencl.params `
+  --out research-output\xr5-landmark-residual-audit
+```
+
+Independent re-wear sessions can be appended with repeated
+`--confirmation-recording <dir>` arguments and always remain frozen report-only
+evidence. The 36-feature exploratory ridge is deliberately stricter: it needs at
+least 41 one-second blocks per eye from at least three independent, exact schema-v3
+captures with matching EyeNet fingerprints. Supply those training captures with
+repeated `--discovery-recording <dir>` arguments. Only their train split is pooled;
+every holdout split remains untouched evaluation evidence. Duplicate canonical paths
+and byte-identical sample/frame evidence are rejected, but the operator must still
+ensure each accepted discovery capture is a genuine independent headset re-wear/session.
+
+Three re-wears of one person test within-person repeatability only; they are not
+multi-user generalization evidence. A transfer claim needs the original user plus at
+least 2--3 additional users/units and must include the opposite failure laterality
+(for example, a right-eye failure if discovery was dominated by the left eye).
+
+The 41-block ridge threshold is only a numerical sanity floor. A typical reachable
+pool of 48 one-second blocks for 36 predictors is still statistically fragile even
+with ridge regularization. Before a correction family can be frozen, a predeclared
+session-wise stability gate must show consistent feature direction/ranking across
+leave-one-session-out discovery analyses, every leave-one-session-out training fold
+must independently clear the 41-block floor, and the frozen model must beat the
+intercept on every held-out session without a laterality reversal. The current audit
+reports the exploratory ridge but does not implement that promotion gate, so its
+status remains `NO-GO`.
+
+Active capture has no encoder queue that can silently drop frames: labelled stereo
+frames are retained in memory and ZIP encoding starts only after capture completes.
+Minimizing the window freezes both the protocol clock and the sampling gate, then
+resumes without charging hidden time to a phase. Exact per-phase quotas remain the
+final integrity check, so an incomplete archive is rejected rather than treated as a
+short but valid session.
+
+Optional landmark overlay images contain
+biometric eye imagery and therefore require the explicit
+`--emit-overlays accepted` flag. The tool never applies a warp; its output is evidence
+for choosing and preregistering a later correction family.
+
+### XR5 residual counterfactual replay
+
+`xr5-residual-counterfactual` applies 45 isolated, bounded interventions to the same
+nine-target archive and replays the exact fingerprint-matched EyeNet. The intervention
+families are post-normalization affine brightness, low-frequency flattening, smooth
+spatial gain fields, bounded coordinate warps, and small geometry probes. It never
+changes live or saved configuration.
+
+The score combines gaze-direction openness error, the worst instructed target,
+left/right asymmetry, and phase-local slow-close fidelity. Train evidence alone orders
+the diagnostic table; holdout remains report-only. Candidate selection is disabled
+unless all 18 target phases in both splits have enough stable raw-image evidence and
+the median train slow-close phase correlation is at least 0.50 for both eyes. A failed
+gate still permits causal-class diagnosis, but every row remains non-selectable.
+
+```powershell
+cargo run --release --features research-synthetic-eye-lab `
+  --bin xr5-residual-counterfactual -- `
+  --recording C:\path\to\extracted-nine-point-recording `
+  --model C:\path\to\00-0000.params_opencl.params `
+  --out research-output\xr5-residual-counterfactual
+```
+
 ## Limits
 
 The Phase 0--1.3 interventions establish causality only inside this synthetic

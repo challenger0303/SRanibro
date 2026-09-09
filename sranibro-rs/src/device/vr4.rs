@@ -58,6 +58,7 @@ impl EyeBlock {
             pupil_valid: self.pupil_valid != 0,
             pupil_pos: self.pupil_pos,
             pupil_pos_valid: self.pupil_pos_valid != 0,
+            pupil_pos_reported: true,
             openness: self.openness,
             openness_valid: self.openness_valid != 0,
             openness_reported: true,

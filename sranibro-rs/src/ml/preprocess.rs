@@ -317,7 +317,7 @@ pub fn despeckle(frame: &[u8], w: usize, h: usize, p: &DespeckleParams) -> Vec<u
 /// Illumination "flatten" (flat-field): subtract the smooth (large-kernel) local-mean
 /// deviation from the global mean, so a low-frequency shadow / gradient (e.g. the close-up
 /// centre band) is removed while the eye's high-frequency structure survives. Identity when
-/// disabled. Runs after despeckle, before brightness normalization.
+/// disabled. Runs after despeckle, before fixed manual brightness.
 pub fn flatten(frame: &[u8], w: usize, h: usize, p: &FlattenParams) -> Vec<u8> {
     if !p.enabled || w == 0 || h == 0 || frame.len() < w * h {
         return frame.to_vec();
@@ -356,8 +356,101 @@ pub fn flatten(frame: &[u8], w: usize, h: usize, p: &FlattenParams) -> Vec<u8> {
     out
 }
 
-/// The processed `DST`x`DST` model input for ONE eye as grayscale u8 — for the
-/// Calibration tab's live geometry preview (shows exactly what the model sees).
+/// Apply a fitted, fixed photometric correction after fixed manual brightness and before
+/// model-input geometry.
+pub fn fitted_photometric(
+    frame: &[u8],
+    w: usize,
+    h: usize,
+    geometry: &MlGeometry,
+    correction: &crate::core::types::PhotometricCorrection,
+    eye: usize,
+) -> Vec<u8> {
+    if !correction.enabled || eye >= 2 || w == 0 || h == 0 || frame.len() < w * h {
+        return frame.to_vec();
+    }
+
+    let flatten_params = FlattenParams {
+        enabled: correction.flatten.enabled,
+        strength: if correction.flatten.strength.is_finite() {
+            correction.flatten.strength.clamp(0.0, 0.75)
+        } else {
+            0.0
+        },
+        radius: if correction.flatten.radius.is_finite() {
+            correction.flatten.radius.clamp(0.15, 0.5)
+        } else {
+            0.33
+        },
+    };
+    let flattened = flatten_params
+        .enabled
+        .then(|| flatten(frame, w, h, &flatten_params));
+    let source = flattened.as_deref().unwrap_or(frame);
+
+    let [raw_gain, raw_bias] = correction.affine[eye];
+    let gain = if raw_gain.is_finite() {
+        raw_gain.clamp(0.70, 1.30)
+    } else {
+        1.0
+    };
+    let bias = if raw_bias.is_finite() {
+        raw_bias.clamp(-30.0, 30.0)
+    } else {
+        0.0
+    };
+    let mut affine = crate::ml::brightness::apply(source, gain, bias);
+
+    let field = correction.field[eye];
+    if field.is_identity() {
+        return affine;
+    }
+    let finite_or_zero = |value: f32, bound: f32| {
+        if value.is_finite() {
+            value.clamp(-bound, bound)
+        } else {
+            0.0
+        }
+    };
+    let horizontal = finite_or_zero(field.horizontal, 0.12);
+    let vertical = finite_or_zero(field.vertical, 0.12);
+    let horizontal_curve = finite_or_zero(field.horizontal_curve, 0.08);
+    let vertical_curve = finite_or_zero(field.vertical_curve, 0.08);
+    if horizontal == 0.0 && vertical == 0.0 && horizontal_curve == 0.0 && vertical_curve == 0.0 {
+        return affine;
+    }
+
+    let x0 = (geometry.crop_left.clamp(0.0, 0.95) * w as f32).floor() as usize;
+    let x1 = ((1.0 - geometry.crop_right.clamp(0.0, 0.95)) * w as f32).ceil() as usize;
+    let y0 = (geometry.crop_top.clamp(0.0, 0.95) * h as f32).floor() as usize;
+    let y1 = ((1.0 - geometry.crop_bottom.clamp(0.0, 0.95)) * h as f32).ceil() as usize;
+    let (x1, y1) = (x1.clamp(x0 + 1, w), y1.clamp(y0 + 1, h));
+    for y in 0..h {
+        let yn = if y1 - y0 <= 1 {
+            0.0
+        } else {
+            2.0 * (y as f32 - y0 as f32) / (y1 - y0 - 1) as f32 - 1.0
+        };
+        for x in 0..w {
+            let xn = if x1 - x0 <= 1 {
+                0.0
+            } else {
+                2.0 * (x as f32 - x0 as f32) / (x1 - x0 - 1) as f32 - 1.0
+            };
+            let local_gain = (1.0
+                + horizontal * xn
+                + vertical * yn
+                + horizontal_curve * (xn * xn - 1.0 / 3.0)
+                + vertical_curve * (yn * yn - 1.0 / 3.0))
+                .clamp(0.70, 1.30);
+            let index = y * w + x;
+            affine[index] = (affine[index] as f32 * local_gain).clamp(0.0, 255.0) as u8;
+        }
+    }
+    affine
+}
+
+/// The processed `DST`x`DST` model input for one eye, used by the live preview.
 pub fn ml_input_preview(img: &[u8], w: u32, h: u32, geom: &MlGeometry, flip_h: bool) -> Vec<u8> {
     let mut f = vec![0f32; DST * DST];
     if geom.is_identity() {
@@ -1210,6 +1303,60 @@ mod tests {
             ..p
         };
         assert_eq!(flatten(&img, w, h, &off), img, "disabled = identity");
+    }
+
+    #[test]
+    fn fitted_photometric_disabled_is_byte_identical() {
+        let frame = (0..64u8).collect::<Vec<_>>();
+        let correction = crate::core::types::PhotometricCorrection::default();
+        assert_eq!(
+            fitted_photometric(&frame, 8, 8, &MlGeometry::default(), &correction, 0),
+            frame
+        );
+    }
+
+    #[test]
+    fn fitted_photometric_applies_per_eye_affine_and_smooth_field() {
+        let frame = vec![100u8; 9 * 9];
+        let correction = crate::core::types::PhotometricCorrection {
+            enabled: true,
+            affine: [[1.0, 10.0], [0.8, 0.0]],
+            field: [
+                crate::core::types::PhotometricGainField {
+                    horizontal: 0.12,
+                    ..Default::default()
+                },
+                Default::default(),
+            ],
+            ..Default::default()
+        };
+        let left = fitted_photometric(&frame, 9, 9, &MlGeometry::default(), &correction, 0);
+        let right = fitted_photometric(&frame, 9, 9, &MlGeometry::default(), &correction, 1);
+        assert!(
+            left[4 * 9] < left[4 * 9 + 8],
+            "horizontal field must be smooth"
+        );
+        assert_eq!(right, vec![80u8; 9 * 9], "right eye keeps its own affine");
+    }
+
+    #[test]
+    fn fitted_photometric_nonfinite_values_fall_back_safely() {
+        let frame = vec![123u8; 16];
+        let correction = crate::core::types::PhotometricCorrection {
+            enabled: true,
+            affine: [[f32::NAN, f32::INFINITY]; 2],
+            field: [crate::core::types::PhotometricGainField {
+                horizontal: f32::NAN,
+                vertical: f32::INFINITY,
+                horizontal_curve: f32::NEG_INFINITY,
+                vertical_curve: f32::NAN,
+            }; 2],
+            ..Default::default()
+        };
+        assert_eq!(
+            fitted_photometric(&frame, 4, 4, &MlGeometry::default(), &correction, 0),
+            frame
+        );
     }
 
     #[test]

@@ -6,9 +6,9 @@
 //! columns (gaze directions) arrive as a sub-prologue followed by 3 floats.
 //!
 //! Column ids: 1=timestamp, 2=status, 3=right-eye gaze, 4=left-eye gaze,
-//! 5=combined gaze, 6=convergence. Gaze x/y are negated to the chip's canonical
-//! sign here (as in the Python reference); the SRanibro sink's own negation must
-//! be reconciled against this once verified on hardware.
+//! 5=combined gaze, 6=convergence. This decoder preserves the chip's raw vector;
+//! per-device handedness and the one canonical output sign conversion happen later
+//! in the pipeline/sinks.
 //!
 //! This module decodes raw gaze stream 1289 and wearable-advanced stream 1285
 //! (native pupil diameter, pupil position, and native openness).
@@ -41,30 +41,15 @@ impl Default for GazeData {
 }
 
 impl GazeData {
-    /// Map to the core contract. 1289 carries only gaze (openness comes from the
-    /// ML on the camera images); pupil/origin are left invalid. `status > 0`
-    /// marks the gaze valid.
+    /// Map the direct EyeChip 1289 stream to the core contract. 1289 carries only
+    /// gaze (openness comes from the ML on the camera images); pupil/origin are
+    /// left invalid.
+    ///
+    /// The packet-level `status` is not a per-eye validity bit. Real VR4 and XR5
+    /// firmware both emit usable directions with status 0, while startup packets
+    /// may carry a non-zero status alongside the all-zero sentinel. Validate each
+    /// direction itself so one missing eye cannot invalidate the other.
     pub fn to_gaze_sample(&self) -> GazeSample {
-        let valid = self.status > 0;
-        let mk = |g: [f32; 3]| EyeSample {
-            gaze: g,
-            gaze_valid: valid,
-            gaze_reported: true,
-            ..Default::default()
-        };
-        GazeSample {
-            timestamp_us: self.timestamp.max(0) as u64,
-            left: mk(self.l_gaze),
-            right: mk(self.r_gaze),
-        }
-    }
-
-    /// XR5 firmware can publish a usable per-eye direction while the packet-level
-    /// status is zero. Conversely, that status is shared by both eyes and cannot
-    /// describe a missing vector for just one eye. Validate each direction itself
-    /// on XR5 so a real vector keeps flowing, while the all-zero sentinel remains
-    /// invalid. Other HMDs retain [`Self::to_gaze_sample`] and its native status rule.
-    pub fn to_xr5_gaze_sample(&self) -> GazeSample {
         let mk = |g: [f32; 3]| EyeSample {
             gaze: g,
             gaze_valid: plausible_gaze_direction(g),
@@ -76,6 +61,12 @@ impl GazeData {
             left: mk(self.l_gaze),
             right: mk(self.r_gaze),
         }
+    }
+
+    /// Back-compatible name retained for the XR5 caller. Direct VR4 and XR5 now
+    /// intentionally share the same per-vector validity rule.
+    pub fn to_xr5_gaze_sample(&self) -> GazeSample {
+        self.to_gaze_sample()
     }
 
     /// Shape the EyeChip's fused/cyclopean direction as an ordinary stereo sample.
@@ -118,8 +109,10 @@ pub struct WearableData {
     pub pupil_valid: [bool; 2],
     pub pupil_pos: [[f32; 2]; 2],
     pub pupil_pos_valid: [bool; 2],
+    pub pupil_pos_reported: [bool; 2],
     pub openness: [f32; 2],
     pub openness_valid: [bool; 2],
+    pub openness_reported: [bool; 2],
 }
 
 impl Default for WearableData {
@@ -134,8 +127,10 @@ impl Default for WearableData {
             pupil_valid: [false; 2],
             pupil_pos: [[0.5; 2]; 2],
             pupil_pos_valid: [false; 2],
+            pupil_pos_reported: [false; 2],
             openness: [0.0; 2],
             openness_valid: [false; 2],
+            openness_reported: [false; 2],
         }
     }
 }
@@ -154,9 +149,10 @@ impl WearableData {
                 pupil_valid: self.pupil_valid[i],
                 pupil_pos: self.pupil_pos[i],
                 pupil_pos_valid: self.pupil_pos_valid[i],
+                pupil_pos_reported: self.pupil_pos_reported[i],
                 openness: self.openness[i],
                 openness_valid: self.openness_valid[i],
-                openness_reported: true,
+                openness_reported: self.openness_reported[i],
             }
         };
         GazeSample {
@@ -185,7 +181,9 @@ impl WearableData {
             || self.gaze_valid.iter().any(|&v| v)
             || self.pupil_valid.iter().any(|&v| v)
             || self.pupil_pos_valid.iter().any(|&v| v)
+            || self.pupil_pos_reported.iter().any(|&v| v)
             || self.openness_valid.iter().any(|&v| v)
+            || self.openness_reported.iter().any(|&v| v)
     }
 }
 
@@ -322,9 +320,11 @@ fn read_tlv_eye(
         out.pupil_valid[idx] = (0.5..=12.0).contains(&mm);
     }
     if let Some(openness) = scalar_f32(columns, cols.openness) {
+        out.openness_reported[idx] = true;
         out.openness[idx] = openness;
         out.openness_valid[idx] = (0.0..=1.0).contains(&openness);
     }
+    out.pupil_pos_reported[idx] = column_payload(columns, cols.pupil_pos_valid).is_some();
     if let Some(pos) = struct_vec2(columns, cols.pupil_pos) {
         out.pupil_pos[idx] = pos;
         out.pupil_pos_valid[idx] = scalar_u32(columns, cols.pupil_pos_valid) == Some(1)
@@ -500,8 +500,10 @@ fn read_eye_struct(bytes: &[u8], base: usize, idx: usize, out: &mut WearableData
     out.pupil_valid[idx] = pupil_valid == 1;
     out.pupil_pos[idx] = pupil_pos;
     out.pupil_pos_valid[idx] = pupil_pos_valid == 1;
+    out.pupil_pos_reported[idx] = true;
     out.openness[idx] = openness;
     out.openness_valid[idx] = openness_valid == 1;
+    out.openness_reported[idx] = true;
     Some(())
 }
 
@@ -577,8 +579,8 @@ pub fn decode_gaze_1289(msg: &[u8]) -> Option<GazeData> {
                     subs.push(sv);
                 }
                 match col_id {
-                    3 => g.r_gaze = vec3_lenient(&subs),
-                    4 => g.l_gaze = vec3_lenient(&subs),
+                    3 => g.l_gaze = vec3_lenient(&subs),
+                    4 => g.r_gaze = vec3_lenient(&subs),
                     5 => g.combined = vec3_lenient(&subs),
                     _ => {}
                 }
@@ -644,9 +646,9 @@ mod tests {
         // 5 rows: left-eye gaze vector, status, timestamp, combined, convergence.
         let mut tlv = enc_pro(5 << 16); // row_count = 5
 
-        // Row 1: left eye (col 4) = vector [0.5, -0.25, 1.0] (pre-negation).
+        // Row 1: left eye (col 3) = vector [0.5, -0.25, 1.0].
         tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
-        tlv.extend(enc_u32(4));
+        tlv.extend(enc_u32(3));
         tlv.extend(enc_pro(3 << 16)); // sub_count = 3
         tlv.extend(enc_f(32768)); //  0.5
         tlv.extend(enc_f(-16384)); // -0.25
@@ -697,6 +699,28 @@ mod tests {
     }
 
     #[test]
+    fn decodes_right_gaze_from_column_four() {
+        let mut tlv = enc_pro(1 << 16);
+        tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
+        tlv.extend(enc_u32(4));
+        tlv.extend(enc_pro(3 << 16));
+        tlv.extend(enc_f(-24576)); // -0.375
+        tlv.extend(enc_f(8192)); //  0.125
+        tlv.extend(enc_f(57344)); //  0.875
+
+        let mut msg = vec![0u8; 26];
+        msg.extend(tlv);
+
+        let g = decode_gaze_1289(&msg).expect("decodes");
+        assert_eq!(g.l_gaze, [0.0; 3], "left eye not present this frame");
+        assert!(g
+            .r_gaze
+            .iter()
+            .zip([-0.375, 0.125, 0.875])
+            .all(|(actual, expected)| (*actual - expected).abs() < 1e-3));
+    }
+
+    #[test]
     fn bad_column_magic_stops_cleanly() {
         let mut tlv = enc_pro(1 << 16);
         tlv.extend(enc_pro(999)); // wrong magic -> break
@@ -707,20 +731,33 @@ mod tests {
     }
 
     #[test]
-    fn xr5_uses_per_eye_vector_validity_when_packet_status_is_zero() {
+    fn direct_eyechip_uses_per_eye_vector_validity_not_packet_status() {
         let g = GazeData {
             status: 0,
             l_gaze: [0.2, -0.1, 0.97],
             r_gaze: [0.0, 0.0, 0.0],
             ..GazeData::default()
         };
-        let sample = g.to_xr5_gaze_sample();
+        let sample = g.to_gaze_sample();
         assert!(sample.left.gaze_valid);
         assert!(
             !sample.right.gaze_valid,
             "zero-vector sentinel must stay invalid"
         );
         assert!(sample.left.gaze_reported && sample.right.gaze_reported);
+        assert!(!sample.left.pupil_pos_reported && !sample.right.pupil_pos_reported);
+
+        let startup = GazeData {
+            status: 2,
+            l_gaze: [0.0; 3],
+            r_gaze: [0.0; 3],
+            ..GazeData::default()
+        }
+        .to_gaze_sample();
+        assert!(
+            !startup.left.gaze_valid && !startup.right.gaze_valid,
+            "a non-zero packet status must not make zero-vector sentinels valid"
+        );
     }
 
     #[test]
@@ -831,7 +868,31 @@ mod tests {
         assert_eq!(w.pupil_mm, [3.25, 4.5]);
         assert_eq!(w.pupil_valid, [true, true]);
         assert_eq!(w.openness_valid, [true, true]);
+        assert_eq!(w.openness_reported, [true, true]);
         assert!((w.pupil_pos[0][0] - 0.3999939).abs() < 1e-4);
         assert!((w.pupil_pos[1][1] - 0.5499878).abs() < 1e-4);
+        assert_eq!(w.pupil_pos_reported, [true, true]);
+        let sample = w.to_gaze_sample();
+        assert!(sample.left.pupil_pos_reported && sample.right.pupil_pos_reported);
+    }
+
+    #[test]
+    fn wearable_reported_invalid_pupil_position_is_not_dropped() {
+        let mut tlv = enc_pro(2 << 16);
+        tlv.extend(enc_col(22, enc_u32(0)));
+        tlv.extend(enc_col(
+            23,
+            enc_vec_f(&[(0.4 * 65536.0) as i32, (0.6 * 65536.0) as i32]),
+        ));
+        let mut msg = vec![0u8; 26];
+        msg.extend(tlv);
+
+        let wearable = decode_wearable_1285(&msg).expect("reported-invalid sample decodes");
+        assert!(wearable.pupil_pos_reported[Eye::Left.idx()]);
+        assert!(!wearable.pupil_pos_valid[Eye::Left.idx()]);
+        let sample = wearable.to_aux_sample();
+        assert!(sample.left.pupil_pos_reported);
+        assert!(!sample.left.pupil_pos_valid);
+        assert!(!sample.left.openness_reported && !sample.right.openness_reported);
     }
 }

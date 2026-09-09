@@ -336,7 +336,7 @@ impl VarjoLib {
         if hmod.is_null() {
             return Err(Error::new(
                 ErrorKind::NotFound,
-                format!("LoadLibrary failed: {dll_path}"),
+                format!("Varjo Base runtime load failed: {}", Error::last_os_error()),
             ));
         }
         macro_rules! load {
@@ -347,7 +347,7 @@ impl VarjoLib {
                         FreeLibrary(hmod);
                         return Err(Error::new(
                             ErrorKind::NotFound,
-                            concat!("VarjoLib missing export ", $name),
+                            concat!("Varjo Base runtime missing export ", $name),
                         ));
                     }
                 }

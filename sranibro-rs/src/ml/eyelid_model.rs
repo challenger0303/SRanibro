@@ -4,7 +4,12 @@
 //! smoothing outside this boundary. The legacy adapter only gives names to the existing
 //! five EyeNet outputs; it does not reinterpret them.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
 use super::eye_net::EyeNet;
+use crate::config::EyelidInferenceBackend;
 
 pub(crate) const EYELID_INPUT_CHANNELS: usize = 2;
 pub(crate) const EYELID_INPUT_WIDTH: usize = 100;
@@ -104,6 +109,72 @@ impl RawEyelidPrediction {
 pub(crate) trait EyelidModel: Send {
     fn infer(&mut self, input: CanonicalStereoInput<'_>)
         -> Result<RawEyelidPrediction, ModelError>;
+
+    /// Live inference may be pipelined by a GPU backend. `None` means that the newest
+    /// submission is still in flight; callers retain the preceding published sample.
+    fn infer_live(
+        &mut self,
+        input: CanonicalStereoInput<'_>,
+    ) -> Result<Option<RawEyelidPrediction>, ModelError> {
+        self.infer(input).map(Some)
+    }
+
+    /// Evaluate the live tensor and its optional alternate routing tensor together.
+    /// CPU backends preserve the old sequential behavior; the GPU backend overrides
+    /// this to dispatch both samples as one batch.
+    fn infer_pair(
+        &mut self,
+        primary: CanonicalStereoInput<'_>,
+        secondary: CanonicalStereoInput<'_>,
+    ) -> Result<[RawEyelidPrediction; 2], ModelError> {
+        Ok([self.infer(primary)?, self.infer(secondary)?])
+    }
+
+    fn infer_pair_live(
+        &mut self,
+        primary: CanonicalStereoInput<'_>,
+        secondary: CanonicalStereoInput<'_>,
+    ) -> Result<Option<[RawEyelidPrediction; 2]>, ModelError> {
+        self.infer_pair(primary, secondary).map(Some)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EyelidBackendReport {
+    pub(crate) active: &'static str,
+    pub(crate) runtime_gpu_active: Option<Arc<AtomicBool>>,
+    pub(crate) adapter: Option<String>,
+    pub(crate) cpu_pair_ms: Option<f32>,
+    pub(crate) gpu_pair_ms: Option<f32>,
+    pub(crate) note: String,
+}
+
+/// Optional renderer-owned GPU context used by the GUI pipeline.
+///
+/// The command-line pipeline leaves this absent and receives its own compute device.
+/// The GUI passes eframe's Arc handles so rendering and EyeNet cannot independently
+/// overfill two DX12 queues on the same physical adapter.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct EyelidGpuContext {
+    pub(crate) device: Arc<wgpu::Device>,
+    pub(crate) queue: Arc<wgpu::Queue>,
+    pub(crate) adapter_name: String,
+}
+
+impl EyelidBackendReport {
+    pub(crate) fn active_label(&self) -> &'static str {
+        if self.active == "GPU"
+            && self
+                .runtime_gpu_active
+                .as_ref()
+                .is_some_and(|active| !active.load(Ordering::Relaxed))
+        {
+            "CPU (fallback)"
+        } else {
+            self.active
+        }
+    }
 }
 
 /// Thin behavior-preserving adapter over the existing SRanipal-compatible EyeNet.
@@ -126,6 +197,274 @@ impl EyelidModel for LegacyEyelidModel {
             self.net.forward_one(input.as_slice()),
         ))
     }
+}
+
+#[cfg(windows)]
+struct HybridGpuEyelidModel {
+    cpu: LegacyEyelidModel,
+    gpu: Option<super::eye_net_gpu::GpuEyeNet>,
+    runtime_gpu_active: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+impl HybridGpuEyelidModel {
+    fn disable_gpu(&mut self, error: &str) {
+        if self.gpu.take().is_some() {
+            self.runtime_gpu_active.store(false, Ordering::Relaxed);
+            eprintln!("[ml:gpu] runtime failure; continuing on CPU: {error}");
+        }
+    }
+}
+
+#[cfg(windows)]
+impl EyelidModel for HybridGpuEyelidModel {
+    fn infer(
+        &mut self,
+        input: CanonicalStereoInput<'_>,
+    ) -> Result<RawEyelidPrediction, ModelError> {
+        if let Some(gpu) = self.gpu.as_mut() {
+            match gpu.infer_batch(input.as_slice(), None) {
+                Ok(raw) => return Ok(RawEyelidPrediction::from_legacy_raw(raw[0])),
+                Err(error) => self.disable_gpu(&error),
+            }
+        }
+        self.cpu.infer(input)
+    }
+
+    fn infer_pair(
+        &mut self,
+        primary: CanonicalStereoInput<'_>,
+        secondary: CanonicalStereoInput<'_>,
+    ) -> Result<[RawEyelidPrediction; 2], ModelError> {
+        if let Some(gpu) = self.gpu.as_mut() {
+            match gpu.infer_batch(primary.as_slice(), Some(secondary.as_slice())) {
+                Ok(raw) => {
+                    return Ok([
+                        RawEyelidPrediction::from_legacy_raw(raw[0]),
+                        RawEyelidPrediction::from_legacy_raw(raw[1]),
+                    ])
+                }
+                Err(error) => self.disable_gpu(&error),
+            }
+        }
+        self.cpu.infer_pair(primary, secondary)
+    }
+
+    fn infer_live(
+        &mut self,
+        input: CanonicalStereoInput<'_>,
+    ) -> Result<Option<RawEyelidPrediction>, ModelError> {
+        if let Some(gpu) = self.gpu.as_mut() {
+            match gpu.infer_live_batch(input.as_slice(), None) {
+                Ok(Some(raw)) => return Ok(Some(RawEyelidPrediction::from_legacy_raw(raw[0]))),
+                Ok(None) => return Ok(None),
+                Err(error) => self.disable_gpu(&error),
+            }
+        }
+        self.cpu.infer(input).map(Some)
+    }
+
+    fn infer_pair_live(
+        &mut self,
+        primary: CanonicalStereoInput<'_>,
+        secondary: CanonicalStereoInput<'_>,
+    ) -> Result<Option<[RawEyelidPrediction; 2]>, ModelError> {
+        if let Some(gpu) = self.gpu.as_mut() {
+            match gpu.infer_live_batch(primary.as_slice(), Some(secondary.as_slice())) {
+                Ok(Some(raw)) => {
+                    return Ok(Some([
+                        RawEyelidPrediction::from_legacy_raw(raw[0]),
+                        RawEyelidPrediction::from_legacy_raw(raw[1]),
+                    ]))
+                }
+                Ok(None) => return Ok(None),
+                Err(error) => self.disable_gpu(&error),
+            }
+        }
+        self.cpu.infer_pair(primary, secondary).map(Some)
+    }
+}
+
+/// Build the live backend. GPU output is checked against the CPU implementation using
+/// both samples before it can become active. `Auto` additionally requires a meaningful
+/// pair-inference speedup; explicit GPU still retains transparent CPU fallback.
+pub(crate) fn build_eyelid_model(
+    mut net: EyeNet,
+    preference: EyelidInferenceBackend,
+    #[cfg(windows)] gpu_context: Option<EyelidGpuContext>,
+) -> (Box<dyn EyelidModel>, EyelidBackendReport) {
+    if preference == EyelidInferenceBackend::Cpu {
+        return (
+            Box::new(LegacyEyelidModel::new(net)),
+            EyelidBackendReport {
+                active: "CPU",
+                runtime_gpu_active: None,
+                adapter: None,
+                cpu_pair_ms: None,
+                gpu_pair_ms: None,
+                note: "CPU selected".into(),
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(context) = gpu_context {
+                super::eye_net_gpu::GpuEyeNet::from_device(
+                    &net,
+                    context.device,
+                    context.queue,
+                    context.adapter_name,
+                )
+            } else {
+                super::eye_net_gpu::GpuEyeNet::new(&net)
+            }
+        }));
+        let mut gpu = match gpu_result {
+            Ok(Ok(gpu)) => gpu,
+            Ok(Err(error)) => {
+                return cpu_after_gpu_rejection(net, format!("GPU unavailable: {error}"));
+            }
+            Err(_) => {
+                return cpu_after_gpu_rejection(
+                    net,
+                    "GPU initialization panicked; CPU fallback retained".into(),
+                );
+            }
+        };
+
+        let mut primary = [0.0f32; EYELID_INPUT_LEN];
+        let mut secondary = [0.0f32; EYELID_INPUT_LEN];
+        for (index, value) in primary.iter_mut().enumerate() {
+            *value = ((index * 37 + 11) % 251) as f32 / 250.0;
+        }
+        for (index, value) in secondary.iter_mut().enumerate() {
+            *value = ((index * 73 + 29) % 241) as f32 / 240.0;
+        }
+
+        // Warm both paths before comparing or timing. This excludes first-use scratch
+        // allocation and shader compilation from the backend decision.
+        let cpu_expected = [net.forward_one(&primary), net.forward_one(&secondary)];
+        let gpu_expected = match gpu.infer_batch(&primary, Some(&secondary)) {
+            Ok(values) => values,
+            Err(error) => {
+                return cpu_after_gpu_rejection(net, format!("GPU validation failed: {error}"));
+            }
+        };
+        if let Some(error) = prediction_mismatch(cpu_expected, gpu_expected) {
+            return cpu_after_gpu_rejection(net, error);
+        }
+
+        let cpu_pair_ms = benchmark_ms(5, || {
+            let _ = net.forward_one(&primary);
+            let _ = net.forward_one(&secondary);
+        });
+        let gpu_pair_ms = benchmark_ms(5, || {
+            gpu.infer_batch(&primary, Some(&secondary))
+                .expect("validated GPU backend must remain available during startup benchmark");
+        });
+        let adapter = gpu.adapter_name().to_string();
+        let fast_enough = gpu_pair_ms <= cpu_pair_ms * 0.90;
+        if preference == EyelidInferenceBackend::Auto && !fast_enough {
+            return (
+                Box::new(LegacyEyelidModel::new(net)),
+                EyelidBackendReport {
+                    active: "CPU",
+                    runtime_gpu_active: None,
+                    adapter: Some(adapter),
+                    cpu_pair_ms: Some(cpu_pair_ms),
+                    gpu_pair_ms: Some(gpu_pair_ms),
+                    note: "Auto kept CPU because GPU pair inference was not at least 10% faster"
+                        .into(),
+                },
+            );
+        }
+        let note = if preference == EyelidInferenceBackend::Gpu && !fast_enough {
+            "GPU forced by user; CPU fallback remains armed"
+        } else {
+            "GPU output validated; CPU fallback remains armed"
+        };
+        let runtime_gpu_active = Arc::new(AtomicBool::new(true));
+        return (
+            Box::new(HybridGpuEyelidModel {
+                cpu: LegacyEyelidModel::new(net),
+                gpu: Some(gpu),
+                runtime_gpu_active: runtime_gpu_active.clone(),
+            }),
+            EyelidBackendReport {
+                active: "GPU",
+                runtime_gpu_active: Some(runtime_gpu_active),
+                adapter: Some(adapter),
+                cpu_pair_ms: Some(cpu_pair_ms),
+                gpu_pair_ms: Some(gpu_pair_ms),
+                note: note.into(),
+            },
+        );
+    }
+
+    #[cfg(not(windows))]
+    cpu_after_gpu_rejection(
+        net,
+        "GPU EyeNet is currently available on Windows only".into(),
+    )
+}
+
+fn cpu_after_gpu_rejection(
+    net: EyeNet,
+    note: String,
+) -> (Box<dyn EyelidModel>, EyelidBackendReport) {
+    eprintln!("[ml:gpu] {note}");
+    (
+        Box::new(LegacyEyelidModel::new(net)),
+        EyelidBackendReport {
+            active: "CPU",
+            runtime_gpu_active: None,
+            adapter: None,
+            cpu_pair_ms: None,
+            gpu_pair_ms: None,
+            note,
+        },
+    )
+}
+
+fn benchmark_ms(mut samples: usize, mut run: impl FnMut()) -> f32 {
+    let mut timings = Vec::with_capacity(samples);
+    while samples > 0 {
+        let started = Instant::now();
+        run();
+        timings.push(started.elapsed().as_secs_f32() * 1000.0);
+        samples -= 1;
+    }
+    timings.sort_by(f32::total_cmp);
+    timings[timings.len() / 2]
+}
+
+fn prediction_mismatch(cpu: [[f32; 5]; 2], gpu: [[f32; 5]; 2]) -> Option<String> {
+    let mut worst = 0.0f32;
+    for sample in 0..2 {
+        for channel in 0..5 {
+            let expected = cpu[sample][channel];
+            let actual = gpu[sample][channel];
+            if expected.is_finite() != actual.is_finite() {
+                return Some(format!(
+                    "GPU validation produced a non-finite mismatch at sample {sample} channel {channel}"
+                ));
+            }
+            if expected.is_finite() {
+                let delta = (expected - actual).abs();
+                worst = worst.max(delta);
+                let tolerance = 0.003 + expected.abs() * 0.01;
+                if delta > tolerance {
+                    return Some(format!(
+                        "GPU validation mismatch at sample {sample} channel {channel}: CPU {expected:.6}, GPU {actual:.6}, delta {delta:.6}"
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!("[ml:gpu] CPU/GPU validation passed (worst delta {worst:.6})");
+    None
 }
 
 #[cfg(test)]

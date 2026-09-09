@@ -8,6 +8,8 @@
 #![cfg(windows)]
 
 use std::io;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -36,6 +38,38 @@ const EP_IN: u8 = 0x83;
 const EP_OUT: u8 = 0x05;
 const GENERIC_RW: u32 = 0xC000_0000; // GENERIC_READ | GENERIC_WRITE
 const ERROR_SEM_TIMEOUT: u32 = 121;
+
+// The EyeChip firmware keeps the previous streaming session alive briefly after
+// WinUsb_Free/CloseHandle return. Reopening during that interval succeeds at the
+// Windows handle level but the first bulk read commonly fails with ERROR_GEN_FAILURE
+// (31), or the authentication challenge is missing. Remember the close time inside
+// this process so a live engine reload can give the firmware a quiet interval. A
+// cold process start has no recorded close and therefore pays no delay.
+const REOPEN_QUIET_PERIOD: Duration = Duration::from_secs(5);
+static LAST_INTERFACE_CLOSE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+fn last_interface_close() -> &'static Mutex<Option<Instant>> {
+    LAST_INTERFACE_CLOSE.get_or_init(|| Mutex::new(None))
+}
+
+fn record_interface_close() {
+    if let Ok(mut last) = last_interface_close().lock() {
+        *last = Some(Instant::now());
+    }
+}
+
+/// Remaining firmware quiet time before another WinUSB session should begin.
+/// Used by the adapter thread so waiting remains stop-responsive and visible in
+/// device status instead of blocking the UI thread.
+pub fn reopen_quiet_remaining() -> Duration {
+    let last = last_interface_close().lock().ok().and_then(|last| *last);
+    quiet_remaining(last, Instant::now())
+}
+
+fn quiet_remaining(last: Option<Instant>, now: Instant) -> Duration {
+    last.map(|closed| REOPEN_QUIET_PERIOD.saturating_sub(now.saturating_duration_since(closed)))
+        .unwrap_or(Duration::ZERO)
+}
 
 /// An open WinUSB connection to the EyeChip, with a TTP deframer and msg-id seq.
 pub struct UsbDevice {
@@ -80,6 +114,7 @@ impl UsbDevice {
         if unsafe { WinUsb_Initialize(file, &mut handle) } == 0 {
             let e = last_err("WinUsb_Initialize");
             unsafe { CloseHandle(file) };
+            record_interface_close();
             return Err(e);
         }
 
@@ -298,6 +333,32 @@ impl Drop for UsbDevice {
                 CloseHandle(self.file);
             }
         }
+        record_interface_close();
+    }
+}
+
+#[cfg(test)]
+mod reopen_quiet_tests {
+    use super::*;
+
+    #[test]
+    fn cold_start_has_no_quiet_delay() {
+        let now = Instant::now();
+        assert_eq!(quiet_remaining(None, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn recent_close_requires_only_the_remaining_quiet_time() {
+        let closed = Instant::now();
+        let now = closed + Duration::from_millis(1250);
+        assert_eq!(
+            quiet_remaining(Some(closed), now),
+            Duration::from_millis(3750)
+        );
+        assert_eq!(
+            quiet_remaining(Some(closed), closed + REOPEN_QUIET_PERIOD),
+            Duration::ZERO
+        );
     }
 }
 

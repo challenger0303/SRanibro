@@ -131,6 +131,7 @@ fn append_file_log(line: &str) {
         let important = line.contains("ERROR")
             || line.contains("failed")
             || line.contains("panic")
+            || line.contains("[ui:")
             || line.contains("gaze diag")
             || line.contains("[starvr] streaming")
             || line.contains("[starvr] first image callback")

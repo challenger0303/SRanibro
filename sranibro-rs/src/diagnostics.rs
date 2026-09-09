@@ -15,15 +15,22 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for &byte in bytes {
         crc ^= u32::from(byte);
         for _ in 0..8 {
             crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
         }
     }
-    !crc
+    crc
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    !crc32_update(!0u32, bytes)
+}
+
+pub(crate) fn crc32_fingerprint(bytes: &[u8]) -> u32 {
+    crc32(bytes)
 }
 
 /// Stable label for comparing reports from one physical unit without exporting

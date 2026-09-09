@@ -1,20 +1,19 @@
-//! StarVR One adapter — Tobii Stream Engine over the patched DLL.
+//! StarVR One adapter — Tobii Stream Engine acquisition.
 //!
 //! StarVR One uses the SAME Tobii IS4 EyeChip as the Pimax VR4/Crystal (200x200
 //! @120Hz stereo IR, `slot A = LEFT`), but a DIFFERENT transport: instead of VR4's
-//! DLL-free WinUSB+TTP path, StarVR is driven through the user-supplied patched
-//! stream-engine DLL (`[assets].starvr_dll`, e.g. ReStar's
-//! `tobii_stream_engine_full_unlock.dll`) via the standard Tobii C API.
+//! DLL-free WinUSB+TTP path, StarVR is driven through a compatible stream-engine
+//! runtime via the standard Tobii C API. Official binaries can provide a runtime
+//! validated specifically for StarVR; public-source builds contain no payload.
 //!
-//! This is a FAITHFUL Rust port of the working Python reference
-//! (`starvr_eye_viewer.py`): `tobii_api_create` -> `enumerate_local_device_urls`
+//! The acquisition sequence is `tobii_api_create` -> `enumerate_local_device_urls`
 //! -> `tobii_device_create` -> `tobii_image_subscribe` + `tobii_wearable_data_subscribe`
 //! -> pump `tobii_device_process_callbacks`. Struct layouts verified against
 //! ReStar's vendored `tobii_wearable.h` (compile-time size asserts below).
 //!
-//! UNVERIFIED ON RUST+HARDWARE: the Python path is known-good and this port matches
-//! it 1:1, but run it once on a StarVR One to confirm before trusting. We bundle
-//! nothing — the DLL is the user's, referenced by path.
+//! Startup is not reported as successful until several complete stereo pairs and
+//! wearable samples have arrived. Runtime stalls are surfaced instead of leaving a
+//! frozen camera image marked as streaming.
 
 #![cfg(windows)]
 
@@ -24,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -79,6 +78,7 @@ impl TobiiWearableEye {
             pupil_valid: self.pupil_diameter_validity != 0,
             pupil_pos: self.pupil_position,
             pupil_pos_valid: self.pupil_position_validity != 0,
+            pupil_pos_reported: true,
             openness: self.eye_openness,
             openness_valid: self.eye_openness_validity != 0,
             openness_reported: true,
@@ -164,8 +164,12 @@ struct Ctx {
     on_gaze: GazeFn,
     slot_a_eye: Eye,
     last_image_timestamp_us: u64,
+    pair_first_valid: bool,
     image_count: u64,
+    stereo_pair_count: u64,
     wearable_count: u64,
+    last_image_at: Option<Instant>,
+    last_wearable_at: Option<Instant>,
 }
 
 type InitSender = mpsc::SyncSender<Result<(), String>>;
@@ -187,6 +191,15 @@ fn signal_init_ok(sender: &mut Option<InitSender>) {
 /// device timestamp lets the next capture re-synchronise even if a callback is
 /// malformed or dropped; a global parity bit cannot recover from that.
 const STEREO_PAIR_MAX_DELTA_US: u64 = 2_000;
+const STARTUP_STEREO_PAIRS: u64 = 5;
+const STARTUP_WEARABLE_SAMPLES: u64 = 3;
+const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(8);
+const STREAM_STALE_WARN: Duration = Duration::from_secs(1);
+const STREAM_STALE_ABORT: Duration = Duration::from_secs(3);
+
+fn startup_stream_ready(stereo_pairs: u64, wearable_samples: u64) -> bool {
+    stereo_pairs >= STARTUP_STEREO_PAIRS && wearable_samples >= STARTUP_WEARABLE_SAMPLES
+}
 
 fn route_image_eye(last_timestamp_us: &mut u64, slot_a_eye: Eye, timestamp_us: u64) -> Eye {
     let is_second_in_pair = *last_timestamp_us != 0
@@ -241,12 +254,24 @@ extern "C" fn img_cb(img: *const c_void, user: *mut c_void) {
         ctx.slot_a_eye,
         timestamp_us,
     );
-    if w == 0 || h == 0 || dptr.is_null() || (w as u64) * (h as u64) > (1 << 20) {
+    let valid = w != 0 && h != 0 && !dptr.is_null() && (w as u64) * (h as u64) <= (1 << 20);
+    let is_second_in_pair = eye == ctx.slot_a_eye.opposite();
+    if !valid {
+        ctx.pair_first_valid = false;
         return;
     }
     let n = (w as usize) * (h as usize);
     let px = unsafe { std::slice::from_raw_parts(dptr, n) };
     ctx.image_count += 1;
+    ctx.last_image_at = Some(Instant::now());
+    if is_second_in_pair {
+        if ctx.pair_first_valid {
+            ctx.stereo_pair_count += 1;
+        }
+        ctx.pair_first_valid = false;
+    } else {
+        ctx.pair_first_valid = true;
+    }
     if ctx.image_count == 1 {
         eprintln!("[starvr] first image callback: {w}x{h} ({n} bytes)");
     }
@@ -260,6 +285,7 @@ extern "C" fn adv_cb(data: *const TobiiWearableData, user: *mut c_void) {
     let ctx = unsafe { &mut *(user as *mut Ctx) };
     let d = unsafe { &*data };
     ctx.wearable_count += 1;
+    ctx.last_wearable_at = Some(Instant::now());
     if ctx.wearable_count == 1 {
         eprintln!("[starvr] first wearable callback (gaze/pupil/openness)");
     }
@@ -285,8 +311,9 @@ pub struct StarVrAdapter {
 
 impl StarVrAdapter {
     pub fn new(cfg: &crate::config::Config) -> Self {
-        // verified: slot A (brighter) = LEFT on StarVR One. Service-routed: no handoff.
-        Self::with_profile(cfg, "StarVR One", Eye::Left, false)
+        // Verified: slot A (brighter) = LEFT on StarVR One. The connection route is
+        // discovered automatically and then remembered in the private config field.
+        Self::with_profile(cfg, "StarVR One", Eye::Left, cfg.hmd.starvr_direct)
     }
 
     /// Generic Tobii stream-engine adapter for any IS4 HMD (StarVR, or Pimax via
@@ -305,16 +332,19 @@ impl StarVrAdapter {
                 name: name.into(),
                 ml_device: "vr4".into(), // same IS4 frontal preprocessing as VR4
                 slot_a_eye: slot_a,
-                transport: "Tobii stream engine (DLL)".into(),
+                transport: "Tobii stream engine".into(),
                 streams: "Tobii image + wearable_data".into(),
                 gaze_src: "gaze · pupil · openness (Tobii)".into(),
                 ..DeviceProfile::default()
             },
-            // Common Tobii DLL (shared with the Pimax gate); legacy starvr_dll is
-            // still honored via the resolver for back-compat.
-            dll_path: cfg
-                .tobii_dll_path()
-                .map(|p| p.to_string_lossy().into_owned()),
+            // StarVR uses a separately validated runtime in official builds;
+            // the generic Pimax stream-engine route keeps the general runtime.
+            dll_path: if name.contains("StarVR") {
+                cfg.starvr_runtime_path()
+            } else {
+                cfg.tobii_runtime_path()
+            }
+            .map(|p| p.to_string_lossy().into_owned()),
             handoff,
             // Observed StarVR serial URLs start with VRS. Prefer that device if
             // another Tobii runtime also exposes a local URL on the machine.
@@ -353,13 +383,15 @@ impl HmdAdapter for StarVrAdapter {
                 "StarVR initialization previously timed out; restart SRanibro before retrying",
             ));
         }
-        if !self.handoff {
+        if self.handoff {
+            crate::platform::ensure_starvr_direct_ready();
+        } else {
             crate::platform::ensure_starvr_ready();
         }
         let dll_path = self.dll_path.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
-                "StarVR: set [assets].tobii_dll to the Tobii stream-engine DLL",
+                "StarVR: Tobii runtime unavailable — reinstall the official SRanibro build",
             )
         })?;
         let stop = self.stop.clone();
@@ -371,23 +403,26 @@ impl HmdAdapter for StarVrAdapter {
 
         let handle = thread::spawn(move || {
             let mut init_tx = Some(init_tx);
-            set_status(&status, "loading DLL…");
+            set_status(&status, "loading Tobii runtime…");
             let dll_c = match CString::new(dll_path.clone()) {
                 Ok(c) => c,
                 Err(_) => {
-                    set_status(&status, "bad DLL path");
-                    signal_init_error(&mut init_tx, "StarVR DLL path contains a NUL byte");
+                    set_status(&status, "Tobii runtime path is invalid");
+                    signal_init_error(&mut init_tx, "StarVR runtime path is invalid");
                     return;
                 }
             };
             let hmod = unsafe { LoadLibraryA(dll_c.as_ptr() as *const u8) };
             if hmod.is_null() {
                 let win32 = unsafe { GetLastError() };
-                eprintln!("[starvr] LoadLibraryA failed: win32={win32}, path={dll_path}");
-                set_status(&status, format!("DLL load failed (Win32 {win32})"));
+                eprintln!("[starvr] Tobii runtime load failed: win32={win32}");
+                set_status(
+                    &status,
+                    format!("Tobii runtime load failed (Win32 {win32})"),
+                );
                 signal_init_error(
                     &mut init_tx,
-                    format!("StarVR DLL load failed (Win32 {win32})"),
+                    format!("StarVR runtime load failed (Win32 {win32})"),
                 );
                 return;
             }
@@ -399,8 +434,11 @@ impl HmdAdapter for StarVrAdapter {
                         Some(f) => f,
                         None => {
                             eprintln!("[starvr] missing export: {}", $name);
-                            set_status(&status, concat!("DLL missing ", $name));
-                            signal_init_error(&mut init_tx, concat!("StarVR DLL missing ", $name));
+                            set_status(&status, concat!("Tobii runtime missing ", $name));
+                            signal_init_error(
+                                &mut init_tx,
+                                concat!("StarVR runtime missing ", $name),
+                            );
                             unsafe { FreeLibrary(hmod) };
                             return;
                         }
@@ -523,8 +561,12 @@ impl HmdAdapter for StarVrAdapter {
                 on_gaze,
                 slot_a_eye: slot_a,
                 last_image_timestamp_us: 0,
+                pair_first_valid: false,
                 image_count: 0,
+                stereo_pair_count: 0,
                 wearable_count: 0,
+                last_image_at: None,
+                last_wearable_at: None,
             });
             let ctx_ptr = &mut *ctx as *mut Ctx as *mut c_void;
 
@@ -555,20 +597,50 @@ impl HmdAdapter for StarVrAdapter {
                 }
                 return;
             }
-            // Gaze/pupil/openness is best-effort (the image alone still feeds the ML).
             let adv_rc = unsafe { adv_sub(dev, adv_cb, ctx_ptr) };
-            let have_adv = adv_rc == 0;
-            if !have_adv {
+            if adv_rc != 0 {
                 eprintln!(
-                    "[starvr] tobii_wearable_data_subscribe failed: rc={adv_rc} ({}) (no gaze overlay)",
+                    "[starvr] tobii_wearable_data_subscribe failed: rc={adv_rc} ({})",
                     error_name(adv_rc)
                 );
+                set_status(
+                    &status,
+                    format!(
+                        "tobii_wearable_data_subscribe failed: {adv_rc} ({})",
+                        error_name(adv_rc)
+                    ),
+                );
+                signal_init_error(
+                    &mut init_tx,
+                    format!(
+                        "tobii_wearable_data_subscribe failed: {adv_rc} ({})",
+                        error_name(adv_rc)
+                    ),
+                );
+                unsafe {
+                    let image_unsub_rc = img_unsub(dev);
+                    if image_unsub_rc != 0 && image_unsub_rc != 2 {
+                        eprintln!(
+                            "[starvr] image unsubscribe after startup failure: rc={image_unsub_rc} ({})",
+                            error_name(image_unsub_rc)
+                        );
+                    }
+                    device_destroy(dev);
+                    api_destroy(api);
+                    FreeLibrary(hmod);
+                }
+                return;
             }
-            set_status(&status, "streaming");
-            eprintln!("[starvr] streaming");
-            signal_init_ok(&mut init_tx);
+            let have_adv = true;
+            set_status(&status, "waiting for live stereo images and wearable data…");
+            eprintln!(
+                "[starvr] subscriptions accepted; verifying continuous image + wearable callbacks"
+            );
 
             let mut consecutive_process_errors = 0u32;
+            let startup_deadline = Instant::now() + STARTUP_READINESS_TIMEOUT;
+            let mut startup_complete = false;
+            let mut stale_reported = false;
             while !stop.load(Ordering::Relaxed) {
                 let rc = unsafe { process(dev) };
                 if rc != 0 {
@@ -590,16 +662,81 @@ impl HmdAdapter for StarVrAdapter {
                         ));
                         continue;
                     }
-                    set_status(
-                        &status,
-                        format!("callback processing failed: {rc} ({})", error_name(rc)),
-                    );
+                    let message = format!("callback processing failed: {rc} ({})", error_name(rc));
+                    set_status(&status, &message);
+                    if !startup_complete {
+                        signal_init_error(&mut init_tx, &message);
+                    }
                     break;
                 }
                 if consecutive_process_errors != 0 {
                     consecutive_process_errors = 0;
                     set_status(&status, "streaming");
                     eprintln!("[starvr] callback processing recovered");
+                }
+
+                if !startup_complete
+                    && startup_stream_ready(ctx.stereo_pair_count, ctx.wearable_count)
+                {
+                    startup_complete = true;
+                    set_status(&status, "streaming (live data verified)");
+                    eprintln!(
+                        "[starvr] STREAM READY: stereo_pairs={} wearable_samples={} images={}",
+                        ctx.stereo_pair_count, ctx.wearable_count, ctx.image_count
+                    );
+                    signal_init_ok(&mut init_tx);
+                } else if !startup_complete && Instant::now() >= startup_deadline {
+                    let message = format!(
+                        "StarVR stream readiness timed out (images={}, stereo_pairs={}, wearable={}); keep the HMD awake and fully seated",
+                        ctx.image_count, ctx.stereo_pair_count, ctx.wearable_count
+                    );
+                    eprintln!("[starvr] {message}");
+                    set_status(&status, &message);
+                    signal_init_error(&mut init_tx, &message);
+                    break;
+                }
+
+                if startup_complete {
+                    let now = Instant::now();
+                    let image_age = ctx
+                        .last_image_at
+                        .map(|at| now.saturating_duration_since(at))
+                        .unwrap_or(Duration::MAX);
+                    let wearable_age = ctx
+                        .last_wearable_at
+                        .map(|at| now.saturating_duration_since(at))
+                        .unwrap_or(Duration::MAX);
+                    let stale = image_age > STREAM_STALE_WARN || wearable_age > STREAM_STALE_WARN;
+                    if stale && !stale_reported {
+                        stale_reported = true;
+                        set_status(
+                            &status,
+                            format!(
+                                "StarVR stream stale: image {:.1}s, wearable {:.1}s",
+                                image_age.as_secs_f32(),
+                                wearable_age.as_secs_f32()
+                            ),
+                        );
+                        eprintln!(
+                            "[starvr] STREAM STALE: image age {:.2}s, wearable age {:.2}s",
+                            image_age.as_secs_f32(),
+                            wearable_age.as_secs_f32()
+                        );
+                    } else if !stale && stale_reported {
+                        stale_reported = false;
+                        set_status(&status, "streaming (live data verified)");
+                        eprintln!("[starvr] stream recovered");
+                    }
+                    if image_age > STREAM_STALE_ABORT || wearable_age > STREAM_STALE_ABORT {
+                        let message = format!(
+                            "StarVR live stream stopped (image {:.1}s, wearable {:.1}s)",
+                            image_age.as_secs_f32(),
+                            wearable_age.as_secs_f32()
+                        );
+                        set_status(&status, &message);
+                        eprintln!("[starvr] {message}");
+                        break;
+                    }
                 }
                 thread::sleep(Duration::from_millis(2));
             }
@@ -609,7 +746,13 @@ impl HmdAdapter for StarVrAdapter {
                 if have_adv {
                     adv_unsub(dev);
                 }
-                img_unsub(dev);
+                let image_unsub_rc = img_unsub(dev);
+                if image_unsub_rc != 0 && image_unsub_rc != 2 {
+                    eprintln!(
+                        "[starvr] image unsubscribe: rc={image_unsub_rc} ({})",
+                        error_name(image_unsub_rc)
+                    );
+                }
                 device_destroy(dev);
                 api_destroy(api);
                 FreeLibrary(hmod);
@@ -621,7 +764,7 @@ impl HmdAdapter for StarVrAdapter {
             }
         });
         self.thread = Some(handle);
-        match init_rx.recv_timeout(Duration::from_secs(10)) {
+        match init_rx.recv_timeout(Duration::from_secs(12)) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(message)) => {
                 if let Some(handle) = self.thread.take() {
@@ -641,7 +784,7 @@ impl HmdAdapter for StarVrAdapter {
                 self.thread.take();
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "StarVR initialization timed out after 10 seconds",
+                    "StarVR initialization timed out after 12 seconds",
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -716,5 +859,23 @@ mod tests {
     fn timestamp_reset_starts_a_new_stereo_pair() {
         let mut last = 90_000;
         assert_eq!(route_image_eye(&mut last, Eye::Left, 100), Eye::Left);
+    }
+
+    #[test]
+    fn startup_requires_both_stereo_images_and_wearable_data() {
+        assert!(!startup_stream_ready(STARTUP_STEREO_PAIRS, 0));
+        assert!(!startup_stream_ready(0, STARTUP_WEARABLE_SAMPLES));
+        assert!(!startup_stream_ready(
+            STARTUP_STEREO_PAIRS - 1,
+            STARTUP_WEARABLE_SAMPLES
+        ));
+        assert!(!startup_stream_ready(
+            STARTUP_STEREO_PAIRS,
+            STARTUP_WEARABLE_SAMPLES - 1
+        ));
+        assert!(startup_stream_ready(
+            STARTUP_STEREO_PAIRS,
+            STARTUP_WEARABLE_SAMPLES
+        ));
     }
 }

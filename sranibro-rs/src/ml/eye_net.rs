@@ -50,6 +50,22 @@ pub struct EyeNet {
     b: Vec<f32>,
 }
 
+/// Borrowed immutable weights used to build an alternate inference backend without
+/// reparsing or changing the user's SRanipal model file. Scratch buffers deliberately
+/// stay private to the CPU implementation.
+pub(crate) struct EyeNetWeights<'a> {
+    pub(crate) conv1_w: &'a [f32],
+    pub(crate) conv1_b: &'a [f32],
+    pub(crate) conv2_w: &'a [f32],
+    pub(crate) conv2_b: &'a [f32],
+    pub(crate) conv3_w: &'a [f32],
+    pub(crate) conv3_b: &'a [f32],
+    pub(crate) fc1_w: &'a [f32],
+    pub(crate) fc1_b: &'a [f32],
+    pub(crate) fc2_w: &'a [f32],
+    pub(crate) fc2_b: &'a [f32],
+}
+
 /// Expected weight tensors and shapes for the SRanipal EyePrediction net. The
 /// user supplies their own weights (from their SRanipal install), so we validate
 /// the model matches this architecture and fail with a precise message otherwise
@@ -98,6 +114,21 @@ impl EyeNet {
             a: Vec::new(),
             b: Vec::new(),
         })
+    }
+
+    pub(crate) fn weights(&self) -> EyeNetWeights<'_> {
+        EyeNetWeights {
+            conv1_w: &self.conv1_w,
+            conv1_b: &self.conv1_b,
+            conv2_w: &self.conv2_w,
+            conv2_b: &self.conv2_b,
+            conv3_w: &self.conv3_w,
+            conv3_b: &self.conv3_b,
+            fc1_w: &self.fc1_w,
+            fc1_b: &self.fc1_b,
+            fc2_w: &self.fc2_w,
+            fc2_b: &self.fc2_b,
+        }
     }
 
     /// Forward a single sample (2ch x 100x100, layout [c][h][w]) -> 5 outputs.

@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use crate::core::types::{DespeckleParams, FlattenParams, MlGeometry};
-use crate::geometry_calib::{GeometryDataset, SampleFamily, SampleKind};
+use crate::core::types::{DespeckleParams, FlattenParams, MlGeometry, PhotometricCorrection};
+use crate::geometry_calib::{
+    GeometryDataset, GeometrySample, SampleFamily, SampleKind, SharedEvidence,
+};
 use crate::geometry_discovery::{
     estimate_appearance_geometry, estimate_motion_geometry, AppearanceGeometryEstimate,
     MotionFrame, MotionGeometryEstimate,
@@ -31,12 +33,28 @@ const XR5_MIN_INNER_CROP: f32 = 0.40;
 const AUDIT_FOLDS: usize = 5;
 const AUDIT_BLOCK_FRAMES: usize = 12;
 const AUDIT_GUARD_FRAMES: usize = 1;
-const AUDIT_FRAMES_PER_FAMILY_FOLD: usize = 16;
+// Every fold must contain the same amount of train-only evidence.  Ten is the
+// guaranteed minimum after block guards in the real capture protocol; asking for
+// more made fold zero larger than the remaining folds and biased the audit mean.
+const AUDIT_FRAMES_PER_FAMILY_FOLD: usize = 10;
+const STATIC_PHASE_TRIM_S: f32 = 0.70;
+const STATIC_TAIL_S: f32 = 1.0;
+const STATIC_END_GUARD_FRAMES: usize = 2;
+const ANCHOR_SIM_MULT: f32 = 2.0;
+const MIN_STATIC_STABLE_S: f32 = 0.40;
+const GAZE_PHASE_TRIM_S: f32 = 0.50;
+const MIN_STATIC_STABLE_FRAMES: usize = 5;
+const MIN_GAZE_STABLE_FRAMES: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct FitInputs {
     pub model_path: PathBuf,
-    pub dataset: GeometryDataset,
+    /// Exact bytes verified against the live model before the capture is consumed.
+    /// Workers parse this immutable snapshot rather than re-reading a mutable path.
+    pub model_bytes: Arc<[u8]>,
+    pub expected_model_crc32: u32,
+    pub expected_model_bytes: u64,
+    pub dataset: SharedEvidence,
     /// Geometry active at capture start. It is the immutable fallback and search centre.
     pub baseline: [MlGeometry; 2],
     /// Effective live mirror flags. Mirror is hardware handedness, never a search variable.
@@ -56,7 +74,10 @@ pub struct GeometryMetrics {
     pub evidence_valid: bool,
     pub score: f32,
     pub separation: [f32; 2],
+    pub open_ref: [f32; 2],
+    pub closed_ref: [f32; 2],
     pub monotonicity: [f32; 2],
+    pub slow_close_std: [f32; 2],
     pub blink_response: f32,
     pub stability: f32,
     pub presence_rate: f32,
@@ -69,6 +90,15 @@ pub struct GeometryMetrics {
     pub gaze_noise: f32,
     pub neutral_noise_per_eye: [f32; 2],
     pub gaze_noise_per_eye: [f32; 2],
+    /// Fraction of the open-to-closed eyelid span retained while looking around.
+    /// Values are per eye; 1.0 means gaze direction did not falsely close the lid.
+    pub gaze_retention: [f32; 2],
+    /// Spurious squeeze produced during the gaze sweep, relative to relaxed neutral.
+    pub gaze_squeeze_fp: [f32; 2],
+    /// Absolute difference between left and right gaze retention.
+    pub gaze_asymmetry: f32,
+    /// Fraction of gaze-sweep frames with valid native Tobii vectors for both eyes.
+    pub gaze_evidence_rate: f32,
     pub blink_events: [usize; 2],
 }
 
@@ -90,8 +120,77 @@ pub struct GeometryFitResult {
     /// centres and aperture axes. Like the motion seed, it never sees the holdout.
     pub appearance_seed: Option<AppearanceGeometryEstimate>,
     pub candidate_from_appearance_seed: bool,
+    pub invalid_static_phases: usize,
+    pub degraded_static_phases: usize,
+    pub valid_closed_phases: [usize; 2],
     pub accepted: bool,
     pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PhotometricFitInputs {
+    pub model_path: PathBuf,
+    pub model_bytes: Arc<[u8]>,
+    pub expected_model_crc32: u32,
+    pub expected_model_bytes: u64,
+    pub dataset: SharedEvidence,
+    /// Frozen frontal geometry. It is evaluated but never searched or changed.
+    pub geometry: [MlGeometry; 2],
+    pub mirrors: [bool; 2],
+    pub despeckle: DespeckleParams,
+    pub flatten: FlattenParams,
+    /// Correction active at capture start and the immutable fallback.
+    pub baseline: PhotometricCorrection,
+}
+
+#[derive(Debug)]
+pub struct PhotometricStartError {
+    pub message: String,
+    pub inputs: PhotometricFitInputs,
+}
+
+#[derive(Clone, Debug)]
+pub struct PhotometricFitResult {
+    pub baseline: PhotometricCorrection,
+    pub candidate: PhotometricCorrection,
+    pub baseline_train: GeometryMetrics,
+    pub candidate_train: GeometryMetrics,
+    pub baseline_holdout: GeometryMetrics,
+    pub candidate_holdout: GeometryMetrics,
+    pub holdout_improvement: f32,
+    pub invalid_static_phases: usize,
+    pub degraded_static_phases: usize,
+    pub valid_closed_phases: [usize; 2],
+    pub accepted: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum PhotometricStatus {
+    Idle,
+    Running {
+        stage: String,
+        completed: usize,
+        total: usize,
+        log: Vec<String>,
+    },
+    Done {
+        result: PhotometricFitResult,
+        log: Vec<String>,
+    },
+    Failed {
+        message: String,
+        log: Vec<String>,
+    },
+    Cancelled {
+        log: Vec<String>,
+    },
+}
+
+impl PhotometricStatus {
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
 }
 
 /// Mean and between-fold spread for one geometry-audit signal.
@@ -264,16 +363,18 @@ impl GeometryFitter {
                 inputs,
             });
         }
-        if !inputs.model_path.is_file() {
+        if inputs.model_bytes.is_empty()
+            || inputs.model_bytes.len() as u64 != inputs.expected_model_bytes
+            || crate::diagnostics::crc32_fingerprint(&inputs.model_bytes)
+                != inputs.expected_model_crc32
+        {
             return Err(StartError {
-                message: format!(
-                    "SRanipal EyePrediction model not found: {}",
-                    inputs.model_path.display()
-                ),
+                message: "EyePrediction model snapshot does not match the live load-time identity"
+                    .into(),
                 inputs,
             });
         }
-        if let Err(message) = validate_dataset_shape(&inputs.dataset) {
+        if let Err(message) = validate_dataset_shape(inputs.dataset.as_dataset()) {
             return Err(StartError { message, inputs });
         }
         if let Some(handle) = self.handle.take() {
@@ -307,6 +408,16 @@ impl GeometryFitter {
                 JobKind::Audit => "xr5-geometry-audit".into(),
             })
             .spawn(move || {
+                #[cfg(windows)]
+                unsafe {
+                    // Candidate replay is sustained bulk CPU work. Keep live camera,
+                    // ML/output and the Windows compositor ahead of it under contention.
+                    let thread = windows_sys::Win32::System::Threading::GetCurrentThread();
+                    let _ = windows_sys::Win32::System::Threading::SetThreadPriority(
+                        thread,
+                        windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL,
+                    );
+                }
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let inputs = worker_pending
                         .lock()
@@ -377,16 +488,218 @@ impl Drop for GeometryFitter {
     }
 }
 
+struct PhotometricShared {
+    status: PhotometricStatus,
+    log: Vec<String>,
+    stage: String,
+    completed: usize,
+    total: usize,
+}
+
+impl PhotometricShared {
+    fn push(&mut self, line: impl Into<String>) {
+        if self.log.len() >= LOG_CAP {
+            self.log.drain(0..self.log.len() - LOG_CAP + 1);
+        }
+        self.log.push(line.into());
+        if matches!(self.status, PhotometricStatus::Running { .. }) {
+            self.publish_running();
+        }
+    }
+
+    fn progress(&mut self, stage: &str, completed: usize, total: usize) {
+        self.stage = stage.into();
+        self.completed = completed.min(total);
+        self.total = total;
+        self.publish_running();
+    }
+
+    fn publish_running(&mut self) {
+        self.status = PhotometricStatus::Running {
+            stage: self.stage.clone(),
+            completed: self.completed,
+            total: self.total,
+            log: self.log.clone(),
+        };
+    }
+}
+
+pub struct PhotometricFitter {
+    shared: Arc<Mutex<PhotometricShared>>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Default for PhotometricFitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PhotometricFitter {
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(PhotometricShared {
+                status: PhotometricStatus::Idle,
+                log: Vec::new(),
+                stage: String::new(),
+                completed: 0,
+                total: 0,
+            })),
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        }
+    }
+
+    pub fn status(&self) -> PhotometricStatus {
+        lock_photometric(&self.shared).status.clone()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status().is_running()
+    }
+
+    pub fn start(&mut self, inputs: PhotometricFitInputs) -> Result<(), PhotometricStartError> {
+        if self.is_running() {
+            return Err(PhotometricStartError {
+                message: "a photometric fit is already running".into(),
+                inputs,
+            });
+        }
+        if inputs.model_bytes.is_empty()
+            || inputs.model_bytes.len() as u64 != inputs.expected_model_bytes
+            || crate::diagnostics::crc32_fingerprint(&inputs.model_bytes)
+                != inputs.expected_model_crc32
+        {
+            return Err(PhotometricStartError {
+                message: "EyePrediction model snapshot does not match the live load-time identity"
+                    .into(),
+                inputs,
+            });
+        }
+        if let Err(message) = validate_dataset_shape(inputs.dataset.as_dataset()) {
+            return Err(PhotometricStartError { message, inputs });
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.cancel.store(false, Ordering::Relaxed);
+        {
+            let mut state = lock_photometric(&self.shared);
+            state.log.clear();
+            state.stage = "starting".into();
+            state.completed = 0;
+            state.total = 1;
+            state.publish_running();
+        }
+        let shared = self.shared.clone();
+        let panic_shared = shared.clone();
+        let cancel = self.cancel.clone();
+        let pending = Arc::new(Mutex::new(Some(inputs)));
+        let worker_pending = pending.clone();
+        match std::thread::Builder::new()
+            .name("photometric-fitter".into())
+            .spawn(move || {
+                #[cfg(windows)]
+                unsafe {
+                    let thread = windows_sys::Win32::System::Threading::GetCurrentThread();
+                    let _ = windows_sys::Win32::System::Threading::SetThreadPriority(
+                        thread,
+                        windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL,
+                    );
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let inputs = worker_pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                        .expect("photometric fitter input must be present");
+                    run_photometric(shared, cancel, inputs);
+                }));
+                if outcome.is_err() {
+                    photometric_fail(
+                        &panic_shared,
+                        "photometric worker hit an unexpected internal panic; current correction was not changed"
+                            .into(),
+                    );
+                }
+            }) {
+            Ok(handle) => {
+                self.handle = Some(handle);
+                Ok(())
+            }
+            Err(error) => {
+                let inputs = pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("failed spawn must leave photometric input available");
+                lock_photometric(&self.shared).status = PhotometricStatus::Idle;
+                Err(PhotometricStartError {
+                    message: format!("could not spawn photometric worker: {error}"),
+                    inputs,
+                })
+            }
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear_finished(&mut self) -> bool {
+        if self.is_running() {
+            return false;
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let mut state = lock_photometric(&self.shared);
+        state.status = PhotometricStatus::Idle;
+        state.log.clear();
+        state.stage.clear();
+        state.completed = 0;
+        state.total = 0;
+        true
+    }
+}
+
+impl Drop for PhotometricFitter {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            drop(handle);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PreparedSample {
     kind: SampleKind,
     expected_open: Option<f32>,
     phase_index: usize,
     native_open: [Option<f32>; 2],
+    native_gaze_deg: [Option<[f32; 2]>; 2],
+    /// Candidate-independent capture stability derived once from the raw eye images.
+    stable: bool,
     left: Vec<u8>,
     right: Vec<u8>,
     left_size: (u32, u32),
     right_size: (u32, u32),
+}
+
+/// Unilateral wink poses are semantic evidence for `wink_fit`, not bilateral
+/// closed-eye evidence for image alignment or photometric fitting. `SampleKind`
+/// intentionally maps them to `SampleFamily::Closed` for legacy exhaustiveness,
+/// so every geometry-scoring boundary must exclude them by exact kind.
+fn is_geometry_scoring_kind(kind: SampleKind) -> bool {
+    !matches!(
+        kind,
+        SampleKind::LeftWink
+            | SampleKind::RightWink
+            | SampleKind::HoldoutLeftWink
+            | SampleKind::HoldoutRightWink
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -425,8 +738,11 @@ struct Observation {
     expected_open: Option<f32>,
     phase_index: usize,
     native_open: [Option<f32>; 2],
+    native_gaze_deg: [Option<[f32; 2]>; 2],
+    stable: bool,
     presence: f32,
     open: [f32; 2],
+    squeeze: [f32; 2],
 }
 
 #[derive(Default)]
@@ -439,9 +755,379 @@ struct ImageAccum {
     motion_pixels: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct StabilityReport {
+    pub flags: Vec<bool>,
+    pub invalid_static_phases: usize,
+    pub degraded_static_phases: usize,
+    pub valid_closed_phases: [usize; 2],
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone)]
+struct StereoAnchor {
+    left: Vec<u8>,
+    right: Vec<u8>,
+}
+
+struct StaticPhaseEvidence {
+    phase_index: usize,
+    family: SampleFamily,
+    split: usize,
+    trimmed: Vec<usize>,
+    tail: Vec<usize>,
+    anchor: StereoAnchor,
+    similarity: f32,
+    invalid: bool,
+}
+
+/// Select the requested static pose from the *end* of each phase. A participant can
+/// remain perfectly still in the previous pose for several seconds, so first-quiet-
+/// streak detection is fundamentally ambiguous. End anchoring uses only raw pixels,
+/// labels and the fixed fallback crop and is therefore identical for every candidate.
+fn capture_stability_flags(
+    samples: &[GeometrySample],
+    baseline: [MlGeometry; 2],
+) -> StabilityReport {
+    let mut report = StabilityReport {
+        flags: vec![false; samples.len()],
+        ..StabilityReport::default()
+    };
+    for (index, sample) in samples.iter().enumerate() {
+        if !is_geometry_scoring_kind(sample.kind) {
+            continue;
+        }
+        if matches!(
+            sample.kind.family(),
+            SampleFamily::SlowClose | SampleFamily::NaturalBlinks
+        ) {
+            report.flags[index] = true;
+        }
+    }
+
+    let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, sample) in samples.iter().enumerate() {
+        if is_geometry_scoring_kind(sample.kind)
+            && matches!(
+                sample.kind.family(),
+                SampleFamily::Neutral | SampleFamily::Closed | SampleFamily::HalfOpen
+            )
+        {
+            grouped.entry(sample.phase_index).or_default().push(index);
+        }
+    }
+
+    let mut phases = Vec::new();
+    for (phase_index, indices) in grouped {
+        let mut trimmed = indices
+            .into_iter()
+            .filter(|index| samples[*index].phase_time_s >= STATIC_PHASE_TRIM_S)
+            .collect::<Vec<_>>();
+        if trimmed.len() <= STATIC_END_GUARD_FRAMES {
+            report.invalid_static_phases += 1;
+            report.notes.push(format!(
+                "phase {phase_index}: fewer than three guarded static frames"
+            ));
+            continue;
+        }
+        trimmed.truncate(trimmed.len() - STATIC_END_GUARD_FRAMES);
+        let guarded_end_s = samples[*trimmed.last().unwrap()].phase_time_s;
+        let tail = trimmed
+            .iter()
+            .copied()
+            .filter(|index| samples[*index].phase_time_s >= guarded_end_s - STATIC_TAIL_S - 1.0e-4)
+            .collect::<Vec<_>>();
+        if tail.len() < 3 {
+            report.invalid_static_phases += 1;
+            report.notes.push(format!(
+                "phase {phase_index}: static tail has fewer than 3 frames"
+            ));
+            continue;
+        }
+        let Some(anchor) = median_stereo_anchor(samples, &tail, baseline) else {
+            report.invalid_static_phases += 1;
+            report.notes.push(format!(
+                "phase {phase_index}: camera dimensions changed inside the static tail"
+            ));
+            continue;
+        };
+        let sample = &samples[tail[0]];
+        phases.push(StaticPhaseEvidence {
+            phase_index,
+            family: sample.kind.family(),
+            split: sample.kind.is_holdout() as usize,
+            trimmed,
+            tail,
+            anchor,
+            similarity: 0.0,
+            invalid: false,
+        });
+    }
+
+    let mut motion_threshold = [0.01; 2];
+    for (split, threshold) in motion_threshold.iter_mut().enumerate() {
+        let motions = phases
+            .iter()
+            .filter(|phase| phase.split == split)
+            .flat_map(|phase| phase.tail.windows(2))
+            .filter_map(|pair| raw_stereo_l1(&samples[pair[0]], &samples[pair[1]], baseline))
+            .collect::<Vec<_>>();
+        *threshold = (percentile(&motions, 0.50).unwrap_or(0.005) * 2.0).clamp(0.002, 0.05);
+    }
+
+    for phase in &mut phases {
+        let threshold = motion_threshold[phase.split];
+        let tail_distances = phase
+            .tail
+            .iter()
+            .filter_map(|index| anchor_distance(&samples[*index], &phase.anchor, baseline))
+            .collect::<Vec<_>>();
+        phase.similarity = (ANCHOR_SIM_MULT
+            * percentile(&tail_distances, 0.50).unwrap_or(threshold))
+        .max(threshold)
+        .clamp(0.002, 0.05);
+    }
+
+    // A Closed phase whose final raw appearance is indistinguishable from the nearest
+    // Neutral phase is non-compliant evidence, not a valid zero-span calibration point.
+    for closed_index in 0..phases.len() {
+        if phases[closed_index].family != SampleFamily::Closed {
+            continue;
+        }
+        let split = phases[closed_index].split;
+        let phase_index = phases[closed_index].phase_index;
+        let nearest = phases
+            .iter()
+            .enumerate()
+            .filter(|(_, phase)| phase.split == split && phase.family == SampleFamily::Neutral)
+            .min_by_key(|(_, phase)| phase.phase_index.abs_diff(phase_index));
+        if let Some((_, neutral)) = nearest {
+            let distance = anchor_l1(&phases[closed_index].anchor, &neutral.anchor);
+            // Compare two median pose anchors against their own within-pose noise
+            // envelopes. Using twice the frame-to-frame motion threshold here made the
+            // limit four times the camera noise and rejected real VR4 closures: the
+            // eyelid changes only a small part of the full 200x200 image, while sensor
+            // noise is present everywhere.
+            let indistinguishable_limit = phases[closed_index]
+                .similarity
+                .max(neutral.similarity)
+                .max(0.004);
+            match distance {
+                Some(distance) if distance <= indistinguishable_limit => {
+                    phases[closed_index].invalid = true;
+                    report.invalid_static_phases += 1;
+                    report.notes.push(format!(
+                        "phase {phase_index}: CLOSED tail is visually indistinguishable from \
+                         NEUTRAL (distance {distance:.4}, noise limit \
+                         {indistinguishable_limit:.4})"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for phase in &phases {
+        if phase.invalid {
+            continue;
+        }
+        let threshold = motion_threshold[phase.split];
+        let last_move_position =
+            phase
+                .trimmed
+                .windows(2)
+                .enumerate()
+                .rev()
+                .find_map(|(position, pair)| {
+                    raw_stereo_l1(&samples[pair[0]], &samples[pair[1]], baseline)
+                        .is_some_and(|motion| motion > threshold)
+                        .then_some(position + 1)
+                });
+        let after_last_move = last_move_position.unwrap_or(0);
+        let mut start = phase.trimmed.len();
+        for position in (after_last_move..phase.trimmed.len()).rev() {
+            let index = phase.trimmed[position];
+            if anchor_distance(&samples[index], &phase.anchor, baseline)
+                .is_some_and(|distance| distance <= phase.similarity)
+            {
+                start = position;
+            } else {
+                break;
+            }
+        }
+        let stable = &phase.trimmed[start..];
+        let stable_span = stable
+            .first()
+            .zip(stable.last())
+            .map(|(first, last)| samples[*last].phase_time_s - samples[*first].phase_time_s)
+            .unwrap_or(0.0);
+        let selected =
+            if stable.len() >= MIN_STATIC_STABLE_FRAMES && stable_span >= MIN_STATIC_STABLE_S {
+                stable
+            } else {
+                report.degraded_static_phases += 1;
+                report.notes.push(format!(
+                    "phase {}: no long stable suffix; guarded final {:.1}s tail used",
+                    phase.phase_index, STATIC_TAIL_S
+                ));
+                phase.tail.as_slice()
+            };
+        for &index in selected {
+            report.flags[index] = true;
+        }
+        if phase.family == SampleFamily::Closed {
+            report.valid_closed_phases[phase.split] += 1;
+        }
+    }
+
+    // Gaze begins only after the raw eye image has actually departed from the preceding
+    // static pose for two consecutive frames. This removes delayed reaction without
+    // consulting EyeNet output or a candidate geometry.
+    let mut gaze_groups = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, sample) in samples.iter().enumerate() {
+        if sample.kind.family() == SampleFamily::GazeSweep {
+            gaze_groups
+                .entry(sample.phase_index)
+                .or_default()
+                .push(index);
+        }
+    }
+    for (phase_index, indices) in gaze_groups {
+        let split = samples[indices[0]].kind.is_holdout() as usize;
+        let previous = phases
+            .iter()
+            .filter(|phase| {
+                !phase.invalid
+                    && phase.split == split
+                    && phase.family == SampleFamily::Neutral
+                    && phase.phase_index < phase_index
+            })
+            .max_by_key(|phase| phase.phase_index);
+        // Without a preceding valid Neutral anchor there is no candidate-independent
+        // way to distinguish an actual gaze departure from carry-over motion. Exclude
+        // that phase instead of treating every post-trim frame as valid gaze evidence.
+        let mut departed = false;
+        let mut departure_streak = 0usize;
+        for index in indices {
+            if samples[index].phase_time_s < GAZE_PHASE_TRIM_S {
+                continue;
+            }
+            if let Some(previous) = previous {
+                let outside = anchor_distance(&samples[index], &previous.anchor, baseline)
+                    .is_some_and(|distance| distance > previous.similarity);
+                departure_streak = if outside { departure_streak + 1 } else { 0 };
+                if departure_streak >= 2 {
+                    departed = true;
+                }
+            }
+            report.flags[index] = departed;
+        }
+    }
+    report
+}
+
+fn crop_stereo_pixels(sample: &GeometrySample, baseline: [MlGeometry; 2]) -> Option<StereoAnchor> {
+    Some(StereoAnchor {
+        left: crop_pixels(&sample.left, sample.left_size, baseline[0])?,
+        right: crop_pixels(&sample.right, sample.right_size, baseline[1])?,
+    })
+}
+
+fn crop_pixels(frame: &[u8], size: (u32, u32), geometry: MlGeometry) -> Option<Vec<u8>> {
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    if width == 0 || height == 0 || frame.len() < width.saturating_mul(height) {
+        return None;
+    }
+    let x0 = (geometry.crop_left.clamp(0.0, 0.95) * width as f32).floor() as usize;
+    let x1 = ((1.0 - geometry.crop_right.clamp(0.0, 0.95)) * width as f32).ceil() as usize;
+    let y0 = (geometry.crop_top.clamp(0.0, 0.95) * height as f32).floor() as usize;
+    let y1 = ((1.0 - geometry.crop_bottom.clamp(0.0, 0.95)) * height as f32).ceil() as usize;
+    let (x1, y1) = (x1.clamp(x0 + 1, width), y1.clamp(y0 + 1, height));
+    let mut pixels = Vec::with_capacity((x1 - x0) * (y1 - y0));
+    for y in y0..y1 {
+        pixels.extend_from_slice(&frame[y * width + x0..y * width + x1]);
+    }
+    Some(pixels)
+}
+
+fn median_stereo_anchor(
+    samples: &[GeometrySample],
+    indices: &[usize],
+    baseline: [MlGeometry; 2],
+) -> Option<StereoAnchor> {
+    let frames = indices
+        .iter()
+        .map(|index| crop_stereo_pixels(&samples[*index], baseline))
+        .collect::<Option<Vec<_>>>()?;
+    let left_len = frames.first()?.left.len();
+    let right_len = frames.first()?.right.len();
+    if frames
+        .iter()
+        .any(|frame| frame.left.len() != left_len || frame.right.len() != right_len)
+    {
+        return None;
+    }
+    Some(StereoAnchor {
+        left: median_anchor_channel(&frames, false, left_len),
+        right: median_anchor_channel(&frames, true, right_len),
+    })
+}
+
+fn median_anchor_channel(frames: &[StereoAnchor], right: bool, len: usize) -> Vec<u8> {
+    let mut result = Vec::with_capacity(len);
+    let mut values = Vec::with_capacity(frames.len());
+    for pixel in 0..len {
+        values.clear();
+        values.extend(frames.iter().map(|frame| {
+            if right {
+                frame.right[pixel]
+            } else {
+                frame.left[pixel]
+            }
+        }));
+        let middle = values.len() / 2;
+        values.select_nth_unstable(middle);
+        result.push(values[middle]);
+    }
+    result
+}
+
+fn anchor_distance(
+    sample: &GeometrySample,
+    anchor: &StereoAnchor,
+    baseline: [MlGeometry; 2],
+) -> Option<f32> {
+    let pixels = crop_stereo_pixels(sample, baseline)?;
+    anchor_l1(&pixels, anchor)
+}
+
+fn anchor_l1(a: &StereoAnchor, b: &StereoAnchor) -> Option<f32> {
+    if a.left.len() != b.left.len() || a.right.len() != b.right.len() {
+        return None;
+    }
+    let pixels = a.left.len() + a.right.len();
+    if pixels == 0 {
+        return None;
+    }
+    let total = a
+        .left
+        .iter()
+        .zip(&b.left)
+        .chain(a.right.iter().zip(&b.right))
+        .map(|(left, right)| left.abs_diff(*right) as f64)
+        .sum::<f64>();
+    Some((total / (pixels as f64 * 255.0)) as f32)
+}
+
+fn raw_stereo_l1(a: &GeometrySample, b: &GeometrySample, baseline: [MlGeometry; 2]) -> Option<f32> {
+    let a = crop_stereo_pixels(a, baseline)?;
+    let b = crop_stereo_pixels(b, baseline)?;
+    anchor_l1(&a, &b)
+}
+
 fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
     log(&shared, format!("[load] {}", inputs.model_path.display()));
-    let map = match tvm_params::parse_map(&inputs.model_path.to_string_lossy()) {
+    let map = match tvm_params::parse_map_bytes(&inputs.model_bytes) {
         Ok(map) => map,
         Err(error) => {
             return fail(
@@ -465,16 +1151,19 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
 
     // Derive the absolute seed before per-frame adaptive brightness. Geometry must
     // follow the spatial eyelid motion, not a user's changing photometric affine.
-    let motion_seed =
-        match estimate_dataset_motion_seed(&inputs.dataset, inputs.baseline, inputs.mirrors) {
-            Ok(estimate) => {
-                log(&shared, format!("[motion seed] {}", estimate.reason));
-                for (eye, name) in [(0usize, "L"), (1usize, "R")] {
-                    let value = &estimate.eyes[eye];
-                    let g = value.geometry;
-                    log(
-                        &shared,
-                        format!(
+    let motion_seed = match estimate_dataset_motion_seed(
+        inputs.dataset.as_dataset(),
+        inputs.baseline,
+        inputs.mirrors,
+    ) {
+        Ok(estimate) => {
+            log(&shared, format!("[motion seed] {}", estimate.reason));
+            for (eye, name) in [(0usize, "L"), (1usize, "R")] {
+                let value = &estimate.eyes[eye];
+                let g = value.geometry;
+                log(
+                    &shared,
+                    format!(
                         "[motion seed {name}] crop {:.3}/{:.3}/{:.3}/{:.3} rot {:+.1} error {:.4}",
                         g.crop_left,
                         g.crop_right,
@@ -483,20 +1172,23 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
                         g.rotate_deg,
                         value.fit_error
                     ),
-                    );
-                }
-                Some(estimate)
-            }
-            Err(message) => {
-                log(
-                    &shared,
-                    format!("[motion seed skipped] {message}; local ML search remains available"),
                 );
-                None
             }
-        };
+            Some(estimate)
+        }
+        Err(message) => {
+            log(
+                &shared,
+                format!("[motion seed skipped] {message}; local ML search remains available"),
+            );
+            None
+        }
+    };
 
-    let appearance_seed = match estimate_dataset_appearance_seed(&inputs.dataset, inputs.baseline) {
+    let appearance_seed = match estimate_dataset_appearance_seed(
+        inputs.dataset.as_dataset(),
+        inputs.baseline,
+    ) {
         Ok(estimate) => {
             log(&shared, format!("[appearance seed] {}", estimate.reason));
             for (eye, name) in [(0usize, "L"), (1usize, "R")] {
@@ -541,10 +1233,34 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         &shared,
         "[prepare] applying the live reflection/brightness preprocessing",
     );
-    let prepare_total = inputs.dataset.samples.len();
+    let prepare_total = inputs
+        .dataset
+        .samples()
+        .iter()
+        .filter(|sample| is_geometry_scoring_kind(sample.kind))
+        .count();
     progress(&shared, "preparing captured frames", 0, prepare_total);
     let mut prepared = Vec::with_capacity(prepare_total);
-    for (index, sample) in inputs.dataset.samples.into_iter().enumerate() {
+    let stability = capture_stability_flags(inputs.dataset.samples(), inputs.baseline);
+    for note in &stability.notes {
+        log(&shared, format!("[capture evidence] {note}"));
+    }
+    if stability.invalid_static_phases >= 2
+        || stability
+            .valid_closed_phases
+            .iter()
+            .any(|count| *count == 0)
+    {
+        return fail(
+            &shared,
+            "capture contains invalid static/closed evidence; follow the final pose in each prompt and record again"
+                .into(),
+        );
+    }
+    for (index, sample) in inputs.dataset.samples().iter().enumerate() {
+        if !is_geometry_scoring_kind(sample.kind) {
+            continue;
+        }
         if cancel.load(Ordering::Relaxed) {
             cancelled(&shared, &cancel);
             return;
@@ -571,16 +1287,21 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
             expected_open: sample.expected_open,
             phase_index: sample.phase_index,
             native_open: sample.native_open,
+            native_gaze_deg: sample
+                .native_gaze
+                .map(|gaze| gaze.and_then(crate::pipeline::gaze_angles_deg)),
+            stable: stability.flags[index],
             left,
             right,
             left_size: sample.left_size,
             right_size: sample.right_size,
         });
-        if index % 20 == 0 || index + 1 == prepare_total {
+        let prepared_count = prepared.len();
+        if prepared_count % 20 == 0 || prepared_count == prepare_total {
             progress(
                 &shared,
                 "preparing captured frames",
-                index + 1,
+                prepared_count,
                 prepare_total,
             );
         }
@@ -601,7 +1322,7 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         + STAGE2_CANDIDATES * train2.len()
         + 12 * train3.len()
         + 2 * holdout.len();
-    let mut work_done = 0usize;
+    let mut work_done = prepare_total;
 
     log(&shared, "[search 1/3] 48 bounded quasi-random candidates");
     let mut stage1_params = Vec::with_capacity(STAGE1_CANDIDATES);
@@ -869,6 +1590,9 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         candidate_from_motion_seed: best.motion_seed,
         appearance_seed,
         candidate_from_appearance_seed: best.appearance_seed,
+        invalid_static_phases: stability.invalid_static_phases,
+        degraded_static_phases: stability.degraded_static_phases,
+        valid_closed_phases: stability.valid_closed_phases,
         accepted,
         reason,
     };
@@ -912,14 +1636,15 @@ struct AuditFoldSignals {
 }
 
 /// Compare the current in-app objective with the absolute-span/half-position criteria
-/// that originally found the XR5 preset. This is diagnostic only: no geometry is
-/// accepted, previewed, or persisted from this path.
+/// that originally found the XR5 preset. Exploratory folds use train phases only;
+/// untouched holdout remains reserved for the normal frozen candidate evaluation.
+/// This is diagnostic only: no geometry is accepted, previewed, or persisted.
 fn run_audit(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
     log(
         &shared,
         format!("[audit load] {}", inputs.model_path.display()),
     );
-    let map = match tvm_params::parse_map(&inputs.model_path.to_string_lossy()) {
+    let map = match tvm_params::parse_map_bytes(&inputs.model_bytes) {
         Ok(map) => map,
         Err(error) => {
             return fail(
@@ -945,10 +1670,34 @@ fn run_audit(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInp
         &shared,
         "[audit prepare] applying the captured deterministic preprocessing",
     );
-    let prepare_total = inputs.dataset.samples.len();
+    let prepare_total = inputs
+        .dataset
+        .samples()
+        .iter()
+        .filter(|sample| is_geometry_scoring_kind(sample.kind))
+        .count();
     progress(&shared, "preparing audit frames", 0, prepare_total);
     let mut prepared = Vec::with_capacity(prepare_total);
-    for (index, sample) in inputs.dataset.samples.into_iter().enumerate() {
+    let stability = capture_stability_flags(inputs.dataset.samples(), inputs.baseline);
+    for note in &stability.notes {
+        log(&shared, format!("[audit evidence] {note}"));
+    }
+    if stability.invalid_static_phases >= 2
+        || stability
+            .valid_closed_phases
+            .iter()
+            .any(|count| *count == 0)
+    {
+        return fail(
+            &shared,
+            "capture contains invalid static/closed evidence; follow the final pose in each prompt and record again"
+                .into(),
+        );
+    }
+    for (index, sample) in inputs.dataset.samples().iter().enumerate() {
+        if !is_geometry_scoring_kind(sample.kind) {
+            continue;
+        }
         if cancel.load(Ordering::Relaxed) {
             cancelled(&shared, &cancel);
             return;
@@ -975,13 +1724,23 @@ fn run_audit(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInp
             expected_open: sample.expected_open,
             phase_index: sample.phase_index,
             native_open: sample.native_open,
+            native_gaze_deg: sample
+                .native_gaze
+                .map(|gaze| gaze.and_then(crate::pipeline::gaze_angles_deg)),
+            stable: stability.flags[index],
             left,
             right,
             left_size: sample.left_size,
             right_size: sample.right_size,
         });
-        if index % 20 == 0 || index + 1 == prepare_total {
-            progress(&shared, "preparing audit frames", index + 1, prepare_total);
+        let prepared_count = prepared.len();
+        if prepared_count % 20 == 0 || prepared_count == prepare_total {
+            progress(
+                &shared,
+                "preparing audit frames",
+                prepared_count,
+                prepare_total,
+            );
         }
     }
 
@@ -994,7 +1753,7 @@ fn run_audit(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInp
     let reference_indices: Vec<_> = prepared
         .iter()
         .enumerate()
-        .filter(|(_, sample)| !sample.kind.is_holdout())
+        .filter(|(_, sample)| is_geometry_scoring_kind(sample.kind) && !sample.kind.is_holdout())
         .map(|(index, _)| index)
         .collect();
     let work_total = prepare_total + reference_indices.len() + specs.len() * evaluations_per_case;
@@ -1362,7 +2121,10 @@ fn audit_fold_indices(samples: &[PreparedSample]) -> Result<Vec<Vec<usize>>, Str
         let mut slow_band_blocks = [0usize; 3];
         let mut cursor = 0usize;
         while cursor < samples.len() {
-            if samples[cursor].kind.family() != family {
+            if !is_geometry_scoring_kind(samples[cursor].kind)
+                || samples[cursor].kind.is_holdout()
+                || samples[cursor].kind.family() != family
+            {
                 cursor += 1;
                 continue;
             }
@@ -1437,17 +2199,17 @@ fn legacy_fold_metrics(observations: &[Observation]) -> LegacyFoldMetrics {
     for eye in 0..2 {
         let groups = [
             values(observations, eye, |observation| {
-                observation.kind.family() == SampleFamily::Closed
+                (observation.kind.family() == SampleFamily::Closed && observation.stable)
                     || (observation.kind.family() == SampleFamily::SlowClose
                         && observation
                             .expected_open
                             .is_some_and(|target| target <= 0.20))
             }),
             values(observations, eye, |observation| {
-                observation.kind.family() == SampleFamily::HalfOpen
+                observation.kind.family() == SampleFamily::HalfOpen && observation.stable
             }),
             values(observations, eye, |observation| {
-                observation.kind.family() == SampleFamily::Neutral
+                (observation.kind.family() == SampleFamily::Neutral && observation.stable)
                     || (observation.kind.family() == SampleFamily::SlowClose
                         && observation
                             .expected_open
@@ -1508,13 +2270,13 @@ fn half_quality(observations: &[Observation]) -> Result<HalfQuality, String> {
     let mut quality = HalfQuality::default();
     for eye in 0..2 {
         let open = values(observations, eye, |observation| {
-            observation.kind == SampleKind::Neutral
+            observation.kind == SampleKind::Neutral && observation.stable
         });
         let closed = values(observations, eye, |observation| {
-            observation.kind == SampleKind::Closed
+            observation.kind == SampleKind::Closed && observation.stable
         });
         let half = values(observations, eye, |observation| {
-            observation.kind == SampleKind::HalfOpen
+            observation.kind == SampleKind::HalfOpen && observation.stable
         });
         if open.len() < 5 || closed.len() < 5 || half.len() < 5 {
             return Err(format!(
@@ -1539,7 +2301,10 @@ fn half_quality(observations: &[Observation]) -> Result<HalfQuality, String> {
         let normalized_stddev = half_variance.sqrt() / span;
         let mut block_values = BTreeMap::<usize, Vec<f32>>::new();
         for observation in observations {
-            if observation.kind == SampleKind::HalfOpen && observation.open[eye].is_finite() {
+            if observation.kind == SampleKind::HalfOpen
+                && observation.stable
+                && observation.open[eye].is_finite()
+            {
                 block_values
                     .entry(observation.phase_index)
                     .or_default()
@@ -1591,7 +2356,7 @@ fn half_quality(observations: &[Observation]) -> Result<HalfQuality, String> {
 
         let half_observations: Vec<_> = observations
             .iter()
-            .filter(|observation| observation.kind == SampleKind::HalfOpen)
+            .filter(|observation| observation.kind == SampleKind::HalfOpen && observation.stable)
             .collect();
         let native_half: Vec<_> = half_observations
             .iter()
@@ -1604,7 +2369,7 @@ fn half_quality(observations: &[Observation]) -> Result<HalfQuality, String> {
             let native_values = |kind: SampleKind| {
                 observations
                     .iter()
-                    .filter(|observation| observation.kind == kind)
+                    .filter(|observation| observation.kind == kind && observation.stable)
                     .filter_map(|observation| observation.native_open[eye])
                     .filter(|value| value.is_finite())
                     .collect::<Vec<_>>()
@@ -1997,6 +2762,443 @@ fn evaluate_candidate(
     evaluate_candidate_detailed(net, samples, indices, geometry, mirrors, cancel).0
 }
 
+/// Research-only deterministic replay seam for comparing photometric hypotheses on a
+/// completed XR5 recording. It deliberately reuses the production stability labels,
+/// preprocessing, EyeNet inference and metrics so an offline result cannot be caused by
+/// a second scorer. The extra affine is applied after the affine captured by the app.
+#[cfg(feature = "research-synthetic-eye-lab")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpatialGainField {
+    pub horizontal: f32,
+    pub vertical: f32,
+    pub horizontal_curve: f32,
+    pub vertical_curve: f32,
+}
+
+/// Bounded, low-dimensional full-frame coordinate warp for offline XR5 research.
+///
+/// Coordinates are normalized to `[-1, 1]` over the complete captured eye frame,
+/// before any candidate geometry is applied. `vertical_bow` is the zero-mean
+/// quadratic vertical displacement along the horizontal axis; `radial_k1` is the
+/// first radial distortion coefficient. Translation, rotation and linear scale stay
+/// in [`MlGeometry`] instead of being duplicated here.
+#[cfg(feature = "research-synthetic-eye-lab")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResearchCoordinateWarp {
+    /// Vertical inverse-sampling displacement `b * (x^2 - 1/3)` in normalized
+    /// full-frame coordinates.
+    pub vertical_bow: f32,
+    /// First inverse radial coefficient in `source = destination * (1 + k1*r^2)`.
+    pub radial_k1: f32,
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+impl ResearchCoordinateWarp {
+    /// Maximum absolute normalized quadratic bow coefficient used by replay.
+    pub const MAX_VERTICAL_BOW: f32 = 0.12;
+    /// Maximum absolute first-order radial coefficient used by replay.
+    pub const MAX_RADIAL_K1: f32 = 0.10;
+}
+
+/// Per-frame output from the exact production preprocessing and EyeNet path.
+///
+/// This is exposed only to offline research tools.  `sample_index` always refers to
+/// the original [`GeometryDataset`] order, so callers can join candidate-independent
+/// raw-image measurements without relying on timing or row position.
+#[cfg(feature = "research-synthetic-eye-lab")]
+#[derive(Clone, Copy, Debug)]
+pub struct ResearchObservation {
+    pub sample_index: usize,
+    pub kind: SampleKind,
+    pub expected_open: Option<f32>,
+    pub phase_index: usize,
+    pub stable: bool,
+    pub native_open: [Option<f32>; 2],
+    pub native_gaze_deg: [Option<[f32; 2]>; 2],
+    pub presence: f32,
+    pub open: [f32; 2],
+    pub squeeze: [f32; 2],
+}
+
+/// Detailed research replay result. Metrics and observations come from the same
+/// inference pass, and stability is computed once from raw pixels and the immutable
+/// capture geometry. Optional photometric interventions occur only after the captured
+/// adaptive-brightness affine; they describe a proposed research seam, not the current
+/// production preprocessing order.
+#[cfg(feature = "research-synthetic-eye-lab")]
+#[derive(Clone, Debug)]
+pub struct ResearchReplay {
+    pub train: GeometryMetrics,
+    pub holdout: GeometryMetrics,
+    pub stability: StabilityReport,
+    pub observations: Vec<ResearchObservation>,
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+pub fn research_stability_report(
+    dataset: &GeometryDataset,
+    stability_baseline: [MlGeometry; 2],
+) -> StabilityReport {
+    capture_stability_flags(&dataset.samples, stability_baseline)
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+pub fn research_evaluate_photometric(
+    net: &mut EyeNet,
+    dataset: &GeometryDataset,
+    stability_baseline: [MlGeometry; 2],
+    stability: &StabilityReport,
+    geometry: [MlGeometry; 2],
+    mirrors: [bool; 2],
+    despeckle: DespeckleParams,
+    captured_flatten: FlattenParams,
+    post_normalization_flatten: FlattenParams,
+    extra_affine: [[f32; 2]; 2],
+    gain_field: [Option<SpatialGainField>; 2],
+    coordinate_warp: [Option<ResearchCoordinateWarp>; 2],
+) -> (GeometryMetrics, GeometryMetrics) {
+    let prepared = research_prepare_samples(
+        dataset,
+        stability_baseline,
+        stability,
+        despeckle,
+        captured_flatten,
+        post_normalization_flatten,
+        extra_affine,
+        gain_field,
+        coordinate_warp,
+    );
+    let train = prepared
+        .iter()
+        .enumerate()
+        .filter(|(_, sample)| !sample.kind.is_holdout())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let holdout = prepared
+        .iter()
+        .enumerate()
+        .filter(|(_, sample)| is_geometry_scoring_kind(sample.kind) && sample.kind.is_holdout())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let cancel = AtomicBool::new(false);
+    let metrics = (
+        evaluate_candidate(net, &prepared, &train, geometry, mirrors, &cancel),
+        evaluate_candidate(net, &prepared, &holdout, geometry, mirrors, &cancel),
+    );
+    metrics
+}
+
+/// Detailed variant of [`research_evaluate_photometric`].  It is intentionally kept
+/// behind the research feature so production code cannot make runtime decisions from
+/// uncalibrated landmark correlations.
+#[cfg(feature = "research-synthetic-eye-lab")]
+#[allow(clippy::too_many_arguments)]
+pub fn research_replay_detailed(
+    net: &mut EyeNet,
+    dataset: &GeometryDataset,
+    stability_baseline: [MlGeometry; 2],
+    geometry: [MlGeometry; 2],
+    mirrors: [bool; 2],
+    despeckle: DespeckleParams,
+    captured_flatten: FlattenParams,
+    post_normalization_flatten: FlattenParams,
+    extra_affine: [[f32; 2]; 2],
+    gain_field: [Option<SpatialGainField>; 2],
+    coordinate_warp: [Option<ResearchCoordinateWarp>; 2],
+) -> ResearchReplay {
+    let stability = capture_stability_flags(&dataset.samples, stability_baseline);
+    let prepared = research_prepare_samples(
+        dataset,
+        stability_baseline,
+        &stability,
+        despeckle,
+        captured_flatten,
+        post_normalization_flatten,
+        extra_affine,
+        gain_field,
+        coordinate_warp,
+    );
+    let train_indices = prepared
+        .iter()
+        .enumerate()
+        .filter(|(_, sample)| !sample.kind.is_holdout())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let holdout_indices = prepared
+        .iter()
+        .enumerate()
+        .filter(|(_, sample)| sample.kind.is_holdout())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let cancel = AtomicBool::new(false);
+    let (train, train_observations) =
+        evaluate_candidate_detailed(net, &prepared, &train_indices, geometry, mirrors, &cancel);
+    let (holdout, holdout_observations) =
+        evaluate_candidate_detailed(net, &prepared, &holdout_indices, geometry, mirrors, &cancel);
+    let mut observations = Vec::with_capacity(dataset.samples.len());
+    observations.extend(
+        train_indices
+            .iter()
+            .copied()
+            .zip(train_observations)
+            .map(|(sample_index, observation)| research_observation(sample_index, observation)),
+    );
+    observations.extend(
+        holdout_indices
+            .iter()
+            .copied()
+            .zip(holdout_observations)
+            .map(|(sample_index, observation)| research_observation(sample_index, observation)),
+    );
+    observations.sort_by_key(|observation| observation.sample_index);
+    ResearchReplay {
+        train,
+        holdout,
+        stability,
+        observations,
+    }
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+fn research_observation(sample_index: usize, observation: Observation) -> ResearchObservation {
+    ResearchObservation {
+        sample_index,
+        kind: observation.kind,
+        expected_open: observation.expected_open,
+        phase_index: observation.phase_index,
+        stable: observation.stable,
+        native_open: observation.native_open,
+        native_gaze_deg: observation.native_gaze_deg,
+        presence: observation.presence,
+        open: observation.open,
+        squeeze: observation.squeeze,
+    }
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+#[allow(clippy::too_many_arguments)]
+fn research_prepare_samples(
+    dataset: &GeometryDataset,
+    stability_baseline: [MlGeometry; 2],
+    stability: &StabilityReport,
+    despeckle: DespeckleParams,
+    captured_flatten: FlattenParams,
+    post_normalization_flatten: FlattenParams,
+    extra_affine: [[f32; 2]; 2],
+    gain_field: [Option<SpatialGainField>; 2],
+    coordinate_warp: [Option<ResearchCoordinateWarp>; 2],
+) -> Vec<PreparedSample> {
+    dataset
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let (lw, lh) = sample.left_size;
+            let (rw, rh) = sample.right_size;
+            // Reconstruct the exact deterministic capture path first.  The stored
+            // adaptive affine was learned from these captured pixels, so applying a
+            // candidate before it would not replay the stateful production controller.
+            let left = preprocess::despeckle(&sample.left, lw as usize, lh as usize, &despeckle);
+            let right = preprocess::despeckle(&sample.right, rw as usize, rh as usize, &despeckle);
+            let left = preprocess::flatten(&left, lw as usize, lh as usize, &captured_flatten);
+            let right = preprocess::flatten(&right, rw as usize, rh as usize, &captured_flatten);
+            let left = brightness::apply(
+                &left,
+                sample.brightness_affine[0][0],
+                sample.brightness_affine[0][1],
+            );
+            let right = brightness::apply(
+                &right,
+                sample.brightness_affine[1][0],
+                sample.brightness_affine[1][1],
+            );
+
+            // Research interventions deliberately live after the captured adaptive
+            // brightness result and before geometry.  This makes every probe a valid
+            // counterfactual without pretending that BrightState can be reconstructed
+            // from a recording that did not save its complete initial history.
+            let left =
+                preprocess::flatten(&left, lw as usize, lh as usize, &post_normalization_flatten);
+            let right = preprocess::flatten(
+                &right,
+                rw as usize,
+                rh as usize,
+                &post_normalization_flatten,
+            );
+            let left = brightness::apply(&left, extra_affine[0][0], extra_affine[0][1]);
+            let right = brightness::apply(&right, extra_affine[1][0], extra_affine[1][1]);
+            let left = research_apply_spatial_gain(
+                &left,
+                sample.left_size,
+                stability_baseline[0],
+                gain_field[0],
+            );
+            let right = research_apply_spatial_gain(
+                &right,
+                sample.right_size,
+                stability_baseline[1],
+                gain_field[1],
+            );
+            // Coordinate hypotheses use fixed full-frame coordinates and remain
+            // independent of the geometry candidate being scored.
+            let left = research_apply_coordinate_warp(&left, sample.left_size, coordinate_warp[0]);
+            let right =
+                research_apply_coordinate_warp(&right, sample.right_size, coordinate_warp[1]);
+            PreparedSample {
+                kind: sample.kind,
+                expected_open: sample.expected_open,
+                phase_index: sample.phase_index,
+                native_open: sample.native_open,
+                native_gaze_deg: sample
+                    .native_gaze
+                    .map(|gaze| gaze.and_then(crate::pipeline::gaze_angles_deg)),
+                stable: stability.flags.get(index).copied().unwrap_or(false),
+                left,
+                right,
+                left_size: sample.left_size,
+                right_size: sample.right_size,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+fn research_apply_spatial_gain(
+    frame: &[u8],
+    size: (u32, u32),
+    geometry: MlGeometry,
+    field: Option<SpatialGainField>,
+) -> Vec<u8> {
+    let Some(field) = field else {
+        return frame.to_vec();
+    };
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    if width == 0 || height == 0 || frame.len() < width.saturating_mul(height) {
+        return frame.to_vec();
+    }
+    let x0 = (geometry.crop_left.clamp(0.0, 0.95) * width as f32).floor() as usize;
+    let x1 = ((1.0 - geometry.crop_right.clamp(0.0, 0.95)) * width as f32).ceil() as usize;
+    let y0 = (geometry.crop_top.clamp(0.0, 0.95) * height as f32).floor() as usize;
+    let y1 = ((1.0 - geometry.crop_bottom.clamp(0.0, 0.95)) * height as f32).ceil() as usize;
+    let (x1, y1) = (x1.clamp(x0 + 1, width), y1.clamp(y0 + 1, height));
+    let mut result = frame.to_vec();
+    for y in 0..height {
+        let yn = if y1 - y0 <= 1 {
+            0.0
+        } else {
+            2.0 * (y as f32 - y0 as f32) / (y1 - y0 - 1) as f32 - 1.0
+        };
+        for x in 0..width {
+            let xn = if x1 - x0 <= 1 {
+                0.0
+            } else {
+                2.0 * (x as f32 - x0 as f32) / (x1 - x0 - 1) as f32 - 1.0
+            };
+            let gain = (1.0
+                + field.horizontal.clamp(-0.12, 0.12) * xn
+                + field.vertical.clamp(-0.12, 0.12) * yn
+                + field.horizontal_curve.clamp(-0.08, 0.08) * (xn * xn - 1.0 / 3.0)
+                + field.vertical_curve.clamp(-0.08, 0.08) * (yn * yn - 1.0 / 3.0))
+                .clamp(0.70, 1.30);
+            let index = y * width + x;
+            result[index] = (frame[index] as f32 * gain).clamp(0.0, 255.0) as u8;
+        }
+    }
+    result
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+fn research_apply_coordinate_warp(
+    frame: &[u8],
+    size: (u32, u32),
+    warp: Option<ResearchCoordinateWarp>,
+) -> Vec<u8> {
+    let Some(warp) = warp else {
+        return frame.to_vec();
+    };
+    if !warp.vertical_bow.is_finite() || !warp.radial_k1.is_finite() {
+        return frame.to_vec();
+    }
+    let vertical_bow = warp.vertical_bow.clamp(
+        -ResearchCoordinateWarp::MAX_VERTICAL_BOW,
+        ResearchCoordinateWarp::MAX_VERTICAL_BOW,
+    );
+    let radial_k1 = warp.radial_k1.clamp(
+        -ResearchCoordinateWarp::MAX_RADIAL_K1,
+        ResearchCoordinateWarp::MAX_RADIAL_K1,
+    );
+    if vertical_bow == 0.0 && radial_k1 == 0.0 {
+        return frame.to_vec();
+    }
+
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    let Some(pixel_count) = width.checked_mul(height) else {
+        return frame.to_vec();
+    };
+    if width == 0 || height == 0 || frame.len() != pixel_count {
+        return frame.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(pixel_count);
+    for y in 0..height {
+        let yn = pixel_to_normalized(y, height);
+        for x in 0..width {
+            let xn = pixel_to_normalized(x, width);
+            let radius_squared = xn * xn + yn * yn;
+            let radial_scale = 1.0 + radial_k1 * radius_squared;
+            let source_xn = xn * radial_scale;
+            let source_yn = yn * radial_scale + vertical_bow * (xn * xn - 1.0 / 3.0);
+            let source_x = normalized_to_pixel(source_xn, width);
+            let source_y = normalized_to_pixel(source_yn, height);
+            result.push(bilinear_sample_clamped(
+                frame, width, height, source_x, source_y,
+            ));
+        }
+    }
+    result
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+fn pixel_to_normalized(position: usize, extent: usize) -> f32 {
+    if extent <= 1 {
+        0.0
+    } else {
+        2.0 * position as f32 / (extent - 1) as f32 - 1.0
+    }
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+fn normalized_to_pixel(position: f32, extent: usize) -> f32 {
+    if extent <= 1 {
+        0.0
+    } else {
+        (position + 1.0) * 0.5 * (extent - 1) as f32
+    }
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+fn bilinear_sample_clamped(frame: &[u8], width: usize, height: usize, x: f32, y: f32) -> u8 {
+    let x = x.clamp(0.0, (width - 1) as f32);
+    let y = y.clamp(0.0, (height - 1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let top = frame[y0 * width + x0] as f32 * (1.0 - tx) + frame[y0 * width + x1] as f32 * tx;
+    let bottom = frame[y1 * width + x0] as f32 * (1.0 - tx) + frame[y1 * width + x1] as f32 * tx;
+    (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8
+}
+
+#[cfg(feature = "research-synthetic-eye-lab")]
+pub fn research_candidate_admissible(
+    candidate: &GeometryMetrics,
+    baseline: &GeometryMetrics,
+) -> bool {
+    admissible(candidate, baseline)
+}
+
 fn evaluate_candidate_detailed(
     net: &mut EyeNet,
     samples: &[PreparedSample],
@@ -2025,7 +3227,8 @@ fn evaluate_candidate_detailed(
             &geometry[0],
             &geometry[1],
         );
-        let contributes_to_fit = sample.kind.family() != SampleFamily::HalfOpen;
+        let contributes_to_fit =
+            is_geometry_scoring_kind(sample.kind) && sample.kind.family() != SampleFamily::HalfOpen;
         if contributes_to_fit {
             accumulate_image_stats(&mut image, &input);
             if let Some((previous_kind, previous_input)) = previous.as_ref() {
@@ -2048,8 +3251,11 @@ fn evaluate_candidate_detailed(
             expected_open: sample.expected_open,
             phase_index: sample.phase_index,
             native_open: sample.native_open,
+            native_gaze_deg: sample.native_gaze_deg,
+            stable: sample.stable,
             presence: output[0],
             open: [output[1], output[2]],
+            squeeze: [output[3], output[4]],
         });
         previous = contributes_to_fit.then_some((sample.kind, input));
     }
@@ -2080,20 +3286,15 @@ fn metrics_from_observations(
     all_observations: &[Observation],
     image: &ImageAccum,
 ) -> GeometryMetrics {
-    let filtered;
-    let observations = if all_observations
+    let filtered = all_observations
         .iter()
-        .any(|observation| observation.kind.family() == SampleFamily::HalfOpen)
-    {
-        filtered = all_observations
-            .iter()
-            .copied()
-            .filter(|observation| observation.kind.family() != SampleFamily::HalfOpen)
-            .collect::<Vec<_>>();
-        filtered.as_slice()
-    } else {
-        all_observations
-    };
+        .copied()
+        .filter(|observation| {
+            is_geometry_scoring_kind(observation.kind)
+                && observation.kind.family() != SampleFamily::HalfOpen
+        })
+        .collect::<Vec<_>>();
+    let observations = filtered.as_slice();
     if observations.is_empty() {
         return GeometryMetrics::default();
     }
@@ -2102,6 +3303,7 @@ fn metrics_from_observations(
         .filter(|observation| {
             observation.presence.is_finite()
                 && observation.open.iter().all(|value| value.is_finite())
+                && observation.squeeze.iter().all(|value| value.is_finite())
         })
         .count();
     let finite_rate = finite as f32 / observations.len() as f32;
@@ -2112,25 +3314,50 @@ fn metrics_from_observations(
         / observations.len() as f32;
 
     let mut separation = [0.0; 2];
+    let mut open_reference = [0.0; 2];
+    let mut closed_reference = [0.0; 2];
     let mut monotonicity = [0.0; 2];
+    let mut slow_close_std = [0.0; 2];
     let mut neutral_ratio = [1.0; 2];
     let mut gaze_ratio = [1.0; 2];
     let mut blink_depth = [0.0; 2];
     let mut blink_events = [0usize; 2];
+    let mut gaze_retention = [1.0; 2];
+    let mut gaze_squeeze_fp = [0.0; 2];
+    let gaze_observations = observations
+        .iter()
+        .filter(|observation| {
+            observation.kind.family() == SampleFamily::GazeSweep && observation.stable
+        })
+        .count();
+    let gaze_evidence_rate = if gaze_observations == 0 {
+        0.0
+    } else {
+        observations
+            .iter()
+            .filter(|observation| {
+                observation.kind.family() == SampleFamily::GazeSweep
+                    && observation.stable
+                    && observation.native_gaze_deg.iter().all(Option::is_some)
+            })
+            .count() as f32
+            / gaze_observations as f32
+    };
+    if gaze_observations < MIN_GAZE_STABLE_FRAMES {
+        return GeometryMetrics {
+            evidence_valid: false,
+            finite_rate,
+            presence_rate,
+            gaze_evidence_rate,
+            ..GeometryMetrics::default()
+        };
+    }
     for eye in 0..2 {
         let open = values(observations, eye, |observation| {
-            observation.kind.family() == SampleFamily::Neutral
-                || (observation.kind.family() == SampleFamily::SlowClose
-                    && observation
-                        .expected_open
-                        .is_some_and(|target| target >= 0.80))
+            observation.kind.family() == SampleFamily::Neutral && observation.stable
         });
         let closed = values(observations, eye, |observation| {
-            observation.kind.family() == SampleFamily::Closed
-                || (observation.kind.family() == SampleFamily::SlowClose
-                    && observation
-                        .expected_open
-                        .is_some_and(|target| target <= 0.20))
+            observation.kind.family() == SampleFamily::Closed && observation.stable
         });
         if open.len() < 5 || closed.len() < 5 {
             return GeometryMetrics {
@@ -2142,7 +3369,11 @@ fn metrics_from_observations(
         }
         let (open_mean, open_var) = mean_variance(&open);
         let (closed_mean, closed_var) = mean_variance(&closed);
-        let span = (open_mean - closed_mean).max(0.001);
+        let open_ref = percentile(&open, 0.50).unwrap_or(open_mean);
+        let closed_ref = percentile(&closed, 0.50).unwrap_or(closed_mean);
+        open_reference[eye] = open_ref;
+        closed_reference[eye] = closed_ref;
+        let span = (open_ref - closed_ref).max(0.001);
         separation[eye] = ((open_mean - closed_mean)
             / ((0.5 * (open_var + closed_var) + 1e-4).sqrt()))
         .clamp(-4.0, 8.0);
@@ -2168,22 +3399,40 @@ fn metrics_from_observations(
             };
         }
         monotonicity[eye] = pearson(&target, &response).clamp(-1.0, 1.0);
+        slow_close_std[eye] = mean_variance(&response).1.sqrt();
 
         let neutral = values(observations, eye, |observation| {
-            observation.kind.family() == SampleFamily::Neutral
+            observation.kind.family() == SampleFamily::Neutral && observation.stable
         });
         let gaze = values(observations, eye, |observation| {
-            observation.kind.family() == SampleFamily::GazeSweep
+            observation.kind.family() == SampleFamily::GazeSweep && observation.stable
         });
         neutral_ratio[eye] = mean_variance(&neutral).1.sqrt() / span;
         gaze_ratio[eye] = mean_variance(&gaze).1.sqrt() / span;
+        gaze_retention[eye] = gaze_retention_for_eye(
+            observations,
+            eye,
+            closed_ref,
+            span,
+            gaze_evidence_rate >= 0.60,
+        );
+        let neutral_squeeze = squeeze_values(observations, eye, |observation| {
+            observation.kind.family() == SampleFamily::Neutral && observation.stable
+        });
+        let gaze_squeeze = squeeze_values(observations, eye, |observation| {
+            observation.kind.family() == SampleFamily::GazeSweep && observation.stable
+        });
+        let neutral_squeeze_ref = percentile(&neutral_squeeze, 0.50).unwrap_or(0.0);
+        gaze_squeeze_fp[eye] = (percentile(&gaze_squeeze, 0.90).unwrap_or(neutral_squeeze_ref)
+            - neutral_squeeze_ref)
+            .max(0.0);
 
         let blink = values(observations, eye, |observation| {
             observation.kind.family() == SampleFamily::NaturalBlinks
         });
-        let blink_low = percentile(&blink, 0.10).unwrap_or(open_mean);
-        blink_depth[eye] = ((open_mean - blink_low) / span).clamp(0.0, 1.5) / 1.5;
-        let threshold = (open_mean + closed_mean) * 0.5;
+        let blink_low = percentile(&blink, 0.10).unwrap_or(open_ref);
+        blink_depth[eye] = ((open_ref - blink_low) / span).clamp(0.0, 1.5) / 1.5;
+        let threshold = (open_ref + closed_ref) * 0.5;
         blink_events[eye] = count_blink_events(&blink, threshold, span * 0.05);
     }
 
@@ -2249,18 +3498,26 @@ fn metrics_from_observations(
         .map(|value| value.clamp(0.0, 1.0))
         .sum::<f32>()
         * 0.5;
-    let score = (0.32 * separation_score
-        + 0.25 * monotonicity_score
-        + 0.15 * blink_response
-        + 0.15 * stability
-        + 0.08 * presence_rate
+    let gaze_asymmetry = (gaze_retention[0] - gaze_retention[1]).abs();
+    let gaze_quality = (0.60 * gaze_retention[0].min(gaze_retention[1]).clamp(0.0, 1.0)
+        + 0.40 * (1.0 - gaze_squeeze_fp[0].max(gaze_squeeze_fp[1]) / 0.30).clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
+    let score = (0.28 * separation_score
+        + 0.22 * monotonicity_score
+        + 0.13 * blink_response
+        + 0.13 * stability
+        + 0.07 * presence_rate
         + 0.05 * image_information)
-        * finite_rate;
+        + 0.12 * gaze_quality;
+    let score = score * finite_rate;
     GeometryMetrics {
         evidence_valid: true,
         score,
         separation,
+        open_ref: open_reference,
+        closed_ref: closed_reference,
         monotonicity,
+        slow_close_std,
         blink_response,
         stability,
         presence_rate,
@@ -2273,6 +3530,10 @@ fn metrics_from_observations(
         gaze_noise,
         neutral_noise_per_eye: neutral_ratio,
         gaze_noise_per_eye: gaze_ratio,
+        gaze_retention,
+        gaze_squeeze_fp,
+        gaze_asymmetry,
+        gaze_evidence_rate,
         blink_events,
     }
 }
@@ -2285,15 +3546,18 @@ fn admissible(candidate: &GeometryMetrics, baseline: &GeometryMetrics) -> bool {
         && candidate.image_std >= baseline.image_std * 0.65
         && candidate.motion_energy + 0.001 >= baseline.motion_energy * 0.55
         && candidate.saturation_rate <= baseline.saturation_rate + 0.15
+        && candidate.gaze_asymmetry <= baseline.gaze_asymmetry + 0.05
         && (0..2).all(|eye| {
             candidate.separation[eye] + 0.15 >= baseline.separation[eye] * 0.85
                 && candidate.monotonicity[eye] + 0.10 >= baseline.monotonicity[eye]
+                && candidate.gaze_retention[eye] + 0.05 >= baseline.gaze_retention[eye]
+                && candidate.gaze_squeeze_fp[eye] <= baseline.gaze_squeeze_fp[eye] + 0.05
         })
 }
 
 fn capture_quality_issue(baseline: &GeometryMetrics) -> Option<&'static str> {
     if !baseline.evidence_valid {
-        Some("one or more required open/closed/slow-close evidence classes are missing")
+        Some("one or more required open/closed/slow-close/stable-gaze evidence classes are missing")
     } else if baseline.finite_rate < 0.99 {
         Some("the fixed network produced non-finite outputs")
     } else if baseline.presence_rate < 0.50 {
@@ -2362,6 +3626,8 @@ fn acceptance(
                 > baseline_holdout.gaze_noise_per_eye[eye] * 1.05 + 0.02
             || candidate_holdout.neutral_noise_per_eye[eye]
                 > baseline_holdout.neutral_noise_per_eye[eye] * 1.10 + 0.01
+            || candidate_holdout.gaze_retention[eye] + 0.03 < baseline_holdout.gaze_retention[eye]
+            || candidate_holdout.gaze_squeeze_fp[eye] > baseline_holdout.gaze_squeeze_fp[eye] + 0.03
     });
     if per_eye_regression {
         return (
@@ -2378,6 +3644,720 @@ fn acceptance(
             relative * 100.0
         ),
     )
+}
+
+#[derive(Clone)]
+struct ScoredPhotometric {
+    correction: PhotometricCorrection,
+    metrics: GeometryMetrics,
+}
+
+fn lock_photometric(shared: &Arc<Mutex<PhotometricShared>>) -> MutexGuard<'_, PhotometricShared> {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn photometric_log(shared: &Arc<Mutex<PhotometricShared>>, line: impl Into<String>) {
+    lock_photometric(shared).push(line);
+}
+
+fn photometric_progress(
+    shared: &Arc<Mutex<PhotometricShared>>,
+    stage: &str,
+    completed: usize,
+    total: usize,
+) {
+    lock_photometric(shared).progress(stage, completed, total);
+}
+
+fn photometric_fail(shared: &Arc<Mutex<PhotometricShared>>, message: String) {
+    let mut state = lock_photometric(shared);
+    let log = state.log.clone();
+    state.status = PhotometricStatus::Failed { message, log };
+}
+
+fn photometric_cancelled(shared: &Arc<Mutex<PhotometricShared>>, cancel: &AtomicBool) -> bool {
+    if !cancel.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut state = lock_photometric(shared);
+    let log = state.log.clone();
+    state.status = PhotometricStatus::Cancelled { log };
+    true
+}
+
+fn run_photometric(
+    shared: Arc<Mutex<PhotometricShared>>,
+    cancel: Arc<AtomicBool>,
+    inputs: PhotometricFitInputs,
+) {
+    photometric_log(&shared, format!("[load] {}", inputs.model_path.display()));
+    let map = match tvm_params::parse_map_bytes(&inputs.model_bytes) {
+        Ok(map) => map,
+        Err(error) => {
+            return photometric_fail(
+                &shared,
+                format!("EyePrediction model parse failed: {error}"),
+            )
+        }
+    };
+    let mut net = match EyeNet::new(map) {
+        Ok(net) => net,
+        Err(error) => {
+            return photometric_fail(
+                &shared,
+                format!("EyePrediction model is incompatible: {error}"),
+            )
+        }
+    };
+
+    photometric_log(
+        &shared,
+        "[prepare] replaying captured filters and adaptive-brightness affine",
+    );
+    let stability = capture_stability_flags(inputs.dataset.samples(), inputs.geometry);
+    for note in &stability.notes {
+        photometric_log(&shared, format!("[capture evidence] {note}"));
+    }
+    if stability.invalid_static_phases >= 2
+        || stability
+            .valid_closed_phases
+            .iter()
+            .any(|count| *count == 0)
+    {
+        return photometric_fail(
+            &shared,
+            "capture contains invalid static/closed evidence; follow the final pose in each prompt and record again"
+                .into(),
+        );
+    }
+
+    let prepare_total = inputs
+        .dataset
+        .samples()
+        .iter()
+        .filter(|sample| is_geometry_scoring_kind(sample.kind))
+        .count();
+    photometric_progress(&shared, "preparing captured frames", 0, prepare_total);
+    let mut prepared = Vec::with_capacity(prepare_total);
+    for (index, sample) in inputs.dataset.samples().iter().enumerate() {
+        if !is_geometry_scoring_kind(sample.kind) {
+            continue;
+        }
+        if photometric_cancelled(&shared, &cancel) {
+            return;
+        }
+        let (lw, lh) = sample.left_size;
+        let (rw, rh) = sample.right_size;
+        let left = preprocess::despeckle(&sample.left, lw as usize, lh as usize, &inputs.despeckle);
+        let right =
+            preprocess::despeckle(&sample.right, rw as usize, rh as usize, &inputs.despeckle);
+        let left = preprocess::flatten(&left, lw as usize, lh as usize, &inputs.flatten);
+        let right = preprocess::flatten(&right, rw as usize, rh as usize, &inputs.flatten);
+        let left = brightness::apply(
+            &left,
+            sample.brightness_affine[0][0],
+            sample.brightness_affine[0][1],
+        );
+        let right = brightness::apply(
+            &right,
+            sample.brightness_affine[1][0],
+            sample.brightness_affine[1][1],
+        );
+        prepared.push(PreparedSample {
+            kind: sample.kind,
+            expected_open: sample.expected_open,
+            phase_index: sample.phase_index,
+            native_open: sample.native_open,
+            native_gaze_deg: sample
+                .native_gaze
+                .map(|gaze| gaze.and_then(crate::pipeline::gaze_angles_deg)),
+            stable: stability.flags[index],
+            left,
+            right,
+            left_size: sample.left_size,
+            right_size: sample.right_size,
+        });
+        let prepared_count = prepared.len();
+        if prepared_count % 20 == 0 || prepared_count == prepare_total {
+            photometric_progress(
+                &shared,
+                "preparing captured frames",
+                prepared_count,
+                prepare_total,
+            );
+        }
+    }
+
+    let train_coarse = stratified_indices(&prepared, false, 140);
+    let train_large = stratified_indices(&prepared, false, 320);
+    let train_final = stratified_indices(&prepared, false, 420);
+    let holdout = stratified_indices(&prepared, true, 420);
+    if train_coarse.is_empty() || train_final.is_empty() || holdout.is_empty() {
+        return photometric_fail(
+            &shared,
+            "capture contains no usable train or untouched holdout frames".into(),
+        );
+    }
+
+    let mut work_done = 0usize;
+    let mut work_total = prepare_total;
+    let baseline = inputs.baseline;
+
+    let coarse = coarse_photometric_candidates(baseline);
+    photometric_log(
+        &shared,
+        format!(
+            "[search 1/3] {} shared/per-eye brightness and contrast probes",
+            coarse.len()
+        ),
+    );
+    let mut coarse_scored = evaluate_photometric_set(
+        &shared,
+        &cancel,
+        &mut net,
+        &prepared,
+        &train_coarse,
+        inputs.geometry,
+        inputs.mirrors,
+        &coarse,
+        "coarse affine search",
+        &mut work_done,
+        &mut work_total,
+    );
+    if photometric_cancelled(&shared, &cancel) {
+        return;
+    }
+    let Some(coarse_baseline) = coarse_scored
+        .iter()
+        .find(|entry| entry.correction == baseline)
+        .map(|entry| entry.metrics.clone())
+    else {
+        return photometric_fail(
+            &shared,
+            "the current photometric path produced no finite baseline".into(),
+        );
+    };
+    if let Some(issue) = capture_quality_issue(&coarse_baseline) {
+        return photometric_fail(
+            &shared,
+            format!("capture quality check failed: {issue}; record the sequence again"),
+        );
+    }
+    coarse_scored.retain(|entry| {
+        photometric_admissible(&entry.metrics, &coarse_baseline)
+            && photometric_always_open_guards(&entry.metrics, &coarse_baseline)
+    });
+    sort_photometric(&mut coarse_scored);
+    if coarse_scored.is_empty() {
+        return photometric_fail(
+            &shared,
+            "every coarse photometric candidate violated a safety guard".into(),
+        );
+    }
+
+    let mut finalists = vec![baseline];
+    for entry in coarse_scored.iter().take(7) {
+        push_unique_photometric(&mut finalists, entry.correction);
+    }
+    photometric_log(
+        &shared,
+        "[search 2/3] successive halving plus weak local flatten refinement",
+    );
+    let mut halved = evaluate_photometric_set(
+        &shared,
+        &cancel,
+        &mut net,
+        &prepared,
+        &train_large,
+        inputs.geometry,
+        inputs.mirrors,
+        &finalists,
+        "successive halving",
+        &mut work_done,
+        &mut work_total,
+    );
+    let halved_baseline = halved
+        .iter()
+        .find(|entry| entry.correction == baseline)
+        .map(|entry| entry.metrics.clone())
+        .unwrap_or_else(|| coarse_baseline.clone());
+    halved.retain(|entry| {
+        photometric_admissible(&entry.metrics, &halved_baseline)
+            && photometric_always_open_guards(&entry.metrics, &halved_baseline)
+    });
+    sort_photometric(&mut halved);
+    let Some(affine_best) = halved.first().map(|entry| entry.correction) else {
+        return photometric_fail(
+            &shared,
+            "no safe affine candidate survived successive halving".into(),
+        );
+    };
+
+    let refined = refinement_photometric_candidates(baseline, affine_best);
+    let mut refined_scored = evaluate_photometric_set(
+        &shared,
+        &cancel,
+        &mut net,
+        &prepared,
+        &train_large,
+        inputs.geometry,
+        inputs.mirrors,
+        &refined,
+        "affine and flatten refinement",
+        &mut work_done,
+        &mut work_total,
+    );
+    let refined_baseline = refined_scored
+        .iter()
+        .find(|entry| entry.correction == baseline)
+        .map(|entry| entry.metrics.clone())
+        .unwrap_or_else(|| halved_baseline.clone());
+    refined_scored.retain(|entry| {
+        photometric_admissible(&entry.metrics, &refined_baseline)
+            && photometric_always_open_guards(&entry.metrics, &refined_baseline)
+    });
+    sort_photometric(&mut refined_scored);
+    let Some(refined_best) = refined_scored.first().map(|entry| entry.correction) else {
+        return photometric_fail(
+            &shared,
+            "photometric refinement produced no safe result".into(),
+        );
+    };
+
+    photometric_log(
+        &shared,
+        "[search 3/3] bounded low-frequency illumination fields; geometry remains frozen",
+    );
+    let field_candidates = field_photometric_candidates(baseline, refined_best);
+    let mut field_scored = evaluate_photometric_set(
+        &shared,
+        &cancel,
+        &mut net,
+        &prepared,
+        &train_large,
+        inputs.geometry,
+        inputs.mirrors,
+        &field_candidates,
+        "local illumination search",
+        &mut work_done,
+        &mut work_total,
+    );
+    let field_baseline = field_scored
+        .iter()
+        .find(|entry| entry.correction == baseline)
+        .map(|entry| entry.metrics.clone())
+        .unwrap_or_else(|| refined_baseline.clone());
+    field_scored.retain(|entry| {
+        photometric_admissible(&entry.metrics, &field_baseline)
+            && photometric_always_open_guards(&entry.metrics, &field_baseline)
+    });
+    sort_photometric(&mut field_scored);
+    let Some(best) = field_scored.first().cloned() else {
+        return photometric_fail(
+            &shared,
+            "low-frequency illumination search produced no safe result".into(),
+        );
+    };
+    let flat_objective = field_scored.get(1).is_some_and(|runner_up| {
+        (best.metrics.score - runner_up.metrics.score).abs() < 0.012
+            && photometric_distance(best.correction, runner_up.correction) > 0.75
+    });
+
+    photometric_log(
+        &shared,
+        "[verify train] replaying current and selected correction on the full train set",
+    );
+    work_total += 2 * train_final.len() + 2 * holdout.len();
+    let baseline_train = evaluate_photometric_candidate(
+        &mut net,
+        &prepared,
+        &train_final,
+        inputs.geometry,
+        inputs.mirrors,
+        baseline,
+        &cancel,
+    );
+    work_done += train_final.len();
+    photometric_progress(&shared, "full train verification", work_done, work_total);
+    let candidate_train = evaluate_photometric_candidate(
+        &mut net,
+        &prepared,
+        &train_final,
+        inputs.geometry,
+        inputs.mirrors,
+        best.correction,
+        &cancel,
+    );
+    work_done += train_final.len();
+    photometric_progress(&shared, "full train verification", work_done, work_total);
+    if photometric_cancelled(&shared, &cancel) {
+        return;
+    }
+
+    photometric_log(
+        &shared,
+        "[holdout] comparing only the train-selected winner against the frozen current path",
+    );
+    let baseline_holdout = evaluate_photometric_candidate(
+        &mut net,
+        &prepared,
+        &holdout,
+        inputs.geometry,
+        inputs.mirrors,
+        baseline,
+        &cancel,
+    );
+    work_done += holdout.len();
+    photometric_progress(
+        &shared,
+        "untouched holdout validation",
+        work_done,
+        work_total,
+    );
+    let candidate_holdout = evaluate_photometric_candidate(
+        &mut net,
+        &prepared,
+        &holdout,
+        inputs.geometry,
+        inputs.mirrors,
+        best.correction,
+        &cancel,
+    );
+    work_done += holdout.len();
+    photometric_progress(
+        &shared,
+        "untouched holdout validation",
+        work_done,
+        work_total,
+    );
+    if photometric_cancelled(&shared, &cancel) {
+        return;
+    }
+
+    let safety_ok = photometric_admissible(&candidate_train, &baseline_train)
+        && photometric_always_open_guards(&candidate_train, &baseline_train)
+        && photometric_admissible(&candidate_holdout, &baseline_holdout)
+        && photometric_always_open_guards(&candidate_holdout, &baseline_holdout);
+    let (accepted, reason) = if !safety_ok {
+        (
+            false,
+            "The candidate violated a train or holdout photometric safety guard; the current correction was kept."
+                .into(),
+        )
+    } else {
+        acceptance(
+            &baseline_train,
+            &candidate_train,
+            &baseline_holdout,
+            &candidate_holdout,
+            best.correction == baseline,
+            flat_objective,
+        )
+    };
+    let result = PhotometricFitResult {
+        baseline,
+        candidate: best.correction,
+        holdout_improvement: candidate_holdout.score - baseline_holdout.score,
+        baseline_train,
+        candidate_train,
+        baseline_holdout,
+        candidate_holdout,
+        invalid_static_phases: stability.invalid_static_phases,
+        degraded_static_phases: stability.degraded_static_phases,
+        valid_closed_phases: stability.valid_closed_phases,
+        accepted,
+        reason,
+    };
+    let mut state = lock_photometric(&shared);
+    state.push(format!(
+        "[done] holdout {:.3} -> {:.3}; {}",
+        result.baseline_holdout.score,
+        result.candidate_holdout.score,
+        if result.accepted {
+            "candidate accepted"
+        } else {
+            "fallback retained"
+        }
+    ));
+    let log = state.log.clone();
+    state.status = PhotometricStatus::Done { result, log };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_photometric_set(
+    shared: &Arc<Mutex<PhotometricShared>>,
+    cancel: &AtomicBool,
+    net: &mut EyeNet,
+    prepared: &[PreparedSample],
+    indices: &[usize],
+    geometry: [MlGeometry; 2],
+    mirrors: [bool; 2],
+    candidates: &[PhotometricCorrection],
+    stage: &str,
+    work_done: &mut usize,
+    work_total: &mut usize,
+) -> Vec<ScoredPhotometric> {
+    *work_total += candidates.len() * indices.len();
+    let mut scored = Vec::with_capacity(candidates.len());
+    for (candidate_index, correction) in candidates.iter().copied().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let metrics = evaluate_photometric_candidate(
+            net, prepared, indices, geometry, mirrors, correction, cancel,
+        );
+        *work_done += indices.len();
+        photometric_progress(shared, stage, *work_done, *work_total);
+        if metrics.score.is_finite() {
+            scored.push(ScoredPhotometric {
+                correction,
+                metrics,
+            });
+        }
+        if candidate_index % 8 == 0 {
+            photometric_log(
+                shared,
+                format!(
+                    "[{stage}] {}/{} candidates",
+                    candidate_index + 1,
+                    candidates.len()
+                ),
+            );
+        }
+    }
+    scored
+}
+
+fn evaluate_photometric_candidate(
+    net: &mut EyeNet,
+    prepared: &[PreparedSample],
+    indices: &[usize],
+    geometry: [MlGeometry; 2],
+    mirrors: [bool; 2],
+    correction: PhotometricCorrection,
+    cancel: &AtomicBool,
+) -> GeometryMetrics {
+    let mut transformed = Vec::with_capacity(indices.len());
+    for &index in indices {
+        if cancel.load(Ordering::Relaxed) {
+            return GeometryMetrics::default();
+        }
+        let sample = &prepared[index];
+        transformed.push(PreparedSample {
+            kind: sample.kind,
+            expected_open: sample.expected_open,
+            phase_index: sample.phase_index,
+            native_open: sample.native_open,
+            native_gaze_deg: sample.native_gaze_deg,
+            stable: sample.stable,
+            left: preprocess::fitted_photometric(
+                &sample.left,
+                sample.left_size.0 as usize,
+                sample.left_size.1 as usize,
+                &geometry[0],
+                &correction,
+                0,
+            ),
+            right: preprocess::fitted_photometric(
+                &sample.right,
+                sample.right_size.0 as usize,
+                sample.right_size.1 as usize,
+                &geometry[1],
+                &correction,
+                1,
+            ),
+            left_size: sample.left_size,
+            right_size: sample.right_size,
+        });
+    }
+    let local_indices = (0..transformed.len()).collect::<Vec<_>>();
+    evaluate_candidate(net, &transformed, &local_indices, geometry, mirrors, cancel)
+}
+
+fn effective_photometric(mut correction: PhotometricCorrection) -> PhotometricCorrection {
+    if !correction.enabled {
+        correction = PhotometricCorrection::default();
+    }
+    correction.enabled = true;
+    correction
+}
+
+fn compose_affine_delta(
+    baseline: PhotometricCorrection,
+    targets: [bool; 2],
+    gain: f32,
+    bias: f32,
+) -> PhotometricCorrection {
+    let mut candidate = effective_photometric(baseline);
+    for eye in 0..2 {
+        if targets[eye] {
+            let [base_gain, base_bias] = candidate.affine[eye];
+            candidate.affine[eye] = [
+                (gain * base_gain).clamp(0.70, 1.30),
+                (gain * base_bias + bias).clamp(-30.0, 30.0),
+            ];
+        }
+    }
+    candidate
+}
+
+fn coarse_photometric_candidates(baseline: PhotometricCorrection) -> Vec<PhotometricCorrection> {
+    let mut candidates = vec![baseline];
+    for gain in [0.85, 0.93, 1.07, 1.15] {
+        push_unique_photometric(
+            &mut candidates,
+            compose_affine_delta(baseline, [true, true], gain, 0.0),
+        );
+    }
+    for bias in [-16.0, -8.0, 8.0, 16.0] {
+        push_unique_photometric(
+            &mut candidates,
+            compose_affine_delta(baseline, [true, true], 1.0, bias),
+        );
+    }
+    for (gain, bias) in [(0.90, -10.0), (0.90, 10.0), (1.10, -10.0), (1.10, 10.0)] {
+        push_unique_photometric(
+            &mut candidates,
+            compose_affine_delta(baseline, [true, true], gain, bias),
+        );
+    }
+    for eye in 0..2 {
+        let targets = [eye == 0, eye == 1];
+        for gain in [0.88, 0.95, 1.05, 1.12] {
+            push_unique_photometric(
+                &mut candidates,
+                compose_affine_delta(baseline, targets, gain, 0.0),
+            );
+        }
+        for bias in [-12.0, -6.0, 6.0, 12.0] {
+            push_unique_photometric(
+                &mut candidates,
+                compose_affine_delta(baseline, targets, 1.0, bias),
+            );
+        }
+    }
+    candidates
+}
+
+fn refinement_photometric_candidates(
+    baseline: PhotometricCorrection,
+    centre: PhotometricCorrection,
+) -> Vec<PhotometricCorrection> {
+    let mut candidates = vec![baseline, centre];
+    for targets in [[true, true], [true, false], [false, true]] {
+        for gain in [0.96, 1.04] {
+            push_unique_photometric(
+                &mut candidates,
+                compose_affine_delta(centre, targets, gain, 0.0),
+            );
+        }
+        for bias in [-4.0, 4.0] {
+            push_unique_photometric(
+                &mut candidates,
+                compose_affine_delta(centre, targets, 1.0, bias),
+            );
+        }
+    }
+    for radius in [0.22, 0.33, 0.45] {
+        for strength in [0.25, 0.45, 0.65] {
+            let mut candidate = effective_photometric(centre);
+            candidate.flatten = FlattenParams {
+                enabled: true,
+                strength,
+                radius,
+            };
+            push_unique_photometric(&mut candidates, candidate);
+        }
+    }
+    candidates
+}
+
+fn field_photometric_candidates(
+    baseline: PhotometricCorrection,
+    centre: PhotometricCorrection,
+) -> Vec<PhotometricCorrection> {
+    let mut candidates = vec![baseline, centre];
+    for targets in [[true, true], [true, false], [false, true]] {
+        for (axis, values) in [
+            (0usize, [-0.12, -0.06, 0.06, 0.12]),
+            (1usize, [-0.12, -0.06, 0.06, 0.12]),
+            (2usize, [-0.08, -0.04, 0.04, 0.08]),
+            (3usize, [-0.08, -0.04, 0.04, 0.08]),
+        ] {
+            for value in values {
+                let mut candidate = effective_photometric(centre);
+                for eye in 0..2 {
+                    if !targets[eye] {
+                        continue;
+                    }
+                    match axis {
+                        0 => {
+                            candidate.field[eye].horizontal =
+                                (candidate.field[eye].horizontal + value).clamp(-0.12, 0.12)
+                        }
+                        1 => {
+                            candidate.field[eye].vertical =
+                                (candidate.field[eye].vertical + value).clamp(-0.12, 0.12)
+                        }
+                        2 => {
+                            candidate.field[eye].horizontal_curve =
+                                (candidate.field[eye].horizontal_curve + value).clamp(-0.08, 0.08)
+                        }
+                        _ => {
+                            candidate.field[eye].vertical_curve =
+                                (candidate.field[eye].vertical_curve + value).clamp(-0.08, 0.08)
+                        }
+                    }
+                }
+                push_unique_photometric(&mut candidates, candidate);
+            }
+        }
+    }
+    candidates
+}
+
+fn push_unique_photometric(
+    candidates: &mut Vec<PhotometricCorrection>,
+    candidate: PhotometricCorrection,
+) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn sort_photometric(scored: &mut [ScoredPhotometric]) {
+    scored.sort_by(|left, right| right.metrics.score.total_cmp(&left.metrics.score));
+}
+
+fn photometric_admissible(candidate: &GeometryMetrics, baseline: &GeometryMetrics) -> bool {
+    admissible(candidate, baseline)
+}
+
+fn photometric_always_open_guards(candidate: &GeometryMetrics, baseline: &GeometryMetrics) -> bool {
+    candidate.saturation_rate <= baseline.saturation_rate + 0.10
+        && (0..2).all(|eye| {
+            let span = (baseline.open_ref[eye] - baseline.closed_ref[eye]).max(0.001);
+            candidate.closed_ref[eye] <= baseline.closed_ref[eye] + 0.05 * span
+                && candidate.slow_close_std[eye] >= baseline.slow_close_std[eye] * 0.60
+                && candidate.monotonicity[eye] + 0.05 >= baseline.monotonicity[eye]
+        })
+}
+
+fn photometric_distance(left: PhotometricCorrection, right: PhotometricCorrection) -> f32 {
+    let mut sum = 0.0;
+    for eye in 0..2 {
+        sum += ((left.affine[eye][0] - right.affine[eye][0]) / 0.15).powi(2);
+        sum += ((left.affine[eye][1] - right.affine[eye][1]) / 15.0).powi(2);
+        sum += ((left.field[eye].horizontal - right.field[eye].horizontal) / 0.12).powi(2);
+        sum += ((left.field[eye].vertical - right.field[eye].vertical) / 0.12).powi(2);
+        sum +=
+            ((left.field[eye].horizontal_curve - right.field[eye].horizontal_curve) / 0.08).powi(2);
+        sum += ((left.field[eye].vertical_curve - right.field[eye].vertical_curve) / 0.08).powi(2);
+    }
+    sum += ((left.flatten.strength - right.flatten.strength) / 0.70).powi(2);
+    sum.sqrt()
 }
 
 fn geometry_from_params(baseline: [MlGeometry; 2], params: SearchParams) -> [MlGeometry; 2] {
@@ -2488,7 +4468,9 @@ fn stratified_indices(samples: &[PreparedSample], holdout: bool, limit: usize) -
     let eligible: Vec<usize> = samples
         .iter()
         .enumerate()
-        .filter(|(_, sample)| sample.kind.is_holdout() == holdout)
+        .filter(|(_, sample)| {
+            is_geometry_scoring_kind(sample.kind) && sample.kind.is_holdout() == holdout
+        })
         .map(|(index, _)| index)
         .collect();
     if eligible.len() <= limit {
@@ -2523,8 +4505,16 @@ fn stratified_indices(samples: &[PreparedSample], holdout: bool, limit: usize) -
 }
 
 fn validate_dataset_shape(dataset: &GeometryDataset) -> Result<(), String> {
-    let train = dataset.train_len();
-    let holdout = dataset.holdout_len();
+    let train = dataset
+        .samples
+        .iter()
+        .filter(|sample| is_geometry_scoring_kind(sample.kind) && !sample.kind.is_holdout())
+        .count();
+    let holdout = dataset
+        .samples
+        .iter()
+        .filter(|sample| is_geometry_scoring_kind(sample.kind) && sample.kind.is_holdout())
+        .count();
     if train < 200 || holdout < 80 {
         return Err(format!(
             "capture is incomplete: train={train}, holdout={holdout} (need at least 200/80)"
@@ -2541,12 +4531,20 @@ fn validate_dataset_shape(dataset: &GeometryDataset) -> Result<(), String> {
         let train_count = dataset
             .samples
             .iter()
-            .filter(|sample| !sample.kind.is_holdout() && sample.kind.family() == family)
+            .filter(|sample| {
+                is_geometry_scoring_kind(sample.kind)
+                    && !sample.kind.is_holdout()
+                    && sample.kind.family() == family
+            })
             .count();
         let holdout_count = dataset
             .samples
             .iter()
-            .filter(|sample| sample.kind.is_holdout() && sample.kind.family() == family)
+            .filter(|sample| {
+                is_geometry_scoring_kind(sample.kind)
+                    && sample.kind.is_holdout()
+                    && sample.kind.family() == family
+            })
             .count();
         if train_count < 20 || holdout_count < 20 {
             return Err(format!(
@@ -2566,6 +4564,88 @@ fn values(
         .iter()
         .filter(|observation| predicate(observation) && observation.open[eye].is_finite())
         .map(|observation| observation.open[eye])
+        .collect()
+}
+
+fn squeeze_values(
+    observations: &[Observation],
+    eye: usize,
+    predicate: impl Fn(&Observation) -> bool,
+) -> Vec<f32> {
+    observations
+        .iter()
+        .filter(|observation| predicate(observation) && observation.squeeze[eye].is_finite())
+        .map(|observation| observation.squeeze[eye])
+        .collect()
+}
+
+fn gaze_retention_for_eye(
+    observations: &[Observation],
+    eye: usize,
+    closed_mean: f32,
+    span: f32,
+    use_direction_bins: bool,
+) -> f32 {
+    let gaze = values(observations, eye, |observation| {
+        observation.kind.family() == SampleFamily::GazeSweep && observation.stable
+    });
+    let filtered_gaze = temporal_median(&gaze, 5);
+    let pooled = ((percentile(&filtered_gaze, 0.10).unwrap_or(closed_mean + span) - closed_mean)
+        / span)
+        .clamp(0.0, 1.2);
+    if !use_direction_bins {
+        return pooled;
+    }
+
+    let directional: Vec<_> = observations
+        .iter()
+        .filter_map(|observation| {
+            (observation.kind.family() == SampleFamily::GazeSweep
+                && observation.stable
+                && observation.open[eye].is_finite())
+            .then_some(observation.native_gaze_deg[eye].map(|gaze| (gaze, observation.open[eye])))
+            .flatten()
+        })
+        .collect();
+    if directional.len() < 5 {
+        return pooled;
+    }
+    let yaw: Vec<_> = directional.iter().map(|(gaze, _)| gaze[0]).collect();
+    let pitch: Vec<_> = directional.iter().map(|(gaze, _)| gaze[1]).collect();
+    let center_yaw = percentile(&yaw, 0.50).unwrap_or(0.0);
+    let center_pitch = percentile(&pitch, 0.50).unwrap_or(0.0);
+    let mut worst = pooled;
+    for direction in 0..4 {
+        let bin: Vec<_> = directional
+            .iter()
+            .filter(|(gaze, _)| match direction {
+                0 => gaze[0] <= center_yaw - 7.0,
+                1 => gaze[0] >= center_yaw + 7.0,
+                2 => gaze[1] <= center_pitch - 7.0,
+                _ => gaze[1] >= center_pitch + 7.0,
+            })
+            .map(|(_, openness)| *openness)
+            .collect();
+        if bin.len() >= 3 {
+            let retention = ((percentile(&bin, 0.50).unwrap_or(closed_mean) - closed_mean) / span)
+                .clamp(0.0, 1.2);
+            worst = worst.min(retention);
+        }
+    }
+    worst
+}
+
+fn temporal_median(values: &[f32], window: usize) -> Vec<f32> {
+    if values.is_empty() || window <= 1 {
+        return values.to_vec();
+    }
+    let radius = window / 2;
+    (0..values.len())
+        .map(|index| {
+            let start = index.saturating_sub(radius);
+            let end = (index + radius + 1).min(values.len());
+            percentile(&values[start..end], 0.50).unwrap_or(values[index])
+        })
         .collect()
 }
 
@@ -2696,9 +4776,266 @@ mod tests {
             expected_open,
             phase_index: kind as usize,
             native_open: [None; 2],
+            native_gaze_deg: [None; 2],
+            stable: true,
             presence: 0.10,
             open,
+            squeeze: [0.0; 2],
         }
+    }
+
+    fn raw_sample(kind: SampleKind, phase_index: usize, time: f32, value: u8) -> GeometrySample {
+        GeometrySample {
+            kind,
+            expected_open: None,
+            phase_time_s: time,
+            left: vec![value; 16],
+            right: vec![value; 16],
+            left_size: (4, 4),
+            right_size: (4, 4),
+            brightness_affine: [[1.0, 0.0]; 2],
+            native_open: [None; 2],
+            native_gaze: [None; 2],
+            commanded_target: None,
+            native_pupil_pos: [None; 2],
+            frame_generation: [0; 2],
+            native_timestamp_us: None,
+            phase_index,
+        }
+    }
+
+    fn localized_closed_sample(
+        kind: SampleKind,
+        phase_index: usize,
+        time: f32,
+        sensor_level: u8,
+    ) -> GeometrySample {
+        let mut sample = raw_sample(kind, phase_index, time, sensor_level);
+        sample.left_size = (20, 20);
+        sample.right_size = (20, 20);
+        sample.left = vec![sensor_level; 400];
+        sample.right = vec![sensor_level; 400];
+        if kind == SampleKind::Closed {
+            for pixel in 0..48 {
+                sample.left[pixel] = sensor_level.saturating_add(50);
+                sample.right[pixel] = sensor_level.saturating_add(50);
+            }
+        }
+        sample
+    }
+
+    #[test]
+    fn photometric_coarse_search_keeps_exact_fallback_and_independent_eyes() {
+        let baseline = PhotometricCorrection::default();
+        let candidates = coarse_photometric_candidates(baseline);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| **candidate == baseline)
+                .count(),
+            1
+        );
+        assert!(candidates.iter().any(|candidate| {
+            candidate.affine[0] != [1.0, 0.0] && candidate.affine[1] == [1.0, 0.0]
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.affine[1] != [1.0, 0.0] && candidate.affine[0] == [1.0, 0.0]
+        }));
+    }
+
+    #[test]
+    fn photometric_candidate_generation_stays_inside_production_bounds() {
+        let baseline = PhotometricCorrection::default();
+        let centre = compose_affine_delta(baseline, [true, false], 1.30, 30.0);
+        let mut candidates = refinement_photometric_candidates(baseline, centre);
+        candidates.extend(field_photometric_candidates(baseline, centre));
+        for candidate in candidates {
+            for affine in candidate.affine {
+                assert!((0.70..=1.30).contains(&affine[0]));
+                assert!((-30.0..=30.0).contains(&affine[1]));
+            }
+            assert!((0.0..=0.75).contains(&candidate.flatten.strength));
+            for field in candidate.field {
+                assert!((-0.12..=0.12).contains(&field.horizontal));
+                assert!((-0.12..=0.12).contains(&field.vertical));
+                assert!((-0.08..=0.08).contains(&field.horizontal_curve));
+                assert!((-0.08..=0.08).contains(&field.vertical_curve));
+            }
+        }
+    }
+
+    #[cfg(feature = "research-synthetic-eye-lab")]
+    #[test]
+    fn research_identity_replay_is_byte_exact_to_captured_preprocessing() {
+        let mut sample = raw_sample(SampleKind::Neutral, 0, 1.0, 0);
+        sample.left = vec![
+            4, 18, 36, 250, 8, 27, 70, 100, 14, 49, 120, 180, 25, 80, 160, 230,
+        ];
+        sample.right = sample.left.iter().copied().rev().collect();
+        sample.brightness_affine = [[1.13, -9.0], [0.87, 12.0]];
+        let dataset = GeometryDataset {
+            samples: vec![sample.clone()],
+        };
+        let despeckle = DespeckleParams::default();
+        let captured_flatten = FlattenParams {
+            enabled: true,
+            strength: 0.65,
+            radius: 0.33,
+        };
+        let stability = StabilityReport {
+            flags: vec![true],
+            ..StabilityReport::default()
+        };
+        let prepared = research_prepare_samples(
+            &dataset,
+            default_ml_geometry("pimax_xr5"),
+            &stability,
+            despeckle,
+            captured_flatten,
+            FlattenParams::default(),
+            [[1.0, 0.0]; 2],
+            [None; 2],
+            [None; 2],
+        );
+
+        let expected = [&sample.left, &sample.right]
+            .into_iter()
+            .enumerate()
+            .map(|(eye, pixels)| {
+                let pixels = preprocess::despeckle(pixels, 4, 4, &despeckle);
+                let pixels = preprocess::flatten(&pixels, 4, 4, &captured_flatten);
+                brightness::apply(
+                    &pixels,
+                    sample.brightness_affine[eye][0],
+                    sample.brightness_affine[eye][1],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prepared[0].left, expected[0]);
+        assert_eq!(prepared[0].right, expected[1]);
+    }
+
+    #[cfg(feature = "research-synthetic-eye-lab")]
+    #[test]
+    fn research_coordinate_warp_identity_is_byte_exact() {
+        let frame = vec![0, 4, 17, 99, 255, 3, 70, 121, 8, 33, 64, 192];
+        assert_eq!(research_apply_coordinate_warp(&frame, (4, 3), None), frame);
+        assert_eq!(
+            research_apply_coordinate_warp(&frame, (4, 3), Some(ResearchCoordinateWarp::default()),),
+            frame
+        );
+    }
+
+    #[cfg(feature = "research-synthetic-eye-lab")]
+    #[test]
+    fn research_coordinate_warp_preserves_a_constant_frame() {
+        let frame = vec![137; 13 * 11];
+        let warped = research_apply_coordinate_warp(
+            &frame,
+            (13, 11),
+            Some(ResearchCoordinateWarp {
+                vertical_bow: ResearchCoordinateWarp::MAX_VERTICAL_BOW,
+                radial_k1: -ResearchCoordinateWarp::MAX_RADIAL_K1,
+            }),
+        );
+        assert_eq!(warped, frame);
+    }
+
+    #[cfg(feature = "research-synthetic-eye-lab")]
+    #[test]
+    fn research_coordinate_warp_nonzero_parameters_move_coordinates() {
+        let frame = (0..9)
+            .flat_map(|y| std::iter::repeat_n(y * 25, 9))
+            .collect::<Vec<u8>>();
+        let bowed = research_apply_coordinate_warp(
+            &frame,
+            (9, 9),
+            Some(ResearchCoordinateWarp {
+                vertical_bow: 0.10,
+                radial_k1: 0.0,
+            }),
+        );
+        let radial = research_apply_coordinate_warp(
+            &frame,
+            (9, 9),
+            Some(ResearchCoordinateWarp {
+                vertical_bow: 0.0,
+                radial_k1: 0.08,
+            }),
+        );
+        assert_ne!(bowed, frame);
+        assert_ne!(bowed[4 * 9], frame[4 * 9]);
+        assert_ne!(radial, frame);
+    }
+
+    #[cfg(feature = "research-synthetic-eye-lab")]
+    #[test]
+    fn research_coordinate_warp_is_horizontally_mirror_equivariant() {
+        let (width, height) = (9usize, 7usize);
+        let frame = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x * 7 + y * 23) as u8))
+            .collect::<Vec<_>>();
+        let mirror = |pixels: &[u8]| {
+            pixels
+                .chunks_exact(width)
+                .flat_map(|row| row.iter().rev().copied())
+                .collect::<Vec<_>>()
+        };
+        let warp = Some(ResearchCoordinateWarp {
+            vertical_bow: -0.08,
+            radial_k1: 0.07,
+        });
+        let warped = research_apply_coordinate_warp(&frame, (width as u32, height as u32), warp);
+        let mirrored_then_warped =
+            research_apply_coordinate_warp(&mirror(&frame), (width as u32, height as u32), warp);
+        assert_eq!(mirrored_then_warped, mirror(&warped));
+    }
+
+    #[cfg(feature = "research-synthetic-eye-lab")]
+    #[test]
+    fn research_coordinate_warp_rejects_nonfinite_or_invalid_frames() {
+        let frame = vec![1, 2, 3, 4, 5];
+        assert_eq!(
+            research_apply_coordinate_warp(
+                &frame,
+                (5, 1),
+                Some(ResearchCoordinateWarp {
+                    vertical_bow: f32::NAN,
+                    radial_k1: 0.1,
+                }),
+            ),
+            frame
+        );
+        assert_eq!(
+            research_apply_coordinate_warp(
+                &frame,
+                (3, 2),
+                Some(ResearchCoordinateWarp {
+                    vertical_bow: 0.1,
+                    radial_k1: 0.1,
+                }),
+            ),
+            frame
+        );
+
+        let valid_frame = (0..35).map(|value| value * 7).collect::<Vec<u8>>();
+        let bounded = research_apply_coordinate_warp(
+            &valid_frame,
+            (7, 5),
+            Some(ResearchCoordinateWarp {
+                vertical_bow: ResearchCoordinateWarp::MAX_VERTICAL_BOW,
+                radial_k1: -ResearchCoordinateWarp::MAX_RADIAL_K1,
+            }),
+        );
+        let excessive = research_apply_coordinate_warp(
+            &valid_frame,
+            (7, 5),
+            Some(ResearchCoordinateWarp {
+                vertical_bow: 1000.0,
+                radial_k1: -1000.0,
+            }),
+        );
+        assert_eq!(excessive, bounded);
     }
 
     #[test]
@@ -2739,6 +5076,194 @@ mod tests {
 
         assert!(!fitter.clear_finished());
         assert!(matches!(fitter.status(), Status::Running { .. }));
+    }
+
+    #[test]
+    fn static_stability_rejects_still_previous_pose_before_late_transition() {
+        let mut samples = Vec::new();
+        for index in 0..=60 {
+            let time = index as f32 * 0.1;
+            let value = if time < 2.5 {
+                0
+            } else if time < 2.8 {
+                ((time - 2.5) / 0.3 * 200.0) as u8
+            } else {
+                200
+            };
+            samples.push(raw_sample(SampleKind::Closed, 7, time, value));
+        }
+        let report = capture_stability_flags(&samples, default_ml_geometry("pimax_xr5"));
+        assert!(samples
+            .iter()
+            .zip(&report.flags)
+            .filter(|(sample, _)| sample.phase_time_s < 2.8)
+            .all(|(_, flag)| !flag));
+        assert!(samples
+            .iter()
+            .zip(&report.flags)
+            .filter(|(sample, _)| (2.8..5.8).contains(&sample.phase_time_s))
+            .all(|(_, flag)| *flag));
+        assert!(!report.flags[59]);
+        assert!(!report.flags[60]);
+    }
+
+    #[test]
+    fn fallback_is_the_tail_window_not_all_trimmed_frames() {
+        let mut samples = (0..=20)
+            .map(|index| {
+                raw_sample(
+                    SampleKind::Closed,
+                    4,
+                    index as f32 * 0.1,
+                    if index % 2 == 0 { 0 } else { 200 },
+                )
+            })
+            .collect::<Vec<_>>();
+        samples.push(raw_sample(SampleKind::SlowClose, 6, 0.0, 0));
+        samples.push(raw_sample(SampleKind::NaturalBlinks, 7, 0.0, 0));
+        let report = capture_stability_flags(&samples, default_ml_geometry("pimax_xr5"));
+        assert!(samples[..21]
+            .iter()
+            .zip(&report.flags[..21])
+            .filter(|(sample, _)| sample.phase_time_s < 0.8)
+            .all(|(_, flag)| !flag));
+        assert!(samples[..21]
+            .iter()
+            .zip(&report.flags[..21])
+            .filter(|(sample, _)| (0.8..1.9).contains(&sample.phase_time_s))
+            .all(|(_, flag)| *flag));
+        assert!(report.degraded_static_phases >= 1);
+        assert!(report.flags[21]);
+        assert!(report.flags[22]);
+    }
+
+    #[test]
+    fn gaze_departure_uses_neutral_not_the_intervening_closed_pose() {
+        let mut samples = Vec::new();
+        for index in 0..=20 {
+            let time = index as f32 * 0.1;
+            samples.push(raw_sample(SampleKind::Neutral, 1, time, 100));
+            samples.push(raw_sample(SampleKind::Closed, 2, time, 0));
+        }
+        samples.push(raw_sample(SampleKind::GazeSweep, 3, 0.2, 100));
+        samples.push(raw_sample(SampleKind::GazeSweep, 3, 0.6, 100));
+        samples.push(raw_sample(SampleKind::GazeSweep, 3, 0.7, 200));
+        samples.push(raw_sample(SampleKind::GazeSweep, 3, 0.8, 200));
+        let report = capture_stability_flags(&samples, default_ml_geometry("pimax_xr5"));
+        assert!(!report.flags[42]);
+        assert!(!report.flags[43]);
+        assert!(!report.flags[44]);
+        assert!(report.flags[45]);
+    }
+
+    #[test]
+    fn gaze_without_a_preceding_valid_neutral_is_excluded() {
+        let samples = (0..=20)
+            .map(|index| {
+                raw_sample(
+                    SampleKind::GazeSweep,
+                    3,
+                    index as f32 * 0.1,
+                    100 + index as u8,
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = capture_stability_flags(&samples, default_ml_geometry("pimax_xr5"));
+        assert!(report.flags.iter().all(|flag| !flag));
+    }
+
+    #[test]
+    fn identical_closed_and_neutral_tail_is_invalidated() {
+        let mut samples = Vec::new();
+        for index in 0..=20 {
+            let time = index as f32 * 0.1;
+            samples.push(raw_sample(SampleKind::Neutral, 1, time, 80));
+            samples.push(raw_sample(SampleKind::Closed, 2, time, 80));
+        }
+        let report = capture_stability_flags(&samples, default_ml_geometry("pimax_xr5"));
+        assert_eq!(report.invalid_static_phases, 1);
+        assert_eq!(report.valid_closed_phases[0], 0);
+        assert!(samples
+            .iter()
+            .zip(&report.flags)
+            .filter(|(sample, _)| sample.kind == SampleKind::Closed)
+            .all(|(_, flag)| !flag));
+    }
+
+    #[test]
+    fn localized_closed_pose_is_not_hidden_by_full_frame_sensor_noise() {
+        let mut samples = Vec::new();
+        for index in 0..=20 {
+            let time = index as f32 * 0.1;
+            let sensor_level = 80 + (index % 2) as u8 * 2;
+            samples.push(localized_closed_sample(
+                SampleKind::Neutral,
+                1,
+                time,
+                sensor_level,
+            ));
+            samples.push(localized_closed_sample(
+                SampleKind::Closed,
+                2,
+                time,
+                sensor_level,
+            ));
+        }
+
+        let report = capture_stability_flags(&samples, [MlGeometry::default(); 2]);
+        assert_eq!(report.invalid_static_phases, 0);
+        assert_eq!(report.valid_closed_phases[0], 1);
+        assert!(samples
+            .iter()
+            .zip(&report.flags)
+            .filter(|(sample, _)| sample.kind == SampleKind::Closed)
+            .any(|(_, flag)| *flag));
+    }
+
+    #[cfg(feature = "research-synthetic-eye-lab")]
+    #[test]
+    fn spatial_gain_identity_is_exact_and_extends_smoothly_past_the_fixed_crop() {
+        let frame = vec![100u8; 16];
+        let geometry = MlGeometry {
+            crop_left: 0.25,
+            crop_right: 0.25,
+            crop_top: 0.25,
+            crop_bottom: 0.25,
+            ..MlGeometry::default()
+        };
+        let identity = research_apply_spatial_gain(
+            &frame,
+            (4, 4),
+            geometry,
+            Some(SpatialGainField::default()),
+        );
+        assert_eq!(identity, frame);
+
+        let changed = research_apply_spatial_gain(
+            &frame,
+            (4, 4),
+            geometry,
+            Some(SpatialGainField {
+                vertical: 0.12,
+                ..SpatialGainField::default()
+            }),
+        );
+        for y in 0..4 {
+            for x in 0..4 {
+                let value = changed[y * 4 + x];
+                if (1..3).contains(&x) && y == 1 {
+                    assert_eq!(value, 88);
+                } else if (1..3).contains(&x) && y == 2 {
+                    assert_eq!(value, 112);
+                } else if y == 0 {
+                    assert_eq!(value, 70);
+                } else if y == 3 {
+                    assert_eq!(value, 130);
+                } else {
+                    assert!(matches!(value, 88 | 112));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2859,6 +5384,255 @@ mod tests {
         assert!(average(bad.separation) < 0.1);
         assert!(capture_quality_issue(&good).is_none());
         assert!(capture_quality_issue(&bad).is_some());
+    }
+
+    #[test]
+    fn gaze_failure_fixture_exposes_worst_eye_and_false_squeeze() {
+        let mut observations = Vec::new();
+        for index in 0..20 {
+            observations.push(observation(
+                SampleKind::Neutral,
+                None,
+                [0.56, 0.56],
+                index as f32,
+            ));
+            observations.push(observation(
+                SampleKind::Closed,
+                None,
+                [0.05, 0.05],
+                index as f32,
+            ));
+            let target = index as f32 / 19.0;
+            observations.push(observation(
+                SampleKind::SlowClose,
+                Some(target),
+                [0.05 + 0.51 * target; 2],
+                index as f32,
+            ));
+            observations.push(observation(
+                SampleKind::NaturalBlinks,
+                None,
+                [if index % 4 == 0 { 0.05 } else { 0.56 }; 2],
+                index as f32,
+            ));
+            let mut gaze = observation(SampleKind::GazeSweep, None, [0.52, 0.39], index as f32);
+            gaze.squeeze = [0.01, 0.295];
+            observations.push(gaze);
+        }
+        let metrics = metrics_from_observations(&observations, &ImageAccum::default());
+        assert!(metrics.evidence_valid);
+        assert!((metrics.gaze_retention[0] - 0.922).abs() < 0.01);
+        assert!((metrics.gaze_retention[1] - 0.667).abs() < 0.01);
+        assert!((metrics.gaze_squeeze_fp[1] - 0.295).abs() < 0.01);
+        assert!(metrics.gaze_asymmetry > 0.24);
+
+        let mut safe_baseline = metrics.clone();
+        safe_baseline.gaze_retention = [1.0; 2];
+        safe_baseline.gaze_squeeze_fp = [0.0; 2];
+        safe_baseline.gaze_asymmetry = 0.0;
+        assert!(!admissible(&metrics, &safe_baseline));
+    }
+
+    #[test]
+    fn retention_p10_is_robust_to_two_frame_blinks() {
+        let mut clean = Vec::new();
+        let mut blinked = Vec::new();
+        for index in 0..20 {
+            for target in [&mut clean, &mut blinked] {
+                target.push(observation(
+                    SampleKind::Neutral,
+                    None,
+                    [0.8; 2],
+                    index as f32,
+                ));
+                target.push(observation(
+                    SampleKind::Closed,
+                    None,
+                    [0.2; 2],
+                    index as f32,
+                ));
+                let expected = index as f32 / 19.0;
+                target.push(observation(
+                    SampleKind::SlowClose,
+                    Some(expected),
+                    [0.2 + 0.6 * expected; 2],
+                    index as f32,
+                ));
+                target.push(observation(
+                    SampleKind::NaturalBlinks,
+                    None,
+                    [0.8; 2],
+                    index as f32,
+                ));
+            }
+            clean.push(observation(
+                SampleKind::GazeSweep,
+                None,
+                [0.76; 2],
+                index as f32,
+            ));
+            blinked.push(observation(
+                SampleKind::GazeSweep,
+                None,
+                [if matches!(index, 5 | 6 | 14 | 15) {
+                    0.2
+                } else {
+                    0.76
+                }; 2],
+                index as f32,
+            ));
+        }
+        let clean = metrics_from_observations(&clean, &ImageAccum::default());
+        let blinked = metrics_from_observations(&blinked, &ImageAccum::default());
+        assert!((clean.gaze_retention[0] - blinked.gaze_retention[0]).abs() < 0.01);
+    }
+
+    #[test]
+    fn median_open_closed_references_resist_minority_contamination() {
+        let mut clean = Vec::new();
+        let mut contaminated = Vec::new();
+        for index in 0..20 {
+            for target in [&mut clean, &mut contaminated] {
+                target.push(observation(
+                    SampleKind::Neutral,
+                    None,
+                    [0.8; 2],
+                    index as f32,
+                ));
+                target.push(observation(
+                    SampleKind::GazeSweep,
+                    None,
+                    [0.7; 2],
+                    index as f32,
+                ));
+                let expected = index as f32 / 19.0;
+                target.push(observation(
+                    SampleKind::SlowClose,
+                    Some(expected),
+                    [0.2 + 0.6 * expected; 2],
+                    index as f32,
+                ));
+                target.push(observation(
+                    SampleKind::NaturalBlinks,
+                    None,
+                    [0.8; 2],
+                    index as f32,
+                ));
+            }
+            clean.push(observation(
+                SampleKind::Closed,
+                None,
+                [0.2; 2],
+                index as f32,
+            ));
+            contaminated.push(observation(
+                SampleKind::Closed,
+                None,
+                [if index < 4 { 0.8 } else { 0.2 }; 2],
+                index as f32,
+            ));
+        }
+        let clean = metrics_from_observations(&clean, &ImageAccum::default());
+        let contaminated = metrics_from_observations(&contaminated, &ImageAccum::default());
+        assert_eq!(clean.closed_ref, [0.2; 2]);
+        assert_eq!(contaminated.closed_ref, [0.2; 2]);
+        assert!((clean.gaze_retention[0] - contaminated.gaze_retention[0]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn half_quality_ignores_unstable_reaction_frames() {
+        let mut observations = Vec::new();
+        for index in 0..10 {
+            observations.push(observation(
+                SampleKind::Neutral,
+                None,
+                [0.8; 2],
+                index as f32,
+            ));
+            observations.push(observation(
+                SampleKind::Closed,
+                None,
+                [0.2; 2],
+                index as f32,
+            ));
+        }
+        for block in [2usize, 4usize] {
+            for index in 0..10 {
+                let mut value = observation(
+                    SampleKind::HalfOpen,
+                    Some(0.5),
+                    [if index < 5 { 0.8 } else { 0.5 }; 2],
+                    index as f32,
+                );
+                value.phase_index = block;
+                value.stable = index >= 5;
+                observations.push(value);
+            }
+        }
+        let quality = half_quality(&observations).unwrap();
+        assert!((quality.position[0] - 0.5).abs() < 1e-5);
+        assert!(quality.block_disagreement[0] < 1e-5);
+    }
+
+    #[test]
+    fn legacy_capture_without_native_gaze_still_has_finite_gaze_metrics() {
+        let mut observations = Vec::new();
+        for index in 0..12 {
+            for (kind, expected, open) in [
+                (SampleKind::Neutral, None, 0.8),
+                (SampleKind::Closed, None, 0.2),
+                (SampleKind::GazeSweep, None, 0.78),
+                (
+                    SampleKind::SlowClose,
+                    Some(index as f32 / 11.0),
+                    0.2 + 0.6 * index as f32 / 11.0,
+                ),
+                (SampleKind::NaturalBlinks, None, 0.8),
+            ] {
+                observations.push(observation(kind, expected, [open; 2], index as f32));
+            }
+        }
+        let metrics = metrics_from_observations(&observations, &ImageAccum::default());
+        assert!(metrics.evidence_valid);
+        assert_eq!(metrics.gaze_evidence_rate, 0.0);
+        assert!(metrics.gaze_retention.iter().all(|value| value.is_finite()));
+        assert!(metrics
+            .gaze_squeeze_fp
+            .iter()
+            .all(|value| value.is_finite()));
+        assert!(metrics.score.is_finite());
+    }
+
+    #[test]
+    fn zero_stable_gaze_frames_invalidate_the_objective() {
+        let mut observations = Vec::new();
+        for index in 0..12 {
+            observations.push(observation(
+                SampleKind::Neutral,
+                None,
+                [0.8; 2],
+                index as f32,
+            ));
+            observations.push(observation(
+                SampleKind::Closed,
+                None,
+                [0.2; 2],
+                index as f32,
+            ));
+            observations.push(observation(
+                SampleKind::SlowClose,
+                Some(index as f32 / 11.0),
+                [0.2 + 0.6 * index as f32 / 11.0; 2],
+                index as f32,
+            ));
+            let mut gaze = observation(SampleKind::GazeSweep, None, [0.78; 2], index as f32);
+            gaze.stable = false;
+            observations.push(gaze);
+        }
+        let metrics = metrics_from_observations(&observations, &ImageAccum::default());
+        assert!(!metrics.evidence_valid);
+        assert_eq!(metrics.gaze_evidence_rate, 0.0);
+        assert_eq!(metrics.score, 0.0);
     }
 
     #[test]
@@ -2995,6 +5769,8 @@ mod tests {
             expected_open: None,
             phase_index: kind as usize,
             native_open: [None; 2],
+            native_gaze_deg: [None; 2],
+            stable: true,
             left: vec![0; 4],
             right: vec![0; 4],
             left_size: (2, 2),
@@ -3031,6 +5807,101 @@ mod tests {
         assert!(holdout
             .iter()
             .any(|index| samples[*index].kind.family() == SampleFamily::Closed));
+    }
+
+    #[test]
+    fn unilateral_winks_never_become_closed_geometry_or_photometric_evidence() {
+        for kind in [
+            SampleKind::LeftWink,
+            SampleKind::RightWink,
+            SampleKind::HoldoutLeftWink,
+            SampleKind::HoldoutRightWink,
+        ] {
+            assert!(!is_geometry_scoring_kind(kind));
+        }
+
+        let wink_samples = (0..40)
+            .flat_map(|index| {
+                let time = index as f32 * 0.05;
+                [
+                    raw_sample(SampleKind::LeftWink, 91, time, 40),
+                    raw_sample(SampleKind::RightWink, 92, time, 210),
+                    raw_sample(SampleKind::HoldoutLeftWink, 93, time, 45),
+                    raw_sample(SampleKind::HoldoutRightWink, 94, time, 205),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let stability = capture_stability_flags(&wink_samples, default_ml_geometry("pimax_xr5"));
+        assert!(stability.flags.iter().all(|flag| !flag));
+        assert_eq!(stability.valid_closed_phases, [0, 0]);
+        assert_eq!(stability.invalid_static_phases, 0);
+
+        let prepared_winks = [
+            SampleKind::LeftWink,
+            SampleKind::RightWink,
+            SampleKind::HoldoutLeftWink,
+            SampleKind::HoldoutRightWink,
+        ]
+        .into_iter()
+        .map(prepared)
+        .collect::<Vec<_>>();
+        assert!(stratified_indices(&prepared_winks, false, usize::MAX).is_empty());
+        assert!(stratified_indices(&prepared_winks, true, usize::MAX).is_empty());
+
+        let mut baseline = Vec::new();
+        for index in 0..30 {
+            let t = index as f32 / 29.0;
+            baseline.push(observation(
+                SampleKind::Neutral,
+                None,
+                [0.80; 2],
+                index as f32,
+            ));
+            baseline.push(observation(
+                SampleKind::Closed,
+                None,
+                [0.20; 2],
+                index as f32,
+            ));
+            baseline.push(observation(
+                SampleKind::SlowClose,
+                Some(t),
+                [0.20 + 0.60 * t; 2],
+                index as f32,
+            ));
+            baseline.push(observation(
+                SampleKind::GazeSweep,
+                None,
+                [0.78; 2],
+                index as f32,
+            ));
+            baseline.push(observation(
+                SampleKind::NaturalBlinks,
+                None,
+                if index % 3 == 0 { [0.20; 2] } else { [0.80; 2] },
+                index as f32,
+            ));
+        }
+        let expected = metrics_from_observations(&baseline, &ImageAccum::default());
+        let mut contaminated = baseline;
+        for index in 0..200 {
+            contaminated.push(observation(
+                SampleKind::LeftWink,
+                None,
+                [0.20, 0.80],
+                index as f32,
+            ));
+            contaminated.push(observation(
+                SampleKind::RightWink,
+                None,
+                [0.80, 0.20],
+                index as f32,
+            ));
+        }
+        assert_eq!(
+            metrics_from_observations(&contaminated, &ImageAccum::default()),
+            expected
+        );
     }
 
     #[test]
@@ -3086,6 +5957,9 @@ mod tests {
         let mut owner = vec![None; samples.len()];
         for (fold, indices) in folds.iter().enumerate() {
             assert_eq!(indices.len(), 6 * AUDIT_FRAMES_PER_FAMILY_FOLD);
+            assert!(indices
+                .iter()
+                .all(|index| !samples[*index].kind.is_holdout()));
             for family in [
                 SampleFamily::Neutral,
                 SampleFamily::HalfOpen,
