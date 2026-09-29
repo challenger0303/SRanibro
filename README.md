@@ -6,7 +6,7 @@ Eye and eyelid tracking for VR. Bring gaze, blinks, EyeWide and eyebrows to VRCF
 
 | Platform | Build | Headsets |
 | --- | --- | --- |
-| **Windows 10 / 11 x64** | **[v0.1.10-beta — download ZIP](https://github.com/challenger0303/SRanibro/releases/download/v0.1.10-beta/SRanibro-v0.1.10-beta-Windows.zip)** | Tobii-equipped hot-mirror headsets, PSVR2, and Dream Air / SE (XR5 beta) |
+| **Windows 10 / 11 x64** | **[v0.1.10-beta — download ZIP](https://github.com/challenger0303/SRanibro/releases/download/v0.1.10-beta/SRanibro-v0.1.10-beta-Windows.zip)** | Tobii-equipped, hot-mirror headsets, PSVR2, and Dream Air / SE (XR5 beta) |
 | **Linux x86_64** | **[v0.1.9-beta — download tar.gz](https://github.com/challenger0303/SRanibro/releases/download/v0.1.9-beta/SRanibro-PSVR2-0.1.9-beta-linux-x86_64.tar.gz)** | **PSVR2 only · experimental** · glibc 2.39+ |
 
 **Windowsはv0.1.10-beta。Linux版はPSVR2専用の実験版です。**
