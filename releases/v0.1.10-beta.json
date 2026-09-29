@@ -1,0 +1,14 @@
+{
+  "version": "v0.1.10-beta",
+  "platform": "Windows x86_64",
+  "distribution": "Closed-source application binary release; this tag contains public documentation and the separately MIT-licensed sranibro-core, not the application source.",
+  "bundle": {
+    "file": "SRanibro-v0.1.10-beta-Windows.zip",
+    "bytes": 31175768,
+    "sha256": "2142d32563f4cb2d2d2488000cef6b269c75c1a14a45e1b77c7c1d77908f63ec"
+  },
+  "executable_sha256": "a99d33012d8c0af7c3524caf1ecaf39eb0121a45bed77afe66e127719e01c4a0",
+  "vrcft_module_version": "0.2.4",
+  "xr5_model": "XR5-Eyelid-Balanced-20260928.sranimodel",
+  "linux": "No Linux build is included in this release. The separate v0.1.9-beta Linux package is experimental and PSVR2-only."
+}
