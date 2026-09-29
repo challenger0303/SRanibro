@@ -1,10 +1,10 @@
 # SRanibro 使い方ガイド
 
-**v0.1.9-beta（Hotmirror / PSVR2統合版）**向けです。
+**Windows版 v0.1.10-beta（Hotmirror / PSVR2 / Dream Air・XR5）**向けです。
 
-[English guide](USER_GUIDE.md) · [ダウンロード](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.9-beta)
+[English guide](USER_GUIDE.md) · [ダウンロード](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.10-beta)
 
-SRanibroは、Hotmirror系VR HMDのアイカメラ映像を使い、まぶた・見開き・目を強く閉じる動きをVRCFaceTracking（VRCFT）へ送るソフトです。視線や瞳孔のデータも扱います。まぶたモデルの推論はPC内で行います。
+SRanibroは、対応VR HMDのアイカメラ映像を使い、まぶた・見開き・対応モデルでは目を強く閉じる動きをVRCFaceTracking（VRCFT）へ送るソフトです。視線や瞳孔のデータも扱います。まぶたモデルの推論はPC内で行います。
 
 最初から長いキャリブレーションをする必要はありません。まず普通に装着して動きを確認し、必要な場合だけ明るさと開閉のバーを調整してください。Wearing Memoryは、良い設定ができた後に使う任意の機能です。
 
@@ -16,10 +16,11 @@ SRanibroは、Hotmirror系VR HMDのアイカメラ映像を使い、まぶた・
   - StarVR One
   - Varjo（対応カメラ経路）
   - PlayStation VR2（PSVR2Toolkit経由）
-- 利用できるSRanipalインストールとEyePredictionモデル
+  - Pimax Dream Air / SE（XR5、ベータ対応）
+- 利用できるSRanipalインストールとEyePredictionモデル（同梱のXR5専用モデルを使う場合は不要）
 - VRChatへ送る場合は、VRCFaceTrackingと対応アバター
 
-**Pimax Dream Air / SE（XR5）は保留中で、この統合版には含まれません。** 旧ガイドのSafe Geometry Fitなどを、この版の初期設定として行う必要はありません。
+**Dream Air / SE（XR5）**は、**Tracking & device → XR5 tracking → XR5 native model**を選びます。開閉とEyeWideに対応し、Squeezeは未対応です。Pythonは不要です。従来の**SRanipal + image transform**も選べますが、そちらはSRanipalモデルが必要です。専用モデルではSafe Geometry Fitは不要です。
 
 先にメーカー側の視線キャリブレーションを済ませてください。SRanibroのRecenterはまぶたの基準を合わせる操作で、メーカー側の視線キャリブレーションとは別です。
 
@@ -27,16 +28,19 @@ PSVR2は、PSVR2Toolkitを導入してSteamVRを起動しておく必要があ�
 
 ## 2. ダウンロードと配置
 
-公式リリースから **`SRanibro-v0.1.9-beta-bundle.zip`** をダウンロードし、書き込み可能なフォルダーへ展開します。
+公式リリースから **`SRanibro-v0.1.10-beta-Windows.zip`** をダウンロードし、書き込み可能なフォルダーへ展開します。
 
 - `SRanibro.exe` — アプリ本体
 - `eyebrow.bin` — 汎用眉モデル
 - `SRanibro-VRCFT-module.zip` — VRCFT用モジュール
+- `models/` — XR5専用まぶたモデル
+- `model-runtime/` — 専用モデルの推論に必要なファイル
+- `licenses/` — 依存ライブラリのライセンス表記
 - `README.txt` — 簡単な案内
 
 `eyebrow.bin`はexeと同じフォルダーに置いてください。個人用の眉モデルが選択済みなら、そちらが優先されます。
 
-SRanipalのまぶたモデルは別途必要です。指定方法は「最初の起動」を参照してください。
+更新時も`models`と`model-runtime`をexeと一緒に配置してください。XR5モデルの選択が空欄なら同梱モデルを使い、選択済みの個人ファイルはそのまま保持します。他のまぶた処理ではSRanipalモデルが別途必要です。指定方法は「最初の起動」を参照してください。
 
 exeは未署名のため、SmartScreenの警告が出る場合があります。公式リリースから入手し、Windowsの保護機能を無効にしないでください。
 
@@ -64,11 +68,11 @@ SRanibroを起動してからVRCFTを起動し、Eye Moduleに`SRanibro`が表�
 
 1. HMDを接続し、メーカーのソフトウェアを起動する。PSVR2はToolkitを導入したSteamVRも起動する。
 2. `SRanibro.exe`を起動し、歯車の**Settings**を開く。
-3. **SRanipal runtime**で**Find automatically**を試す。見つからなければ`sr_runtime.exe`を選ぶか、それが入っているフォルダーを指定する。
+3. SRanipalを使う場合は、**SRanipal runtime**で**Find automatically**を試す。見つからなければ`sr_runtime.exe`を選ぶか、それが入っているフォルダーを指定する。XR5専用モデルならこの操作は不要。
 4. **Tracking & device**のHeadsetで使用する機種を選ぶ。自動判別が意図と違う場合は明示的に選ぶ。
-5. **Apply & reload**を押す。
+5. Dream Airは**XR5 tracking → XR5 native model**を選んで**Apply & reload**を押す。他の機種は機種選択後に**Apply & reload**を押す。
 
-指定したSRanipalフォルダーには、次のモデルが必要です。
+SRanipalを使う場合、指定したフォルダーには次のモデルが必要です。
 
 ```text
 model\EyePrediction\00-0000.params_opencl.params
@@ -87,10 +91,10 @@ Pipelineを展開すると、機器・カメラ・モデル・出力の状態を
 負荷が気になるときは：
 
 - 普段はPREVIEWをOFFにする、またはウィンドウを最小化する。
-- **Settings → Tracking & device → Eyelid inference**で、まず**Auto**を使う。
+- **Settings → Tracking & device → Eyelid processing**で、まず**GPU**を使う。
 - GPU利用時だけ問題が出るなら**CPU**に切り替えて比較する。切り替え時には再接続されます。
 
-AutoはGPUの出力と速度を確認して推論経路を選びます。GPUを選べば必ず速くなるとは限りません。
+GPUの初期化や実行に失敗した場合はCPUへフォールバックします。GPUを選べば必ず速くなるとは限りません。
 
 ## 6. まぶた・Wide・Squeezeを調整する
 
@@ -123,7 +127,7 @@ AutoはGPUの出力と速度を確認して推論経路を選びます。GPUを�
 
 **Set Wide neutral**は、見開いていない自然な開眼状態で押します。その後で見開き、オレンジのWideマーカーと出力を見ながらWideの開始・最大側を調整します。緑は通常の開閉、オレンジはWideの確認用です。
 
-Squeezeは別のバーです。普通の閉眼と、閉じた状態から少し力を入れる動作を比べて範囲を調整してください。無理に強く力を入れる必要はありません。
+Squeezeは対応モデル用の別のバーです（XR5専用モデルは未対応）。普通の閉眼と、閉じた状態から少し力を入れる動作を比べて範囲を調整してください。無理に強く力を入れる必要はありません。
 
 **Eyelid response**は途中の開閉の反応を変える調整です。まず上下限を合わせ、それでも途中の動きが合わない場合に使います。
 

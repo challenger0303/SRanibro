@@ -1,10 +1,10 @@
 # SRanibro User Guide
 
-For **v0.1.9-beta, the unified Hotmirror / PSVR2 build**.
+For **v0.1.10-beta on Windows: Hotmirror, PSVR2 and Dream Air / XR5**.
 
-[日本語版 / Japanese guide](USER_GUIDE.ja.md) · [Download](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.9-beta)
+[日本語版 / Japanese guide](USER_GUIDE.ja.md) · [Download](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.10-beta)
 
-SRanibro processes eye-camera images from hot-mirror VR headsets and sends eyelid openness, EyeWide and EyeSquint to VRCFaceTracking (VRCFT). It also handles gaze and pupil data. Eyelid inference runs locally on your PC.
+SRanibro processes eye-camera images from supported VR headsets and sends eyelid openness, EyeWide and, where supported, EyeSquint to VRCFaceTracking (VRCFT). It also handles gaze and pupil data. Eyelid inference runs locally on your PC.
 
 You do not need a long calibration sequence to get started. Wear the headset normally, check tracking, and adjust image brightness and the open/closed handles only if needed. Wearing Memory is optional: use it after you have a setup that works well.
 
@@ -16,10 +16,11 @@ You do not need a long calibration sequence to get started. Wear the headset nor
   - StarVR One
   - Varjo, through a supported camera path
   - PlayStation VR2 through PSVR2Toolkit
-- A SRanipal installation and EyePrediction model you are entitled to use.
+  - Pimax Dream Air / SE (XR5, beta)
+- A SRanipal installation and EyePrediction model you are entitled to use, unless using the bundled XR5 native model.
 - VRCFaceTracking and a compatible avatar for VRChat output.
 
-**Pimax Dream Air / SE (XR5) is paused and is not included in this unified build.** The Safe Geometry Fit instructions in older guides are not part of this build's initial setup.
+**Dream Air / SE (XR5):** choose **XR5 native model** under **Tracking & device → XR5 tracking**. It provides openness and EyeWide; Squeeze is not supported. No Python is needed. The older **SRanipal + image transform** path remains an option and requires SRanipal weights. Safe Geometry Fit is not needed for the native model.
 
 Complete the headset vendor's gaze calibration first. SRanibro's Recenter sets an eyelid reference; it is not the same as calibrating gaze in the vendor software.
 
@@ -27,16 +28,19 @@ PSVR2 requires PSVR2Toolkit and a running SteamVR session. Installing the PlaySt
 
 ## 2. Download and extract
 
-Download **`SRanibro-v0.1.9-beta-bundle.zip`** from the official release and extract it to a writable folder.
+Download **`SRanibro-v0.1.10-beta-Windows.zip`** from the official release and extract it to a writable folder.
 
 - `SRanibro.exe` — application
 - `eyebrow.bin` — generic eyebrow model
 - `SRanibro-VRCFT-module.zip` — VRCFT module
+- `models/` — XR5 native eyelid model
+- `model-runtime/` — native model inference dependencies
+- `licenses/` — dependency notices
 - `README.txt` — quick instructions
 
 Keep `eyebrow.bin` beside the executable. If you have already selected a personal eyebrow model, that model takes priority.
 
-You need to supply the SRanipal eyelid model separately. See "First launch" for setup instructions.
+Keep `models` and `model-runtime` beside the EXE, including when updating. A blank XR5 model selection uses the bundled model; a previously selected custom file is kept. Other eyelid paths need the SRanipal model separately. See "First launch" for setup instructions.
 
 The executable is unsigned, so SmartScreen may warn. Download from the official release and do not disable Windows protection.
 
@@ -64,11 +68,11 @@ Start SRanibro, then start VRCFT. Its Eye Module should report `SRanibro`. The b
 
 1. Connect the headset and start its vendor software. For PSVR2, also start SteamVR with PSVR2Toolkit installed.
 2. Run `SRanibro.exe` and open the gear-shaped **Settings** page.
-3. Under **SRanipal runtime**, try **Find automatically**. If that fails, select `sr_runtime.exe` or specify the folder containing it.
+3. For SRanipal tracking, under **SRanipal runtime**, try **Find automatically**. If that fails, select `sr_runtime.exe` or specify the folder containing it. Skip this for XR5 native tracking.
 4. Choose your headset under **Tracking & device**. Select it explicitly if automatic detection chooses the wrong device.
-5. Press **Apply & reload**.
+5. For Dream Air, choose **XR5 native model** under **XR5 tracking**, then press **Apply & reload**. For other headsets, press **Apply & reload** after selecting the device.
 
-The SRanipal folder must contain:
+When using SRanipal, its folder must contain:
 
 ```text
 model\EyePrediction\00-0000.params_opencl.params
@@ -87,10 +91,10 @@ A number such as `120/s` on an image is the camera-frame arrival rate. It is not
 If load is a problem:
 
 - Leave PREVIEW off during normal use, or minimize the window.
-- Start with **Auto** under **Settings → Tracking & device → Eyelid inference**.
+- Start with **GPU** under **Settings → Tracking & device → Eyelid processing**.
 - If problems occur only with GPU inference, compare **CPU** mode. Changing the inference mode reconnects tracking.
 
-Auto checks GPU output and speed before choosing a path. GPU mode is not guaranteed to be faster on every PC.
+GPU processing can fall back to CPU if initialization or execution fails. GPU is not guaranteed to be faster on every PC.
 
 ## 6. Adjust eyelids, Wide and Squeeze
 
@@ -123,7 +127,7 @@ The two eyes can produce different model values. LINK links adjustment values; i
 
 Press **Set Wide neutral** with your eyes relaxed, not widened. Then widen your eyes and adjust the Wide start/full range while watching the orange marker and output. Green shows normal eyelid movement; orange shows Wide.
 
-Squeeze has its own rail. Compare ordinary closure with gently adding tension after closing, then adjust its range. You do not need to squeeze forcefully.
+Squeeze has its own rail when using a model that supports it (the XR5 native model does not). Compare ordinary closure with gently adding tension after closing, then adjust its range. You do not need to squeeze forcefully.
 
 **Eyelid response** changes the response between the endpoints. Set the endpoints first, then use this control if the movement in between still feels wrong.
 
