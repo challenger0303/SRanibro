@@ -19,7 +19,7 @@ Extract the whole Windows ZIP. It includes the XR5 eyelid model, eyebrow model a
 
 - **Hot-mirror:** Pimax Crystal / Crystal Super (VR4), StarVR One, and Varjo through a supported camera path. Uses your SRanipal EyePrediction model.
 - **PSVR2:** requires PSVR2Toolkit and SteamVR, plus your SRanipal model.
-- **Dream Air / SE (XR5):** the bundled native model provides openness and EyeWide, without Python or SRanipal. Squeeze is not supported by this model. The SRanipal + image-transform option remains available.
+- **Dream Air / SE (XR5):** new settings use the bundled native model for openness and EyeWide, without Python or SRanipal. Squeeze is not supported by this model. The SRanipal + image-transform option remains available; existing selections are kept.
 
 ## Adjust eyelids by eye
 

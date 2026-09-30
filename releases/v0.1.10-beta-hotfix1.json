@@ -1,0 +1,32 @@
+{
+  "version": "v0.1.10-beta",
+  "revision": "hotfix1",
+  "date": "2026-09-30",
+  "platform": "Windows x86_64",
+  "distribution": "Binary-only app update. The original release tag is unchanged; its public source archives describe the original documentation snapshot.",
+  "changes": [
+    "Native XR5 eyelids are the default for new Windows settings; explicit SRanipal fallback selections are preserved.",
+    "Legacy XR5 EyeWide inference, fitter UI and capability flags are excluded while native eyelids are selected."
+  ],
+  "bundle": {
+    "file": "SRanibro-v0.1.10-beta-Windows.zip",
+    "bytes": 31176400,
+    "sha256": "3830874d5d62b7f6e5fef23ad428b2b8fb8612c64b657ab8091716c94e712435"
+  },
+  "previous_bundle_sha256": "2142d32563f4cb2d2d2488000cef6b269c75c1a14a45e1b77c7c1d77908f63ec",
+  "executable_sha256": "088304b4c0d32891b9e096d3e2aaa3bedc2676812c1f2a948806b972c2f60ed3",
+  "vrcft_module_version": "0.2.4",
+  "xr5_model": "XR5-Eyelid-Balanced-20260928.sranimodel",
+  "model_weights_changed": false,
+  "gaze_processing_changed": false,
+  "linux_build_changed": false,
+  "validation": {
+    "library_tests_passed": 708,
+    "library_tests_ignored": 3,
+    "output_integration_tests_passed": 12,
+    "cpu_previous_output_identical_pairs": 303,
+    "directml_status_differences": 0,
+    "directml_max_opening_delta": 0.000003039836883544922,
+    "fresh_hmd_test": false
+  }
+}

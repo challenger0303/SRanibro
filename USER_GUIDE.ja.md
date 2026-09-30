@@ -20,7 +20,7 @@ SRanibroは、対応VR HMDのアイカメラ映像を使い、まぶた・見開
 - 利用できるSRanipalインストールとEyePredictionモデル（同梱のXR5専用モデルを使う場合は不要）
 - VRChatへ送る場合は、VRCFaceTrackingと対応アバター
 
-**Dream Air / SE（XR5）**は、**Tracking & device → XR5 tracking → XR5 native model**を選びます。開閉とEyeWideに対応し、Squeezeは未対応です。Pythonは不要です。従来の**SRanipal + image transform**も選べますが、そちらはSRanipalモデルが必要です。専用モデルではSafe Geometry Fitは不要です。
+**Dream Air / SE（XR5）**の新規設定は、**Tracking & device → XR5 tracking → XR5 native model**が標準です。既存のSRanipal選択は保持するので、変更したい場合はここで切り替えてください。開閉とEyeWideに対応し、Squeezeは未対応です。Pythonは不要です。従来の**SRanipal + image transform**も選べますが、そちらはSRanipalモデルが必要です。旧XR5 EyeWideの学習項目は、そのフォールバック使用時だけ表示します。専用モデルではSafe Geometry Fitは不要です。
 
 先にメーカー側の視線キャリブレーションを済ませてください。SRanibroのRecenterはまぶたの基準を合わせる操作で、メーカー側の視線キャリブレーションとは別です。
 

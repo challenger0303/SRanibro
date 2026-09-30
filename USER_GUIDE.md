@@ -20,7 +20,7 @@ You do not need a long calibration sequence to get started. Wear the headset nor
 - A SRanipal installation and EyePrediction model you are entitled to use, unless using the bundled XR5 native model.
 - VRCFaceTracking and a compatible avatar for VRChat output.
 
-**Dream Air / SE (XR5):** choose **XR5 native model** under **Tracking & device → XR5 tracking**. It provides openness and EyeWide; Squeeze is not supported. No Python is needed. The older **SRanipal + image transform** path remains an option and requires SRanipal weights. Safe Geometry Fit is not needed for the native model.
+**Dream Air / SE (XR5):** new settings default to **XR5 native model** under **Tracking & device → XR5 tracking**. Existing SRanipal selections are kept; switch here if needed. The native model provides openness and EyeWide; Squeeze is not supported. No Python is needed. The older **SRanipal + image transform** path remains an option and requires SRanipal weights. Its separate XR5 EyeWide fitter is only available with that fallback. Safe Geometry Fit is not needed for the native model.
 
 Complete the headset vendor's gaze calibration first. SRanibro's Recenter sets an eyelid reference; it is not the same as calibrating gaze in the vendor software.
 
