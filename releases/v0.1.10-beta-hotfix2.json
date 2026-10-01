@@ -1,0 +1,41 @@
+{
+  "version": "v0.1.10-beta",
+  "revision": "hotfix2",
+  "date": "2026-10-01",
+  "platform": "Windows x86_64",
+  "distribution": "Binary-only update. Original release tag retained.",
+  "changes": [
+    "Improved native XR5 EyeWide sensitivity and paired-eye entry.",
+    "Includes XR5 native default and legacy EyeWide isolation fixes."
+  ],
+  "bundle": {
+    "file": "SRanibro-v0.1.10-beta-Windows.zip",
+    "bytes": 31176994,
+    "sha256": "3f1fed6409c53c7338074ef7dd17897793730fe600d3e52f373e476693c37c1a"
+  },
+  "previous_bundle_sha256": "3830874d5d62b7f6e5fef23ad428b2b8fb8612c64b657ab8091716c94e712435",
+  "executable_sha256": "f7a84c348ffca957feb659c9c22d6e443c8471475647a825a74b841b2c2cbc7f",
+  "vrcft_module_version": "0.2.4",
+  "xr5_model": "XR5-Eyelid-Balanced-20260928.sranimodel",
+  "model_weights_changed": false,
+  "primary_eyelid_processing_changed": false,
+  "gaze_processing_changed": false,
+  "linux_build_changed": false,
+  "validation": {
+    "library_tests_passed": 712,
+    "library_tests_ignored": 4,
+    "output_integration_tests_passed": 12,
+    "replay_recordings": 71,
+    "replay_ticks": 682286,
+    "cpu_previous_output_identical_pairs": 303,
+    "directml_status_differences": 0,
+    "directml_max_opening_delta": 3.039836883544922e-06,
+    "unpacked_unicode_path_cpu_gpu_smoke_pass": true,
+    "fresh_hmd_test": false
+  },
+  "limitations": [
+    "Wide remains weak or absent for some users.",
+    "Small increases in relaxed-eye Wide activity occurred in replay.",
+    "Existing Wide ranges may need adjustment."
+  ]
+}
