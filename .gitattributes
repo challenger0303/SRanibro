@@ -1,0 +1,8 @@
+* -text
+/sranibro-app/** text=auto eol=lf
+/sranibro-app/assets/** -text
+/README.md text eol=lf
+/USER_GUIDE.md text eol=lf
+/USER_GUIDE.ja.md text eol=lf
+/.gitignore text eol=lf
+/.gitattributes text eol=lf

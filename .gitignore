@@ -1,2 +1,10 @@
 # Binaries ship via GitHub Releases, not the repo tree.
 *.exe
+
+# Private build and runtime material must stay outside the public tree.
+**/private_*
+**/target/
+**/__pycache__/
+*.pyc
+*.dll
+*.pdb

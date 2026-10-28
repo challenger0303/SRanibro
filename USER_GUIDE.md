@@ -1,8 +1,8 @@
 # SRanibro User Guide
 
-For **v0.1.10-beta on Windows: Hotmirror, PSVR2 and Dream Air / XR5**.
+For **v0.1.11-beta on Windows: Hotmirror, PSVR2 and Dream Air / XR5**.
 
-[日本語版 / Japanese guide](USER_GUIDE.ja.md) · [Download](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.10-beta)
+[日本語版 / Japanese guide](USER_GUIDE.ja.md) · [Download](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.11-beta)
 
 SRanibro processes eye-camera images from supported VR headsets and sends eyelid openness, EyeWide and, where supported, EyeSquint to VRCFaceTracking (VRCFT). It also handles gaze and pupil data. Eyelid inference runs locally on your PC.
 
@@ -28,7 +28,7 @@ PSVR2 requires PSVR2Toolkit and a running SteamVR session. Installing the PlaySt
 
 ## 2. Download and extract
 
-Download **`SRanibro-v0.1.10-beta-Windows.zip`** from the official release and extract it to a writable folder.
+Download **`SRanibro-v0.1.11-beta-Windows.zip`** from the official release and extract it to a writable folder.
 
 - `SRanibro.exe` — application
 - `eyebrow.bin` — generic eyebrow model

@@ -1,8 +1,8 @@
 # SRanibro 使い方ガイド
 
-**Windows版 v0.1.10-beta（Hotmirror / PSVR2 / Dream Air・XR5）**向けです。
+**Windows版 v0.1.11-beta（Hotmirror / PSVR2 / Dream Air・XR5）**向けです。
 
-[English guide](USER_GUIDE.md) · [ダウンロード](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.10-beta)
+[English guide](USER_GUIDE.md) · [ダウンロード](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.11-beta)
 
 SRanibroは、対応VR HMDのアイカメラ映像を使い、まぶた・見開き・対応モデルでは目を強く閉じる動きをVRCFaceTracking（VRCFT）へ送るソフトです。視線や瞳孔のデータも扱います。まぶたモデルの推論はPC内で行います。
 
@@ -28,7 +28,7 @@ PSVR2は、PSVR2Toolkitを導入してSteamVRを起動しておく必要があ�
 
 ## 2. ダウンロードと配置
 
-公式リリースから **`SRanibro-v0.1.10-beta-Windows.zip`** をダウンロードし、書き込み可能なフォルダーへ展開します。
+公式リリースから **`SRanibro-v0.1.11-beta-Windows.zip`** をダウンロードし、書き込み可能なフォルダーへ展開します。
 
 - `SRanibro.exe` — アプリ本体
 - `eyebrow.bin` — 汎用眉モデル
