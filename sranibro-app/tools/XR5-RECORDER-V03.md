@@ -28,8 +28,6 @@ Validation performed:
 
 No changes to normal SRanibro settings, no application replacement, no upload, and no model deployment. Local distribution folder: `outputs/XR5-Recorder-v0.3.0` with English/Japanese instructions, restoration helper and third-party notices.
 
-## Official packaging requirement
+## Distribution validation
 
-Do not distribute the public-source Cargo build as a working recorder. Its runtime provider deliberately returns `None`; UI and synthetic capture tests do not exercise the real connection prerequisite. The first v0.3.0 ZIP was incorrectly built through that path and is replaced by the runtime-included hotfix.
-
-Official binaries must be built in private staging with the existing authorized provider. Keep the provider and payloads out of the public source tree and ZIP. Before packaging, run the finished EXE with `--check-runtime <report-path>` under an empty temporary `LOCALAPPDATA`. Require exit code 0 and a PASS report. This checks materialization, library loading and the API export without touching the HMD or services. Also run the recorder tests, payload integrity test, synthetic export and desktop smoke check. Runtime validation is not proof of a live camera connection.
+Before packaging, run the finished EXE with `--check-runtime <report-path>` under an empty temporary `LOCALAPPDATA`. Require exit code 0 and a PASS report. Also run the recorder tests, synthetic export and desktop smoke check. Runtime validation does not establish a live camera connection or tracking accuracy.

@@ -50,8 +50,8 @@ Save a wearing position after checking your blinks and winks. **Wearing Memory**
 
 ## License
 
-Application source is now available in [`sranibro-app`](sranibro-app/), except the private Tobii forced-access boundary described in [SOURCE_BOUNDARY.md](sranibro-app/SOURCE_BOUNDARY.md). The existing [application source notice](sranibro-app/SOURCE-LICENSE.md) permits review and research reference; it is not an MIT license. The Windows binary retains the private device-access backend. Binary redistribution terms are unchanged: link to the official release.
+Application source is available in [`sranibro-app`](sranibro-app/). The [application source notice](sranibro-app/SOURCE-LICENSE.md) permits review and research reference; it is not an MIT license. Binary redistribution terms are unchanged: link to the official release.
 
-The separate [`sranibro-core`](sranibro-core/) source remains [MIT-licensed](sranibro-core/LICENSE). GitHub's generated source archives now also include the application source with the documented exclusions; no vendor runtime, authentication material, personal mappings or eye recordings are in the repository.
+The separate [`sranibro-core`](sranibro-core/) source remains [MIT-licensed](sranibro-core/LICENSE). GitHub's generated source archives also include the application source.
 
 SRanibro is independent and is not affiliated with or endorsed by Tobii, HTC, Pimax, StarVR, Varjo, Sony, VRChat or VRCFaceTracking. Trademarks belong to their respective owners.

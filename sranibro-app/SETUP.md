@@ -1,6 +1,6 @@
 # SRanibro — Setup
 
-> Historical runtime setup reference. For this public source checkout, start with README.md and SOURCE_BOUNDARY.md: direct EyeChip access and forced runtime management are excluded. The official Windows release has a separate private device-access backend.
+> Historical setup reference. Start with [README.md](README.md) for current source build instructions and the project user guides for Windows packages.
 
 VR eye-tracking → VRCFaceTracking bridge for Tobii IS4 hotmirror HMDs
 (Pimax Crystal / Crystal Super, StarVR One).
@@ -49,9 +49,6 @@ Open **Settings** (gear icon) → **Assets**:
   - `starvr` — StarVR One.
 - Click **Apply & reload** (no app restart).
 
-On connect, SRanibro frees the EyeChip from the Tobii runtime — **allow the UAC
-prompt** (it needs admin once to stop/disable the Tobii service).
-
 The dashboard's **PIPELINE** should go green (DEVICE → CAMERA/GAZE → ML → CORE →
 OUTPUT) and the eye-camera images should appear.
 
@@ -82,8 +79,7 @@ Tuning (open/close/wide/squeeze feel) lives in the **Calibration** tab.
 - **Nothing happens / window flashes and closes** → check
   `%APPDATA%\SRanibro\sranibro.log` for the reason (graphics init, panic, etc.).
 - **"Tobii DLL required"** → set the Tobii DLL in Settings and Apply & reload.
-- **DEVICE red, "no camera stream"** → the headset isn't connected, or the Tobii
-  runtime still holds the device (the UAC handoff was declined). Re-Apply and allow UAC.
+- **DEVICE red, "no camera stream"** → check the headset connection, selected adapter and device log.
 - **Pipeline stuck before CORE** → the fault summary at the bottom of the dashboard
   names the first broken stage and the next action.
 - **Window too big for your screen** → it auto-fits the monitor on launch.
