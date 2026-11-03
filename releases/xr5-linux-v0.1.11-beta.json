@@ -1,0 +1,30 @@
+{
+  "version": "xr5-linux-v0.1.11-beta",
+  "date": "2026-11-03",
+  "platform": "Ubuntu 24.04 x86_64",
+  "glibc_minimum": "2.39",
+  "status": "experimental preview",
+  "application_version": "0.1.11-beta",
+  "source_commit": "bf359c6053fa274ea0513b84294facd2d878b465",
+  "bundle": {
+    "file": "SRanibro-XR5-v0.1.11-beta-linux-x86_64.tar.gz",
+    "bytes": 19983796,
+    "sha256": "b83f0733177295e94cad4536532c5abf47917263cc5862f9ce5fae69c808cb28"
+  },
+  "executable_sha256": "c3808c92d98a6acd08206592279561f40972336f5dc490b03b730dfa1bc80595",
+  "validation": {
+    "linux_library_tests_passed": 736,
+    "linux_library_tests_ignored": 6,
+    "windows_build_check": true,
+    "psvr2_linux_build_check": true,
+    "archive_files_checked": 517,
+    "packaged_model_parity_pairs": 21,
+    "packaged_model_parity_eyes": 42,
+    "packaged_model_parity_max_absolute_difference": 0.0,
+    "disconnected_probe_returns_failure": true,
+    "linux_x11_ui_checked": true
+  },
+  "linux_live_xr5_verified": false,
+  "gaze_accuracy_verified": false,
+  "model_weights_changed": false
+}
