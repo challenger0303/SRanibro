@@ -25,7 +25,7 @@ Extract the whole Windows ZIP. It includes the XR5 eyelid model, eyebrow model a
 
 v0.1.11-beta includes the current application code and opt-in experimental XR5 model-gaze integration. Native gaze remains the default; a compatible local gaze package is required for Model gaze. Personal gaze mappings are not bundled, and no new gaze/eyelid accuracy gain is claimed.
 
-The separate **[XR5 Recorder v0.4.1](https://github.com/challenger0303/SRanibro/releases/download/v0.1.11-beta/SRanibro-XR5-Recorder-v0.4.1-TobiiReference.zip)** keeps a dot fixed in SteamVR space while the user moves their head, and records native Tobii gaze references with the eye images. Missing, stale and invalid references are kept explicit. Real-device timing, eye assignment and coordinate alignment still require validation.
+The separate **[XR5 Recorder v0.4.2](https://github.com/challenger0303/SRanibro/releases/tag/xr5-recorder-v0.4.2)** adds Squint and independent eyebrow-up/down recording prompts. Keep eye opening unchanged or use slow relaxed blinks during eyebrow-up recording. It supports a fixed dot in SteamVR space with head movement, plus native gaze references. [Recording guide](sranibro-app/tools/XR5-RECORDER-V042.md).
 
 ## Adjust eyelids by eye
 

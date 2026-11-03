@@ -14,15 +14,22 @@ pub enum RecordingPose {
     Relaxed,
     HalfOpen,
     Blinks,
+    Squint,
+    EyebrowUp,
+    EyebrowDown,
 }
 impl RecordingPose {
-    pub const ALL: [Self; 4] = [Self::Wide, Self::Relaxed, Self::HalfOpen, Self::Blinks];
+    pub const EYES: [Self; 5] = [Self::Wide, Self::Relaxed, Self::HalfOpen, Self::Blinks, Self::Squint];
+    pub const EYEBROWS: [Self; 2] = [Self::EyebrowUp, Self::EyebrowDown];
     pub fn label(self) -> &'static str {
         match self {
             Self::Wide => "Wide open",
             Self::Relaxed => "Normal",
             Self::HalfOpen => "Half open",
             Self::Blinks => "Blinks",
+            Self::Squint => "Squint",
+            Self::EyebrowUp => "Eyebrow up",
+            Self::EyebrowDown => "Eyebrow down",
         }
     }
     pub fn slug(self) -> &'static str {
@@ -31,14 +38,20 @@ impl RecordingPose {
             Self::Relaxed => "relaxed",
             Self::HalfOpen => "half_open",
             Self::Blinks => "blinks",
+            Self::Squint => "squint",
+            Self::EyebrowUp => "eyebrow_up",
+            Self::EyebrowDown => "eyebrow_down",
         }
     }
     pub fn instruction(self) -> &'static str {
         match self {
-            Self::Wide=>"Open your eyes wide and look around freely. Blink and rest whenever needed; do not strain.",
-            Self::Relaxed=>"Keep your eyes comfortably open and look around freely. Blink normally.",
-            Self::HalfOpen=>"Keep your eyelids roughly halfway closed and look around freely. No exact halfway position is required; rest whenever needed.",
-            Self::Blinks=>"Look around freely and blink naturally. Also slowly close fully and reopen a few times; take breaks whenever needed.",
+            Self::Wide=>"Open your eyes wide without straining. Blink and rest whenever needed.",
+            Self::Relaxed=>"Keep your eyes and eyebrows relaxed. Blink normally.",
+            Self::HalfOpen=>"Keep your eyelids roughly halfway closed without squeezing. No exact halfway position is required; rest whenever needed.",
+            Self::Blinks=>"Blink naturally. Also slowly close fully and reopen a few times; take breaks whenever needed.",
+            Self::Squint=>"Gently squint with your eyelids while keeping your eyebrows relaxed. Do not force your eyes shut; blink and rest whenever needed.",
+            Self::EyebrowUp=>"Raise only your eyebrows. Keep your eye opening unchanged, or use slow, relaxed blinks. Do not open your eyes wider.",
+            Self::EyebrowDown=>"Lower only your eyebrows. Keep your eyes relaxed without squeezing; blink and rest whenever needed.",
         }
     }
 }
@@ -320,12 +333,12 @@ impl FreeCapture {
                 });
                 format!("Waiting for the world-fixed dot. {error}")
             } else if settling {
-                "Keep looking at the floating dot. Get ready to move your head slowly.".into()
+                format!("Keep looking at the floating dot. Get ready to move your head slowly. {}", self.pose.instruction())
             } else {
-                "Keep your eyes on the same dot. Slowly turn/tilt your head left, right, up and down. Blink and rest as needed.".into()
+                format!("Keep your eyes on the same dot. Slowly turn/tilt your head left, right, up and down. {}", self.pose.instruction())
             }
         } else {
-            self.pose.instruction().into()
+            format!("{} Look around freely.", self.pose.instruction())
         };
         Status::Running {
             phase_index: 0,
@@ -417,9 +430,9 @@ impl FreeCapture {
         let stored = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
         zip.start_file("metadata.txt", stored)?;
-        zip.write_all(format!("{metadata}label_status=unlabelled\nsplit=unassigned\nprompted_action={}\nrequested_seconds={}\nrecorded_active_seconds={:.6}\ncapture_evidence_complete={}\ncompletion_means=recording_finished_not_pose_coverage\n",self.pose.slug(),self.requested_seconds(),self.elapsed.saturating_sub(COUNTDOWN).as_secs_f64().min(self.duration.as_secs_f64()),self.coverage_ok()).as_bytes())?;
+        zip.write_all(format!("{metadata}label_status=unlabelled\nsplit=unassigned\nprompted_action={}\nprompted_instruction={}\nrequested_seconds={}\nrecorded_active_seconds={:.6}\ncapture_evidence_complete={}\ncompletion_means=recording_finished_not_pose_coverage\n",self.pose.slug(),self.pose.instruction(),self.requested_seconds(),self.elapsed.saturating_sub(COUNTDOWN).as_secs_f64().min(self.duration.as_secs_f64()),self.coverage_ok()).as_bytes())?;
         zip.start_file("README.txt", stored)?;
-        zip.write_all(b"prompted_action records the participant-selected group: wide, relaxed, half_open, or blinks. This is NOT a per-frame eye-state label; blinks/rest/transition frames are valid in every group. Do not turn the prompt into openness=0,0.5,1 targets.\nBiometric eye images; local storage only. No automatic upload. All frames are UNLABELLED, with split UNASSIGNED. Blank expected_open, categorical commanded_target and holdout fields are intentional. No pose or gaze truth is inferred from prompts or native signals. Assign evaluation splits by recording/contributor, not random neighboring frames, before annotation or fitting. Reuse for tuning consumes that session for final evaluation. Raw Gray8 stereo frames precede ML transforms. phase_time_s is active recording time; wall_time_us is local monotonic elapsed time from Start (including preparation/pauses), not exposure synchronization. Native values and flags are separate in native_evidence.csv.\n")?;
+        zip.write_all(b"prompted_action records the participant-selected group: wide, relaxed, half_open, blinks, squint, eyebrow_up, or eyebrow_down. Squint is separate from a relaxed half-open posture. For eyebrow_up, raise only the eyebrows while keeping eye opening unchanged, or using slow relaxed blinks; do not open the eyes wider. Eyebrow prompts do not certify actual eyebrow displacement or visibility in the eye-camera image. The exact selected instruction is retained as prompted_instruction in metadata.txt. This is NOT a per-frame eye-state label; blinks/rest/transition frames are valid in every group. Do not turn the prompt into openness=0,0.5,1 targets.\nBiometric eye images; local storage only. No automatic upload. All frames are UNLABELLED, with split UNASSIGNED. Blank expected_open, categorical commanded_target and holdout fields are intentional. No pose or gaze truth is inferred from prompts or native signals. Assign evaluation splits by recording/contributor, not random neighboring frames, before annotation or fitting. Reuse for tuning consumes that session for final evaluation. Raw Gray8 stereo frames precede ML transforms. phase_time_s is active recording time; wall_time_us is local monotonic elapsed time from Start (including preparation/pauses), not exposure synchronization. Native values and flags are separate in native_evidence.csv.\n")?;
         if let Some(guide) = &self.guide {
             zip.write_all(b"WORLD FIXATION: one dot is anchored 2m in front of the initial HMD pose in OpenVR Standing coordinates (+X right,+Y up,-Z forward). Keep looking at it while moving your head slowly. fixation.csv stores the fixed world target, measured HMD poses and runtime eye-to-head view transforms. Nominal eye rays describe the direction TO THE DOT conditional on actual fixation, not measured gaze or anatomical optical axes. fixation_confirmed is always false. Pose pairing uses the latest preceding query (<=50ms) at each camera RECEIVE time, never an exposure timestamp. Runtime overlay visibility is not proof of scanout, attention or fixation. Camera intrinsics/extrinsics, pupil/iris landmarks and eyeball geometry are not estimated. settle/hold is timing context, not attention classification. Use a dedicated xr5_world_fixation_v1 importer, not legacy calibration fitting.\n")?;
             zip.start_file("fixation.csv", stored)?;
@@ -520,6 +533,73 @@ impl FreeCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_expression_archives_keep_distinct_prompts_without_fabricated_eye_labels() {
+        use std::io::Read;
+        for (pose, expected) in [
+            (RecordingPose::Squint, "squint"),
+            (RecordingPose::EyebrowUp, "eyebrow_up"),
+            (RecordingPose::EyebrowDown, "eyebrow_down"),
+        ] {
+            let t = Instant::now();
+            let mut capture = FreeCapture::new();
+            capture.start(10, pose, [0; 2], t);
+            assert!(frame(&mut capture, t + COUNTDOWN, 1));
+            assert!(capture.finish());
+            let path = std::env::temp_dir().join(format!("xr5-expression-{}-{expected}.zip", std::process::id()));
+            capture.export_recording(&path, "capture_protocol=xr5_free_gaze_pose_recording_v1\n").unwrap();
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+            let mut samples = String::new();
+            archive.by_name("samples.csv").unwrap().read_to_string(&mut samples).unwrap();
+            let row: Vec<_> = samples.lines().nth(1).unwrap().split(',').collect();
+            assert_eq!(row[34], expected);
+            assert_eq!(row[1], "unlabelled");
+            for column in [2, 5, 24] { assert_eq!(row[column], ""); }
+            assert_eq!(row[32], "unassigned");
+            let mut metadata = String::new();
+            archive.by_name("metadata.txt").unwrap().read_to_string(&mut metadata).unwrap();
+            assert!(metadata.contains(&format!("prompted_action={expected}\n")));
+            assert!(metadata.contains("prompted_instruction="));
+            if pose == RecordingPose::EyebrowUp {
+                assert!(metadata.contains("Raise only your eyebrows."));
+                assert!(metadata.contains("Keep your eye opening unchanged, or use slow, relaxed blinks."));
+                assert!(metadata.contains("Do not open your eyes wider."));
+            }
+            assert!(archive.by_name("frames/000000_left.png").is_ok());
+            assert!(archive.by_name("frames/000000_right.png").is_ok());
+            drop(archive);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    #[test]
+    fn world_fixation_keeps_eyebrow_only_instruction_during_preparation() {
+        use sranibro_rs::recorder_fixation::{PoseHistory, WorldPose};
+        use std::sync::{Arc, Mutex};
+        let t = Instant::now();
+        let feedback = Arc::new(Mutex::new(PoseHistory::default()));
+        let mut capture = FreeCapture::new();
+        capture.start_world(30, RecordingPose::EyebrowUp, [0; 2], t, 42, feedback.clone());
+        let transform = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]];
+        for i in 0..=80 {
+            let now = t + Duration::from_millis(i * 50);
+            feedback.lock().unwrap().push(WorldPose {
+                session: 42, queried_at: now, target_world: [0., 0., -2.],
+                head_to_world: transform, eye_to_head: [transform; 2],
+                angular_velocity: [0.; 3], tracking_result: 200,
+                valid: true, connected: true, overlay_visible: true,
+            });
+            capture.tick_at(now);
+        }
+        match capture.status() {
+            Status::Running { instruction, settling, .. } => {
+                assert!(settling);
+                assert!(instruction.contains("floating dot"));
+                assert!(instruction.contains("Raise only your eyebrows."));
+                assert!(instruction.contains("Do not open your eyes wider."));
+            }
+            _ => panic!("expected the fixed-dot preparation stage"),
+        }
+    }
     #[test]
     fn world_tracking_gates_clock_and_requires_pose_context_for_both_eyes() {
         use sranibro_rs::recorder_fixation::{PoseHistory, WorldPose};

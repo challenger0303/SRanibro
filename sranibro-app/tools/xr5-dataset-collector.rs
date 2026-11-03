@@ -556,7 +556,7 @@ mod app {
         fn draw_header(&self, ui: &mut egui::Ui, state: &LiveState) {
             ui.horizontal(|ui| {
                 ui.heading("XR5 Recorder");
-                ui.small("v0.4.1 Tobii gaze reference");
+                ui.small("v0.4.2 Expression recording");
                 ui.label(
                     RichText::new(if state.mock { "SIMULATION" } else { "SRanibro" })
                         .strong()
@@ -649,7 +649,7 @@ mod app {
         }
 
         fn draw_idle(&mut self, ui: &mut egui::Ui, state: &LiveState) {
-            ui.heading("Eye recording");
+            ui.heading("Expression recording");
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.world_fixation, true, "Fixed dot + head movement");
                 ui.selectable_value(&mut self.world_fixation, false, "Free eye movement");
@@ -661,7 +661,9 @@ mod app {
                 ui.label("Look around freely; there are no gaze targets.");
             }
             ui.add_space(8.0);
-            for pair in RecordingPose::ALL.chunks(2) {
+            for (group, poses) in [("Eyes", RecordingPose::EYES.as_slice()), ("Eyebrows", RecordingPose::EYEBROWS.as_slice())] {
+                ui.label(group);
+                for pair in poses.chunks(2) {
                 ui.horizontal(|ui| {
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
                     for &pose in pair {
@@ -678,13 +680,11 @@ mod app {
                         }
                     }
                 });
+                }
+                ui.add_space(4.0);
             }
             ui.add_space(6.0);
-            if self.world_fixation {
-                ui.label("Keep the selected eyelid posture comfortably while watching the same dot. Blink and take breaks whenever needed.");
-            } else {
-                ui.label(self.recording_pose.instruction());
-            }
+            ui.label(self.recording_pose.instruction());
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("Recording time");
@@ -1089,6 +1089,9 @@ mod app {
                 } else {
                     RecordingPose::HalfOpen
                 };
+            }
+            if self.ui_smoke.is_some() && std::env::args().any(|a| a == "--ui-smoke-eyebrow-up") {
+                self.recording_pose = RecordingPose::EyebrowUp;
             }
             if ctx.input(|i| i.viewport().close_requested())
                 && (state.saving || capture_is_active(&state.capture_status))
@@ -2144,7 +2147,7 @@ mod app {
                 );
             metadata.push_str("fixation_schema=xr5_world_fixation_v1\ntarget_initial_distance_m=2\ntarget_width_m=0.075\ntarget_anchor=initial_tracked_hmd_pose_forward\ntracking_origin=standing\npose_prediction_seconds=0\npose_pairing=latest_preceding_query_at_each_camera_receive\npose_max_age_us=50000\npose_pairing_is_exposure_sync=false\nview_origins=runtime_virtual_eye_to_head_not_measured_anatomical_centers\nnominal_ray_space=runtime_eye_view_right_up_minus_z_forward\nfixation_confirmed=false\ngeometry_calibration_available=false\nevent_log_capacity=8192\n");
         }
-        metadata.push_str("collector_version=0.4.1\nnative_evidence_schema=xr5_native_evidence_v1\nnative_flags_preserved=true\nnative_packet_stream=1285\nnative_sample_pairing=latest_received_with_age_not_exposure_synchronized\ntobii_gaze_schema=xr5_tobii_gaze_reference_v1\ntobii_gaze_stream=1289\ntobii_gaze_pairing=latest_preceding_packet_at_each_camera_receive\ntobii_gaze_freshness_limit_ms=150\ntobii_gaze_clock=local_monotonic_receive_not_exposure_sync\ntobii_gaze_validity=adapter_vector_plausibility_not_native_confidence\ntobii_gaze_coordinate_frame=device_raw_unverified\ntobii_gaze_eye_mapping=decoder_column3_left_column4_right_then_recording_swap\ntobii_gaze_hardware_eye_assignment_verified=false\ntobii_gaze_is_training_label=false\n");
+        metadata.push_str("collector_version=0.4.2\nnative_evidence_schema=xr5_native_evidence_v1\nnative_flags_preserved=true\nnative_packet_stream=1285\nnative_sample_pairing=latest_received_with_age_not_exposure_synchronized\ntobii_gaze_schema=xr5_tobii_gaze_reference_v1\ntobii_gaze_stream=1289\ntobii_gaze_pairing=latest_preceding_packet_at_each_camera_receive\ntobii_gaze_freshness_limit_ms=150\ntobii_gaze_clock=local_monotonic_receive_not_exposure_sync\ntobii_gaze_validity=adapter_vector_plausibility_not_native_confidence\ntobii_gaze_coordinate_frame=device_raw_unverified\ntobii_gaze_eye_mapping=decoder_column3_left_column4_right_then_recording_swap\ntobii_gaze_hardware_eye_assignment_verified=false\ntobii_gaze_is_training_label=false\n");
         metadata.push_str(&format!("collection_group={}\n", shared.collection_group));
         let result = capture
             .export_recording(&partial, &metadata)

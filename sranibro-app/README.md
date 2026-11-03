@@ -13,3 +13,5 @@ cargo test --locked --release --features xr5-only --bin sranibro-xr5-dataset-col
 The result is `target/release/sranibro-rs.exe`. Available tracking paths depend on the configured adapters and runtime dependencies. For ready-to-run Windows packages, use the [official releases](https://github.com/challenger0303/SRanibro/releases). User models/runtimes are checked when using their respective tracking paths. Do not copy user settings into distributable packages.
 
 The recorder defaults to a fixed point in SteamVR space while the user moves their head, and saves native Tobii reference directions/status/timing when available. Reference availability is not ground-truth fixation confidence. Hardware eye assignment, coordinate alignment and live accuracy remain separate checks.
+
+Recorder **v0.4.2** adds Squint, Eyebrow up and Eyebrow down prompts. Eyebrow up keeps eye opening unchanged or permits slow relaxed blinks. See the [recording guide](tools/XR5-RECORDER-V042.md) and [Windows recorder release](https://github.com/challenger0303/SRanibro/releases/tag/xr5-recorder-v0.4.2).

@@ -1,0 +1,25 @@
+{
+  "version": "xr5-recorder-v0.4.2",
+  "date": "2026-11-03",
+  "platform": "Windows x86_64",
+  "bundle": {
+    "file": "SRanibro-XR5-Recorder-v0.4.2.zip",
+    "bytes": 5092002,
+    "sha256": "f0b699ed7523a6c1e67fd4fae50836ae6512b0bab1eca760906ad2d77803b279"
+  },
+  "executable_sha256": "6bedfe201aa4f2285c0a7b64381f46630d8ed93143f8727f86d6f182504bcc7d",
+  "validation": {
+    "recorder_unit_tests_passed": 30,
+    "synthetic_free_and_world_export_pass": true,
+    "real_headset_recordings": 7,
+    "recorded_active_seconds": 540,
+    "stereo_pairs": 33299,
+    "missing_image_or_reference_files": 0,
+    "archive_crc_failures": 0
+  },
+  "limitations": [
+    "Recording prompts are not per-frame labels or confirmed fixation.",
+    "No gaze or expression-recognition accuracy claim.",
+    "Hardware eye assignment, coordinate alignment and exposure synchronization are not verified."
+  ]
+}
