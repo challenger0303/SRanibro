@@ -411,7 +411,7 @@ fn native_options_for_renderer(renderer: UiRenderer) -> eframe::NativeOptions {
             UiRenderer::Glow => eframe::Renderer::Glow,
             UiRenderer::Dx12 | UiRenderer::Vulkan => eframe::Renderer::Wgpu,
         },
-        vsync: true,
+        vsync: !(cfg!(target_os = "linux") && renderer == UiRenderer::Glow),
         wgpu_options,
         ..Default::default()
     }
@@ -1760,10 +1760,10 @@ mod gaze_range_tests {
     }
 
     #[test]
-    fn interactive_ui_never_queues_more_than_one_vsynced_frame() {
+    fn interactive_ui_keeps_diagnostic_presentation_bounded() {
         for renderer in [UiRenderer::Glow, UiRenderer::Dx12, UiRenderer::Vulkan] {
             let options = native_options_for_renderer(renderer);
-            assert!(options.vsync);
+            assert_eq!(options.vsync, !(cfg!(target_os = "linux") && renderer == UiRenderer::Glow));
             assert_eq!(options.wgpu_options.present_mode, wgpu::PresentMode::Fifo);
             assert_eq!(options.wgpu_options.desired_maximum_frame_latency, Some(1));
         }
