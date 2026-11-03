@@ -1,5 +1,3 @@
-//! Independent reported-origin sharing. Never selects or modifies gaze direction.
-//! Device-local mm, not a measured corneal center or validated world-space pose.
 use crate::core::types::{EyeResult, GazeSample};
 use std::time::{Duration, Instant};
 
@@ -44,8 +42,6 @@ fn valid_point(point: [f32; 3]) -> bool {
 }
 
 impl Tracker {
-    /// `sample` is original wearable data routed to physical L/R, never merged
-    /// last-good values. A changed duplicate can invalidate but cannot refresh.
     pub fn push(&mut self, sample: GazeSample, at: Instant, swapped: bool) {
         if sample.timestamp_us == 0 {
             return;
@@ -89,8 +85,6 @@ impl Tracker {
         })
     }
 
-    /// Builds optional rays from already selected/processed output. Does not
-    /// mutate eye state, smoothing, vergence, eyelids or OSC output preferences.
     pub fn rays(&self, eyes: &[EyeResult; 2], now: Instant, flip_x: bool) -> [Option<Ray>; 2] {
         let origins = self.snapshot(now, flip_x);
         std::array::from_fn(|i| {

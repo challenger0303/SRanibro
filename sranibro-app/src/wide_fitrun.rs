@@ -1,8 +1,3 @@
-//! Background in-app EyeWide head fitter.
-//!
-//! This is deliberately separate from eyebrow fitting: it requires two completed
-//! sessions and validates on the newest whole session. Output filenames are unique, so
-//! a failed run can never truncate or replace the model currently selected in config.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -160,9 +155,6 @@ fn run(shared: Arc<Mutex<Shared>>, inputs: FitInputs) {
             fit.sessions, fit.train_frames, fit.val_frames
         ),
     );
-    // A catastrophically non-generalizing head should remain a diagnostic result rather
-    // than becoming selectable. The threshold is intentionally lenient; normal 0..1
-    // regressors should be comfortably below it.
     if val_rmse > 0.40 {
         return fail(
             &shared,

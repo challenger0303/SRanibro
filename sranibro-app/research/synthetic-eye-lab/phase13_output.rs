@@ -1,4 +1,3 @@
-//! Provenance, sealed-input validation, and atomic artifacts for Phase 1.3.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;

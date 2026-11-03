@@ -1,9 +1,3 @@
-//! Standalone Dream Air / XR5 eyelid-model dataset collector.
-//!
-//! This binary deliberately does not construct SRanibro's model, post-processor,
-//! VRCFT server, OSC output, fitters, or saved calibration. It opens only the XR5
-//! camera/native-data adapter, records eye movement and optional world fixation,
-//! and writes a local ZIP.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -321,8 +315,6 @@ mod app {
     }
 
     struct Shared {
-        /// All item recordings from one app run stay together when selecting
-        /// independent evaluation sessions; no random adjacent-frame splitting.
         collection_group: String,
         ui: Mutex<LiveState>,
         source: Mutex<SourceState>,
@@ -1018,7 +1010,6 @@ mod app {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            // Synthetic visual test only. Never opens the real camera adapter.
             if self.ui_smoke.is_some() && std::env::args().any(|a| a == "--ui-smoke-recording") {
                 let now = Instant::now();
                 let mut capture = FreeCapture::new();
@@ -1079,7 +1070,7 @@ mod app {
                 let mut reference = tobii_reference::ReferenceState::default();
                 if !std::env::args().any(|a| a == "--ui-smoke-tobii-missing") {
                     reference.receive(&tobii_reference::simulation_packet(123, true), now);
-                    state.gaze_hz = 120.0; // Explicit simulated display fixture.
+                    state.gaze_hz = 120.0;
                 } else {
                     state.gaze_hz = 0.0;
                 }
@@ -1097,7 +1088,6 @@ mod app {
                 && (state.saving || capture_is_active(&state.capture_status))
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                // Finish saving or explicitly cancel the recording first.
             }
             self.upload_preview(ctx, &state);
             self.sync_overlay(&state);
@@ -1207,8 +1197,6 @@ mod app {
         }
     }
 
-    /// Full accelerated recording/export smoke test. Uses synthetic data only,
-    /// no hardware, service handoff, native runtime, window or user settings.
     pub fn self_test(directory: &Path) -> Result<(), String> {
         use std::io::Read;
         std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
@@ -1548,7 +1536,6 @@ mod app {
     }
 
     fn worker_main(shared: Arc<Shared>, commands: Receiver<WorkerCommand>, mock: bool) {
-        // Opening the app alone must not stop services or claim the user's HMD.
         if !mock {
             loop {
                 match commands.recv() {
@@ -1603,7 +1590,6 @@ mod app {
         if device::auto_device_key_from_serial(serial.as_deref()) != DEVICE_KEY {
             return Err("No Dream Air / XR5 EyeChip detected. Connect that headset and retry; this recorder does not support other HMDs.".into());
         }
-        // Collector is isolated from the user's tracking/calibration settings.
         let mut config = Config::default();
         config.hmd.device = DEVICE_KEY.into();
         let mapping = config.mapping_for(DEVICE_KEY);
@@ -1815,8 +1801,6 @@ mod app {
                 publish_mock_pair(&shared, &capture.status(), now);
             }
 
-            // The world-dot worker polls tracking independently of desktop repaint.
-            // Free recordings retain their existing minimized behavior.
 
             capture.tick_at(now);
             if capture.is_running() && !capture.is_ready() && !capture.is_paused() {
@@ -2170,8 +2154,6 @@ mod app {
     }
 
     fn open_recordings_folder(directory: &Path) {
-        // Also usable before the first recording. Use the same destination as
-        // the writer, including its fallback when Desktop is unavailable.
         let result = std::fs::create_dir_all(directory).and_then(|()| {
             std::process::Command::new("explorer.exe")
                 .arg(directory)
@@ -2482,8 +2464,6 @@ mod app {
 
 #[cfg(windows)]
 fn main() -> eframe::Result<()> {
-    // The platform handoff relaunches this exact executable. Without these
-    // subcommands an elevated second GUI would be opened instead of the helper.
     match std::env::args().nth(1).as_deref() {
         Some("custom") => {
             sranibro_rs::platform::cmd_custom();
@@ -2494,8 +2474,6 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
         Some("--check-runtime") => {
-            // Release gate: check the finished executable, not just a test binary.
-            // No camera is opened and no service handoff is performed.
             let report = std::env::args()
                 .nth(2)
                 .expect("--check-runtime needs a report path");
@@ -2508,8 +2486,6 @@ fn main() -> eframe::Result<()> {
                 use windows_sys::Win32::Foundation::FreeLibrary;
                 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
                 let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-                // SAFETY: the provider supplies an absolute path, terminated above.
-                // No exported function is invoked; the handle is released below.
                 let library = unsafe { LoadLibraryW(wide.as_ptr()) };
                 if library.is_null() {
                     return Err(format!(

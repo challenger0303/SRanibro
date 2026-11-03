@@ -25,9 +25,6 @@ pub fn load_exact(path: &Path) -> Result<LoadedModel, Box<dyn Error>> {
     })
 }
 
-/// Exact CHW tensor: left u8 image -> channel 0, right u8 image -> channel 1,
-/// each converted only by division by 255. No production geometry or normalization
-/// is applied in canonical mode.
 pub fn canonical_tensor(stereo: &RenderedStereo) -> Vec<f32> {
     assert_eq!(stereo.left.pixels.len(), SIDE * SIDE);
     assert_eq!(stereo.right.pixels.len(), SIDE * SIDE);

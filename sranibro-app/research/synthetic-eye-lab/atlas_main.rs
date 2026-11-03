@@ -1,6 +1,3 @@
-//! Standalone, renderer-only entry point for the preregistered moment atlas.
-//!
-//! Its module tree deliberately has no EyeNet, experiment, solver, or recording loader.
 
 mod atlas;
 mod atlas_output;
@@ -33,8 +30,6 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<RunOutcome, Box<dyn Err
     require_release_build()?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-    // Both checks precede the expensive atlas preparation. They are repeated by the
-    // writer so a destination or worktree change cannot silently mix the record.
     ensure_output_empty(&args.out)?;
     let repository = repository_state(manifest_dir)?;
     if repository.dirty {

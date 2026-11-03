@@ -1,4 +1,4 @@
-"""Anchored learned image-coordinate displacement, research only."""
+""
 import importlib.util
 from pathlib import Path
 import numpy as np

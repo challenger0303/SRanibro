@@ -1,9 +1,3 @@
-//! WinUSB transport to the Tobii EyeChip — no libusb, no patched DLL.
-//!
-//! Ported from `winusb_device.py` (device enumeration + WinUSB I/O) and the
-//! handshake in `tobii_usb_direct.py` (control init + channel upgrade + auth +
-//! subscribe). Requires the Tobii platform service to be stopped (WinUSB takes
-//! the interface exclusively):  `net stop "Tobii VR4PIMAXP3B Platform Runtime"`.
 
 #![cfg(windows)]
 
@@ -27,7 +21,6 @@ use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED,
 
 use super::ttp::{build_packet, Deframer};
 
-/// EyeChip device-interface GUID {85C0F97C-E2B1-422A-92A9-5F96072E79D8}.
 const GUID_EYECHIP: GUID = GUID {
     data1: 0x85C0_F97C,
     data2: 0xE2B1,
@@ -37,15 +30,9 @@ const GUID_EYECHIP: GUID = GUID {
 
 const EP_IN: u8 = 0x83;
 const EP_OUT: u8 = 0x05;
-const GENERIC_RW: u32 = 0xC000_0000; // GENERIC_READ | GENERIC_WRITE
+const GENERIC_RW: u32 = 0xC000_0000;
 const ERROR_SEM_TIMEOUT: u32 = 121;
 
-// The EyeChip firmware keeps the previous streaming session alive briefly after
-// WinUsb_Free/CloseHandle return. Reopening during that interval succeeds at the
-// Windows handle level but the first bulk read commonly fails with ERROR_GEN_FAILURE
-// (31), or the authentication challenge is missing. Remember the close time inside
-// this process so a live engine reload can give the firmware a quiet interval. A
-// cold process start has no recorded close and therefore pays no delay.
 const REOPEN_QUIET_PERIOD: Duration = Duration::from_secs(5);
 static LAST_INTERFACE_CLOSE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
@@ -59,9 +46,6 @@ fn record_interface_close() {
     }
 }
 
-/// Remaining firmware quiet time before another WinUSB session should begin.
-/// Used by the adapter thread so waiting remains stop-responsive and visible in
-/// device status instead of blocking the UI thread.
 pub fn reopen_quiet_remaining() -> Duration {
     let last = last_interface_close().lock().ok().and_then(|last| *last);
     quiet_remaining(last, Instant::now())
@@ -72,7 +56,6 @@ fn quiet_remaining(last: Option<Instant>, now: Instant) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-/// An open WinUSB connection to the EyeChip, with a TTP deframer and msg-id seq.
 pub struct UsbDevice {
     file: HANDLE,
     handle: WINUSB_INTERFACE_HANDLE,
@@ -81,8 +64,6 @@ pub struct UsbDevice {
     deframer: Deframer,
 }
 
-// The raw handles are only ever used from the single thread that opens the
-// device; we never share a UsbDevice across threads.
 unsafe impl Send for UsbDevice {}
 
 fn last_err(ctx: &str) -> io::Error {
@@ -91,16 +72,14 @@ fn last_err(ctx: &str) -> io::Error {
 }
 
 impl UsbDevice {
-    /// Enumerate + open the EyeChip and bring up the WinUSB interface.
     pub fn open() -> io::Result<Self> {
         let (path, serial) = find_device()?;
 
-        // SAFETY: path is a NUL-terminated UTF-16 buffer from the CM API.
         let file = unsafe {
             CreateFileW(
                 path.as_ptr(),
                 GENERIC_RW,
-                0, // exclusive (no sharing)
+                0,
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_OVERLAPPED,
@@ -137,8 +116,6 @@ impl UsbDevice {
     }
 
     fn set_timeout(&self, ep: u8, ms: u32) -> io::Result<()> {
-        // Zero disables the WinUSB timeout. Never turn a short remaining deadline
-        // into an unbounded native read by rounding it down to zero milliseconds.
         let v = ms.max(1);
         let ok = unsafe {
             WinUsb_SetPipePolicy(
@@ -155,7 +132,6 @@ impl UsbDevice {
         Ok(())
     }
 
-    /// Control OUT transfer (e.g. device init commands).
     pub fn control_out(
         &self,
         req_type: u8,
@@ -189,7 +165,6 @@ impl UsbDevice {
         Ok(())
     }
 
-    /// Control IN transfer; returns the bytes read.
     pub fn control_in(
         &self,
         req_type: u8,
@@ -224,7 +199,6 @@ impl UsbDevice {
         Ok(buf)
     }
 
-    /// The fixed control-transfer init sequence (from winusb_device.init_device).
     pub fn init_device(&self) -> io::Result<()> {
         Err(super::runtime_access::unavailable())
 }
@@ -247,8 +221,6 @@ impl UsbDevice {
         Ok(())
     }
 
-    /// Read one bulk transfer (up to `buf.len()`), returning the count. A pipe
-    /// timeout returns Ok(0) rather than an error.
     fn read_bulk(&self, buf: &mut [u8], timeout_ms: u32) -> io::Result<usize> {
         self.set_timeout(EP_IN, timeout_ms)?;
         let mut transferred = 0u32;
@@ -275,7 +247,6 @@ impl UsbDevice {
         Ok(transferred as usize)
     }
 
-    /// Send a TTP command, returning its msg_id.
     pub fn send(&mut self, packet_id: u32, payload: &[u8]) -> io::Result<u32> {
         self.msg_id += 1;
         let pkt = build_packet(self.msg_id, packet_id, payload);
@@ -283,8 +254,6 @@ impl UsbDevice {
         Ok(self.msg_id)
     }
 
-    /// Pull the next deframed TTP message (any), reading more USB if needed.
-    /// Returns Ok(None) on a read timeout with nothing buffered.
     pub fn next_message(&mut self, timeout_ms: u32) -> io::Result<Option<Vec<u8>>> {
         let buffered = self.deframer.pop();
         if let Some(error) = self.deframer.error() {
@@ -306,7 +275,6 @@ impl UsbDevice {
         Ok(next)
     }
 
-    /// Wait for a command response with the given msg_id (skipping other frames).
     pub fn recv(&mut self, expected_mid: u32, timeout_ms: u32) -> io::Result<Option<Vec<u8>>> {
         receive_matching_response(
             expected_mid,
@@ -317,8 +285,6 @@ impl UsbDevice {
         )
     }
 
-    /// Command wait used by the adapter handshake. Stop and total deadline are
-    /// checked after EVERY packet, including a continuous unrelated stream.
     pub fn recv_with_stop(
         &mut self,
         expected_mid: u32,
@@ -362,7 +328,6 @@ fn receive_matching_response(
                 "EyeChip wait cancelled",
             ));
         }
-        // A late matching response cannot extend the original command deadline.
         if now().saturating_duration_since(started) >= timeout {
             return Ok(None);
         }
@@ -527,10 +492,6 @@ mod reopen_quiet_tests {
     }
 }
 
-/// Run the CM device-interface enumeration for the EyeChip GUID and return the
-/// first interface's NUL-terminated UTF-16 path buffer. This is the shared core of
-/// both [`find_device`] (which then opens the device) and [`peek_serial`] (which
-/// only wants the serial) — enumeration only, no CreateFile/WinUsb_Initialize.
 fn enumerate_eyechip() -> io::Result<Vec<u16>> {
     let mut len: u32 = 0;
     let cr = unsafe {
@@ -567,10 +528,7 @@ fn enumerate_eyechip() -> io::Result<Vec<u16>> {
     Ok(buf)
 }
 
-/// Extract the serial from an EyeChip device-interface path: it is the 3rd
-/// '#'-separated segment (e.g. `...#XR5DA-12345#...`).
 fn serial_from_path(buf: &[u16]) -> String {
-    // First NUL-terminated string in the multi-sz.
     let first_len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let path_str = String::from_utf16_lossy(&buf[..first_len]);
     path_str
@@ -580,18 +538,12 @@ fn serial_from_path(buf: &[u16]) -> String {
         .unwrap_or_default()
 }
 
-/// Enumerate the EyeChip interface; return (NUL-terminated UTF-16 path, serial).
 fn find_device() -> io::Result<(Vec<u16>, String)> {
     let buf = enumerate_eyechip()?;
     let serial = serial_from_path(&buf);
     Ok((buf, serial))
 }
 
-/// Peek the EyeChip serial WITHOUT opening the device — CM enumeration only (no
-/// CreateFile / WinUsb_Initialize), so it's cheap and safe to call before deciding
-/// which adapter to build. Returns `None` if no EyeChip is present (or the serial
-/// segment is empty). Used by `make_adapter` to auto-route VR4 vs XR5 from the
-/// serial prefix. Shares the exact CM enumeration `find_device` uses.
 pub fn peek_serial() -> Option<String> {
     let buf = enumerate_eyechip().ok()?;
     let serial = serial_from_path(&buf);

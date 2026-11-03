@@ -1,5 +1,3 @@
-//! Recorder-only EyeChip1289 reference, never measured fixation or a fit label.
-//! Keep raw columns/packet/status so adapter eye labels can be audited later.
 use sranibro_rs::device::{
     gaze::{decode_gaze_1289, GazeData},
     ttp,
@@ -38,7 +36,6 @@ pub struct ReferenceRow {
 }
 impl ReferenceState {
     pub fn receive(&mut self, bytes: &[u8], now: Instant) {
-        // Only streaming gaze data, never control/authentication or other PIDs.
         if bytes.len() < 16 || ttp::pid(bytes) != ttp::PID_GAZE || bytes[4..8] != [0, 0, 0, 0] {
             return;
         }
@@ -222,7 +219,6 @@ pub fn write_archive<W: Write + Seek>(
     Ok(())
 }
 
-/// Explicit simulation only; valid TTP fixed-point encoding exercises the decoder.
 pub fn simulation_packet(timestamp: i64, valid: bool) -> Vec<u8> {
     fn enc(tag: u8, b: &[u8]) -> Vec<u8> {
         let mut o = vec![tag];

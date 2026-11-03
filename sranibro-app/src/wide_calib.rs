@@ -1,23 +1,14 @@
-//! Guided Dream Air/XR5 EyeWide dataset collection.
-//!
-//! Every run creates a separate session so train/validation can split by session rather
-//! than leaking adjacent frames across a random frame split. Frames stay local under
-//! `base_dir()/wide_data/sessions/`; SRanibro never uploads eye images.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Save at 30 stereo pairs/s even though XR5 supplies 120 Hz and the UI polls at 60 Hz.
-/// Adjacent 60 Hz images are redundant for training; 30 Hz gives the wearer enough time
-/// to settle into each instructed pose and captures more real temporal variation.
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(33);
 
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureSpec {
     pub folder: &'static str,
     pub wide: f32,
-    /// Stereo-pair count (one left + one right image per count).
     pub target: u32,
 }
 
@@ -55,8 +46,6 @@ macro_rules! cap {
     };
 }
 
-/// Stable poses only. Transition frames are excluded by the short REST phases.
-/// Upward gaze is deliberately over-sampled because it is the strongest EyeWide confound.
 pub const PHASES: &[Phase] = &[
     rest!("Relax naturally and look straight ahead"),
     cap!(
@@ -265,8 +254,6 @@ impl WideCalib {
         Ok(())
     }
 
-    /// Delete only the active partial session. Previous completed sessions remain available
-    /// for session-level validation.
     pub fn abort(&mut self) {
         if self.is_running() {
             if let Some(session) = &self.session {
@@ -289,8 +276,6 @@ impl WideCalib {
                 "stop the active capture before deleting Wide data",
             ));
         }
-        // Delete biometric source images/labels, but keep fitted model artifacts under
-        // wide_data/models so the currently configured tracker is not broken.
         let sessions = self.root.join("sessions");
         if sessions.exists() {
             std::fs::remove_dir_all(sessions)?;
@@ -525,9 +510,6 @@ fn write_gray_png(path: &Path, w: u32, h: u32, pixels: &[u8], mirror: bool) -> s
         .map_err(std::io::Error::other)
 }
 
-/// Research-only bridge used to prove that the XR5 audit reverses the exact
-/// mirror convention and PNG bytes produced by the real capture writer. It is
-/// deliberately unavailable in normal builds.
 #[cfg(feature = "research-synthetic-eye-lab")]
 #[doc(hidden)]
 pub fn research_write_gray_png(
@@ -551,7 +533,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut capture = WideCalib::with_root(root.clone());
         capture.start().unwrap();
-        capture.idx = Some(1); // first capture phase
+        capture.idx = Some(1);
         let pixels = vec![0u8, 10, 20, 30, 40, 50];
         assert_eq!(
             capture.on_frame(Some((3, 2, &pixels)), Some((3, 2, &pixels))),

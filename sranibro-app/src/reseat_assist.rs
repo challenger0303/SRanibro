@@ -1,14 +1,3 @@
-//! Immutable, per-headset wearing-position reference and live reseat guidance.
-//!
-//! This is deliberately not another calibration loop. A reference changes only
-//! after the user explicitly confirms that the current fit is good. Live matching
-//! never edits geometry, photometric correction, eyelid endpoints, or baselines.
-//!
-//! Matching uses a compact census descriptor over temporally stable eye-camera
-//! structure. Census comparisons are insensitive to monotonic brightness/contrast
-//! changes; very dark pupil pixels, saturated IR glints, borders, and unstable
-//! capture pixels receive no weight. Both eyes must independently agree before a
-//! physical direction is shown.
 
 use std::fs;
 use std::io::Write;
@@ -25,16 +14,11 @@ const SCHEMA_VERSION: u16 = 2;
 pub const TEMPLATE_SIDE: usize = 48;
 const TEMPLATE_PIXELS: usize = TEMPLATE_SIDE * TEMPLATE_SIDE;
 const CAPTURE_SECONDS: f32 = 7.5;
-/// A brief evidence-driven tail prevents a busy UI frame from discarding an
-/// otherwise complete reference. The user simply keeps looking straight ahead.
 const CAPTURE_GRACE_SECONDS: f32 = 3.0;
 const CAPTURE_SETTLE_END: f32 = 0.8;
 const CAPTURE_FIRST_CENTRE_END: f32 = 2.0;
 const CAPTURE_SWEEP_END: f32 = 4.8;
 const CAPTURE_BLINK_END: f32 = 6.3;
-// The controller is polled by a nominal 60 Hz UI. 35 ms aliases to every third
-// repaint (about 20 Hz), while 30 ms accepts every second repaint (about 30 Hz)
-// without cloning anything close to the 120 Hz source rate.
 const CAPTURE_INTERVAL: Duration = Duration::from_millis(30);
 const MIN_CAPTURE_FRAMES: usize = 120;
 const MIN_CENTRE_FRAMES: usize = 45;
@@ -56,8 +40,6 @@ const ALIGNED_SCALE_ERROR: f32 = 0.028;
 const ALIGNED_ROTATION_DEG: f32 = 1.5;
 const ALIGNED_HOLD: Duration = Duration::from_secs(1);
 
-/// A wearing-position reference is a user-owned local artifact, not a tracking
-/// calibration parameter. The assist reads frames and writes only its own file.
 pub const CHANGE_DOMAINS: crate::calib_session::DomainSet = crate::calib_session::DomainSet::NONE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,9 +59,6 @@ impl ReferenceContext {
     }
 }
 
-/// Fingerprint only mapping settings applied to `Telemetry.frames`. ML crop,
-/// rotation, per-eye mirror, brightness and photometry happen later in the pipeline
-/// and therefore must not invalidate this raw-camera wearing-position reference.
 pub fn image_fingerprint(mapping: EyeMapping, _geometry: [MlGeometry; 2]) -> u64 {
     let mut hash = Fnv64::new();
     hash.bytes(b"reseat-raw-image-context-v2");
@@ -240,8 +219,6 @@ impl CaptureStep {
         }
     }
 
-    /// Target shown by the SteamVR capture guide. The eye-sweep target moves
-    /// through all four directions while the head and HMD remain stationary.
     pub fn target(self, overall_progress: f32) -> Option<GazeTarget> {
         match self {
             Self::Settling | Self::CentreBefore | Self::BlinkTwice | Self::CentreAfter => {
@@ -274,13 +251,8 @@ pub struct EyeMatch {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Estimate {
-    /// Physical correction in a normalized, frontal image plane. Positive X/Y means
-    /// move the HMD right/down. Units are 48x48 template pixels.
     pub correction_px: [f32; 2],
-    /// A value above 1.0 means the current eye image is larger than the saved fit
-    /// (move the HMD slightly farther away); below 1.0 means move it closer.
     pub scale: f32,
-    /// Positive means rotate the HMD clockwise as seen by the wearer.
     pub rotation_deg: f32,
     pub confidence: f32,
     pub eyes: [EyeMatch; 2],
@@ -296,9 +268,6 @@ impl Estimate {
     }
 
     pub fn instruction(self) -> String {
-        // Depth and roll alter the apparent x/y displacement, so guide one dominant
-        // physical adjustment at a time in that order. This is much easier to follow
-        // inside VR and avoids rapidly alternating two instructions near a boundary.
         if (self.scale - 1.0).abs() > ALIGNED_SCALE_ERROR {
             return if self.scale > 1.0 {
                 "move it slightly farther from your eyes".into()
@@ -395,9 +364,6 @@ impl ReferenceCapture {
         blinking: Option<bool>,
         now: Instant,
     ) -> Result<Option<Reference>, String> {
-        // A bounded pipeline history may still contain pairs published just before
-        // the user pressed Start. Advance the cursor, but never label them as part
-        // of this wearing-position reference.
         if now < self.started {
             if let [Some(left), Some(right)] = frames {
                 self.last_generation = [left.generation, right.generation];
@@ -532,8 +498,6 @@ impl ReferenceCapture {
     }
 }
 
-/// UI-side controller. Work is bounded to one compact stereo registration every
-/// 180 ms; the 120 Hz camera and ML threads are never blocked.
 pub struct Assist {
     context: ReferenceContext,
     axes: [EyeAxes; 2],
@@ -609,8 +573,6 @@ impl Assist {
         self.last_generation[1] = self.last_generation[1].max(generation[1]);
     }
 
-    /// Remove a native UI/event-loop hiatus from capture and guidance clocks.
-    /// Frames generated while the instructions were frozen are intentionally skipped.
     pub fn suspend_for(&mut self, duration: Duration, generation: [u64; 2]) {
         if !self.is_active() || duration.is_zero() {
             return;
@@ -863,10 +825,6 @@ fn estimate(
         register_eye(&reference.eyes[0], &current[0])?,
         register_eye(&reference.eyes[1], &current[1])?,
     ];
-    // Convert both raw camera coordinate systems into the same anatomical image
-    // plane before stereo agreement. XR5's right ML channel is mirrored; omitting
-    // that handedness makes real horizontal displacement and roll cancel between
-    // the eyes and can produce an authoritative-looking but wrong arrow.
     let canonical: [([f32; 2], f32); 2] =
         std::array::from_fn(|eye| canonicalize_match(matches[eye], axes[eye]));
     let face_shift = [canonical[0].0, canonical[1].0];
@@ -910,9 +868,6 @@ fn register_eye(reference: &EyeTemplate, current: &[u8]) -> Result<EyeMatch, Str
     let current_census = census(current);
     let mut best = Candidate::default();
     let mut candidates = Vec::with_capacity(400);
-    // Staged coordinate descent keeps the dashboard thread light: translation
-    // first, then roll, depth, and one joint local refinement. The previous full
-    // Cartesian grid evaluated more than four times as many transforms.
     for dy in (-6..=6).step_by(2) {
         for dx in (-6..=6).step_by(2) {
             consider_candidate(
@@ -981,10 +936,6 @@ fn register_eye(reference: &EyeTemplate, current: &[u8]) -> Result<EyeMatch, Str
             }
         }
     }
-    // Recompute ambiguity against the final transform. Carrying a `second`
-    // candidate through coordinate-descent stages can leave a near-duplicate of
-    // the final answer or a coarse predecessor, neither of which represents a
-    // genuinely competing registration mode.
     let margin = ambiguity_margin(best, &candidates);
     if !best.score.is_finite() || best.score < MIN_EYE_SCORE || margin < MIN_EYE_MARGIN {
         return Err(format!(
@@ -1104,9 +1055,6 @@ fn score_transform(
         weight_sum += weighted_bits;
         if ix < 2 || iy < 2 || ix >= TEMPLATE_SIDE as isize - 2 || iy >= TEMPLATE_SIDE as isize - 2
         {
-            // Missing reference structure is a maximal mismatch. Omitting it
-            // would make large shifts/scales look artificially good by scoring
-            // only the easiest surviving subset.
             distance += weighted_bits;
             continue;
         }
@@ -1161,8 +1109,6 @@ fn rotate_shift(value: [f32; 2], degrees: f32) -> [f32; 2] {
 
 fn canonicalize_match(value: EyeMatch, axes: EyeAxes) -> ([f32; 2], f32) {
     let mut shift = rotate_shift(value.shift_px, axes.upright_deg);
-    // `warp_into` applies geometry rotation and then mirrors the destination ML
-    // channel, so the same order is required for a raw-frame displacement.
     shift[0] *= axes.handedness;
     shift[1] /= axes.scale_y;
     (shift, value.rotation_deg * axes.handedness)
@@ -1195,8 +1141,6 @@ fn validate_gaze_sweep(
             widest_pitch = widest_pitch.max(range_f32(directions.iter().map(|angles| angles[1])));
         }
     }
-    // Devices without usable native gaze remain supported; their image variability
-    // mask and stereo abstention are the fallback safeguards.
     if measured && (widest_yaw < 8.0 || widest_pitch < 6.0) {
         return Err(format!(
             "the eye-only look-around step was too small ({widest_yaw:.1} deg horizontal, {widest_pitch:.1} deg vertical); keep the HMD still and look farther left, right, up and down"
@@ -1248,9 +1192,6 @@ fn build_template(
         variability[pixel] = p90.saturating_sub(p10);
         glare[pixel] = p90 >= 238;
     }
-    // Saturated glints and emitter blooms have useful-looking edges but are
-    // camera/illumination structure, not a wearing-position landmark. Dilate their
-    // mask so the bright-to-dark halo cannot dominate census registration.
     let mut glare_dilated = vec![false; TEMPLATE_PIXELS];
     let mut nuisance_dilated = vec![false; TEMPLATE_PIXELS];
     for y in 0..TEMPLATE_SIDE {
@@ -1327,9 +1268,6 @@ fn xr5_safe_pixel(
     if !(34.0 / 200.0..=166.0 / 200.0).contains(&normalized_y) {
         return false;
     }
-    // The inner LED/lens stack is fixed to the camera and must never vote as
-    // "stable face structure". The geometry passed here is the frozen shipped
-    // optical preset, not a live user-editable ML geometry.
     if geometry.crop_right >= geometry.crop_left {
         normalized_x <= 108.0 / 200.0
     } else {
@@ -1469,10 +1407,6 @@ fn save_to(path: &Path, reference: &Reference) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the published reference, falling back to the previous confirmed file if
-/// the process or machine stopped between `path -> .bak` and `.partial -> path`.
-/// A missing primary is restored best-effort; even if the rename is denied, the
-/// validated backup remains usable in memory and is never silently discarded.
 fn load_with_backup(path: &Path) -> Result<Option<Reference>, String> {
     let backup = path.with_extension("bak");
     if path.is_file() {
@@ -1762,8 +1696,6 @@ mod tests {
             score: 0.90,
         };
         let candidates = [
-            // This coarse predecessor is close to the final transform and must
-            // not masquerade as an alternative registration mode.
             Candidate {
                 dx: 2.0,
                 score: 0.895,
@@ -1900,7 +1832,6 @@ mod tests {
             rotation_deg: 2.0,
             ..EyeMatch::default()
         };
-        // A horizontally mirrored camera channel observes opposite X and roll.
         let right = EyeMatch {
             shift_px: [-3.0, -1.0],
             rotation_deg: -2.0,

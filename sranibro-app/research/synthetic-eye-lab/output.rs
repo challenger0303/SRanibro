@@ -938,9 +938,6 @@ fn summaries(
                     acc
                 },
             );
-            // A single flattened correlation is misleading for a 2D grid because each
-            // x value is repeated across different y strata. The plotting script emits
-            // the 2D response surface instead.
             let allow_correlation = !interpretation_withheld
                 && factor_y_name.is_none()
                 && x.len() >= MIN_CORRELATION_CASES;

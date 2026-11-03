@@ -1,4 +1,4 @@
-"""Opt-in research variant only; no current candidate/app default change."""
+""
 from pathlib import Path
 import ctypes,hashlib,importlib.util,json
 import numpy as np

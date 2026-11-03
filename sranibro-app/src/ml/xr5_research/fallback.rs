@@ -1,4 +1,3 @@
-//! One-way GPU -> CPU recovery, without overlapping child processes or retry loops.
 use super::{Bridge, Process, Settings, Snapshot};
 use std::{io, sync::{Arc, Weak}, time::{Duration, Instant}};
 
@@ -23,7 +22,7 @@ impl Worker for Bridge {
     }
     fn stop(self) -> Self::Drain {
         let drain = Arc::downgrade(&self.process);
-        drop(self); // kills the child; the pipe owner releases the lease after reaping it
+        drop(self);
         drain
     }
     fn drained(drain: &Self::Drain) -> bool {

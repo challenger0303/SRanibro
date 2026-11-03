@@ -1,11 +1,3 @@
-//! Research-only replay of an exported Safe Geometry Fit recording.
-//!
-//! This compares bounded post-normalization photometric, low-frequency flattening,
-//! affine-geometry, and landmark-independent coordinate-warp counterfactuals with the
-//! exact production EyeNet scorer. Recorded preprocessing and adaptive-brightness
-//! affines are reconstructed first; research interventions are then applied at an
-//! explicit seam before geometry. It never changes SRanibro configuration or model
-//! bytes and never writes camera images.
 
 use std::fs::File;
 use std::io::Write;
@@ -85,9 +77,6 @@ fn run() -> Result<(), String> {
     let bytes = std::fs::read(&args.model)
         .map_err(|error| format!("read model {}: {error}", args.model.display()))?;
     let parity = replay_parity(&recording.metadata, &bytes);
-    // Bind every replay result to the exact evidence, network and executable before
-    // moving any fields out of LoadedRecording. Paths remain useful for humans, but
-    // only these content identities are authoritative.
     let identity = ArtifactIdentity {
         recording_evidence_sha256: hash_recording_evidence(&args.recording, &recording.frames)?,
         metadata_sha256: hash_file(&args.recording.join("metadata.txt"))?,
@@ -183,10 +172,6 @@ fn run() -> Result<(), String> {
         ));
     }
     if args.confirmation {
-        // The legacy fixed values were discovered while candidate flatten/fields
-        // lived before the captured adaptive-brightness affine. Moving candidates
-        // to the honest post-normalization seam changes the intervention itself, so
-        // those values cannot be treated as a preregistered confirmation here.
         write_results(
             &args,
             &identity,
@@ -261,7 +246,6 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    // Select only on train evidence. Holdout remains a report-only safety check.
     let best_photometric = rows
         .iter()
         .filter(|row| row.train_safe && !row.probe.name.starts_with("geometry_"))
@@ -319,9 +303,6 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    // Keep the first local-field experiment monocular and causally isolated. A
-    // train-selected shared/per-eye affine would otherwise change the opposite eye
-    // while a probe name claimed to test only one local field.
     let phase_c = spatial_field_probes(baseline_geometry, no_post_flatten);
     let phase_c_len = phase_c.len();
     let mut phase_c_rows = Vec::new();
@@ -364,10 +345,6 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    // Coordinate interventions are evaluated as their own causal family.  They use
-    // identity research photometry so a successful warp cannot be mistaken for a
-    // gain/contrast effect.  Landmarks never parameterize these fixed-coordinate
-    // probes; commanded labels and the same EyeNet safety metrics remain the judge.
     let phase_d = coordinate_warp_probes(baseline_geometry, identity_affine, no_post_flatten);
     let phase_d_len = phase_d.len();
     for (index, probe) in phase_d.into_iter().enumerate() {
@@ -690,9 +667,6 @@ fn geometry_probes(
                     );
                 }
             }
-            // A crop-window translation that would cross the recorded frame edge is
-            // not silently converted into a crop/scale intervention. Omit that probe
-            // unless every targeted eye can realize it while preserving window size.
             if targets
                 .iter()
                 .enumerate()
@@ -713,9 +687,6 @@ fn geometry_probes(
     probes
 }
 
-/// Fixed-coordinate, landmark-independent probes for the nonlinear spatial class.
-/// Each magnitude is evaluated independently so the report exposes dose response;
-/// there is deliberately no train-selected combination search at this stage.
 fn coordinate_warp_probes(
     geometry: [MlGeometry; 2],
     affine: [[f32; 2]; 2],
@@ -902,8 +873,6 @@ fn write_row<W: Write>(
     train_safe: bool,
     holdout_safe: bool,
 ) -> Result<(), String> {
-    // A rejected/diagnostic run can never expose a row as safe, even if a caller
-    // passes the pre-gate metric result through unchanged.
     let train_safe = selection_allowed && train_safe;
     let holdout_safe = selection_allowed && holdout_safe;
     let l = probe.geometry[0];
@@ -1036,9 +1005,6 @@ fn hash_current_executable() -> Result<String, String> {
     hash_file(&path).map_err(|error| format!("hash replay executable: {error}"))
 }
 
-/// Hash the exact ordered evidence consumed by this replay. `samples.csv` binds
-/// labels and relative paths; the explicit ordinal/source-index/side records below
-/// bind each referenced image byte stream without relying on filesystem metadata.
 fn hash_recording_evidence(
     root: &Path,
     frames: &[xr5_recording::RecordingFrame],
@@ -1216,8 +1182,6 @@ mod tests {
             ..GeometryMetrics::default()
         };
         let mut row = Vec::new();
-        // Even deliberately passing pre-gate `true` flags cannot make a rejected
-        // artifact advertise either split as safe.
         write_row(&mut row, &probe, &train, &holdout, false, true, true).unwrap();
         let row = String::from_utf8(row).unwrap();
         assert_eq!(

@@ -1,43 +1,16 @@
-//! Tobii TTP protocol: USB framing, the typed-value (TLV) codec, image decode,
-//! and packet builders — the pure, host-independent core of the EyeChip transport.
-//!
-//! Ported from `ttp_bridge.py` (framing/image) and `tobii_usb_direct.py` (the
-//! DLL-free direct-USB path: TLV codec, gaze stream 1289, subscribe/auth packets).
-//! Everything here is unit-testable offline; the WinUSB + auth glue drives it.
-//!
-//! Conventions: this module works on *deframed* TTP messages — the 8-byte USB
-//! header is stripped by [`Deframer`], so within a message: big-endian `0x51` at
-//! offset 0, msg_id @4, pid @12, payload_len @20, and the TLV payload at offset 26.
 
-/// Fixed-point scale for tag-3 floats: value = i32 * (1/65536).
 const FIXED_SCALE: f32 = 1.5258789e-05;
 
-// An operational bound for this EyeChip transport, not a limit on all Tobii
-// protocols. Supported grayscale frames are 40,000 bytes; this also leaves ample
-// space for a 160,000-byte image plus metadata. Reject implausible lengths before
-// retaining a never-ending USB stream or allocating a declared vector.
 const MAX_TTP_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 2 * (MAX_TTP_MESSAGE_BYTES + 8);
 
-/// Camera image stream id.
 pub const PID_IMAGE: u32 = 1291;
-/// Raw gaze stream id (gaze vectors + convergence only).
 pub const PID_GAZE: u32 = 1289;
-/// Wearable "advanced data" stream id: gaze L/R + PUPIL diameter + pupil position
-/// + eyelid openness. The DLL gated this behind a PROFESSIONAL license check, but
-/// that check is in the DLL — subscribing directly over USB bypasses it.
 pub const PID_WEARABLE: u32 = 1285;
-/// Subscribe-command pid.
 pub const PID_SUBSCRIBE: u32 = 1220;
-/// Column-prologue magic that precedes every gaze row.
 pub const GAZE_COLUMN_MAGIC: u32 = 134073;
 
-// ---------------------------------------------------------------------------
-// USB framing
-// ---------------------------------------------------------------------------
 
-/// Reassembles TTP messages from a stream of USB bulk reads (strips the 8-byte
-/// USB header so callers see the TTP message starting at the `0x51` magic).
 #[derive(Default)]
 pub struct Deframer {
     buf: Vec<u8>,
@@ -61,8 +34,6 @@ impl Deframer {
         self.validate_outer_length();
     }
 
-    /// A malformed stream is terminal for this deframer. The transport must close
-    /// the session; do not silently discard bytes and interpret pixels as headers.
     pub fn error(&self) -> Option<&'static str> {
         self.error
     }
@@ -81,8 +52,6 @@ impl Deframer {
         }
     }
 
-    /// Pop the next complete TTP message, or `None` if more data is needed.
-    /// Empty frames are consumed and skipped (matches the Python relay).
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         loop {
             self.validate_outer_length();
@@ -90,11 +59,6 @@ impl Deframer {
                 return None;
             }
             let frame_len = u32::from_le_bytes(self.buf[4..8].try_into().unwrap()) as usize;
-            // For a real TTP header, its payload length disambiguates the two USB
-            // length conventions. The old "8 bytes short means total length"
-            // fallback consumed incomplete camera images at certain chunk splits.
-            // Unknown/legacy metadata retains the previous framing convention.
-            // Do not reject a no-body acknowledgement on an unverified inner field.
             let hinted_total = self
                 .buf
                 .get(8..12)
@@ -113,7 +77,7 @@ impl Deframer {
             } else if frame_len + 8 <= self.buf.len() {
                 frame_len + 8
             } else if frame_len <= self.buf.len() && frame_len >= 8 {
-                frame_len // protocol quirk: frame_len is the total size here
+                frame_len
             } else {
                 return None;
             };
@@ -127,7 +91,6 @@ impl Deframer {
     }
 }
 
-/// Big-endian pid at TTP offset 12 (0 if too short).
 pub fn pid(msg: &[u8]) -> u32 {
     if msg.len() >= 16 {
         u32::from_be_bytes(msg[12..16].try_into().unwrap())
@@ -136,23 +99,16 @@ pub fn pid(msg: &[u8]) -> u32 {
     }
 }
 
-/// True for a camera-image message (decode locally; never forward to a DLL).
 pub fn is_image(msg: &[u8]) -> bool {
     pid(msg) == PID_IMAGE && msg.len() > 10000
 }
 
-// ---------------------------------------------------------------------------
-// TLV typed-value codec
-// ---------------------------------------------------------------------------
 
-/// A decoded TTP typed value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     U32(u32),
     F32(f32),
-    /// 64-bit fixed-point value used by some wearable vectors.
     F64(f64),
-    /// Prologue/structure marker; the row/sub count is `value >> 16`.
     Pro(u32),
     I64(i64),
     Blob(Vec<u8>),
@@ -173,16 +129,11 @@ fn be_i64(d: &[u8], p: usize) -> Option<i64> {
         .map(|s| i64::from_be_bytes(s.try_into().unwrap()))
 }
 
-/// Decode one typed value at `pos`, returning the value and the next position.
-/// Bounds-checked: returns `None` on truncation.
 pub fn decode_value(data: &[u8], pos: usize) -> Option<(Value, usize)> {
     let t = *data.get(pos)?;
     if !matches!(t, 2..=6 | 21 | 23) {
         return Some((Value::Unk(t), pos.checked_add(1)?));
     }
-    // Keep the established tolerance for redundant length metadata. Device
-    // variants may encode this differently; only actual consumed byte counts
-    // below control allocation. No allocation is based on this ignored field.
     let _declared_len = be_u32(data, pos.checked_add(1)?)?;
     let start = pos.checked_add(5)?;
     match t {
@@ -209,7 +160,6 @@ pub fn decode_value(data: &[u8], pos: usize) -> Option<(Value, usize)> {
             }
             let payload_start = start.checked_add(4)?;
             let end = payload_start.checked_add(byte_count)?;
-            // Validate all remaining bytes BEFORE reserving either vector.
             let body = data.get(payload_start..end)?;
             let value = if t == 21 {
                 Value::Blob(body.to_vec())
@@ -226,29 +176,14 @@ pub fn decode_value(data: &[u8], pos: usize) -> Option<(Value, usize)> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Image decode (stream 1291)
-// ---------------------------------------------------------------------------
 
-/// A decoded camera frame.
 pub struct DecodedImage {
-    /// Bridge convention: 0 = RIGHT, 1 = LEFT, -1 = unknown.
     pub region: i32,
-    /// Frame dimensions (VR4 EyeChip is fixed 200x200).
     pub width: u32,
     pub height: u32,
-    /// `width*height` grayscale bytes, row-major.
     pub pixels: Vec<u8>,
 }
 
-/// Decode a pid-1291 message into (region, 200x200): scan for blob marker 0x15,
-/// require a 40000-byte payload. Offsets are for a deframed message.
-///
-/// TODO(hardware, XR5): this keys on a 40000-byte blob = 200×200. The XR5 primary
-/// optics MAY publish 400×400 (160000-byte blob). If bring-up logs show the XR5
-/// frame is not 200×200, add a second size branch here (e.g. accept 160000 →
-/// 400×400) and set width/height accordingly — everything downstream already reads
-/// W/H from the frame, so only this decode is size-specific.
 pub fn decode_image(msg: &[u8]) -> Option<DecodedImage> {
     let upper = msg.len().saturating_sub(12).min(2000);
     let mut i = 26usize;
@@ -275,11 +210,7 @@ pub fn decode_image(msg: &[u8]) -> Option<DecodedImage> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Packet builders (host -> device)
-// ---------------------------------------------------------------------------
 
-/// Encode a u32 TTP value (tag 2).
 pub fn encode_u32(v: u32) -> Vec<u8> {
     let mut o = vec![2u8];
     o.extend_from_slice(&4u32.to_be_bytes());
@@ -287,7 +218,6 @@ pub fn encode_u32(v: u32) -> Vec<u8> {
     o
 }
 
-/// Encode a u32-vector TTP value (tag 23).
 pub fn encode_u32_vector(vals: &[u32]) -> Vec<u8> {
     let n = vals.len() as u32;
     let mut o = vec![23u8];
@@ -299,7 +229,6 @@ pub fn encode_u32_vector(vals: &[u32]) -> Vec<u8> {
     o
 }
 
-/// Encode a blob TTP value (tag 21).
 pub fn encode_blob(data: &[u8]) -> Vec<u8> {
     let mut o = vec![21u8];
     o.extend_from_slice(&((data.len() + 4) as u32).to_be_bytes());
@@ -308,8 +237,6 @@ pub fn encode_blob(data: &[u8]) -> Vec<u8> {
     o
 }
 
-/// Build a full USB packet (8-byte USB header + TTP header + payload), matching
-/// `tobii_usb_direct.ttp_build_packet`.
 pub fn build_packet(msg_id: u32, packet_id: u32, payload: &[u8]) -> Vec<u8> {
     let pl_len = (payload.len() + 2) as u32;
     let msg_len = (payload.len() + 26) as u32;
@@ -324,14 +251,12 @@ pub fn build_packet(msg_id: u32, packet_id: u32, payload: &[u8]) -> Vec<u8> {
     o
 }
 
-/// Subscribe to a stream (packet id 1220).
 pub fn subscribe_packet(msg_id: u32, stream_id: u32) -> Vec<u8> {
     let mut payload = encode_u32(stream_id);
     payload.extend(encode_u32_vector(&[]));
     build_packet(msg_id, PID_SUBSCRIBE, &payload)
 }
 
-/// The image-stream subscribe the bridge injects (fixed msg_id 9999).
 pub fn image_subscribe_packet(stream_id: u32) -> Vec<u8> {
     subscribe_packet(9999, stream_id)
 }
@@ -489,7 +414,6 @@ mod tests {
         let b = encode_blob(&[9, 8, 7]);
         assert_eq!(decode_value(&b, 0).unwrap().0, Value::Blob(vec![9, 8, 7]));
 
-        // tag-3 fixed-point float: 32768 -> ~0.5
         let mut f = vec![3u8];
         f.extend_from_slice(&4u32.to_be_bytes());
         f.extend_from_slice(&32768i32.to_be_bytes());
@@ -501,10 +425,9 @@ mod tests {
 
     #[test]
     fn decode_value_is_truncation_safe() {
-        // A u32 tag with only 2 bytes of value -> None, not a panic.
         let mut t = vec![2u8];
         t.extend_from_slice(&4u32.to_be_bytes());
-        t.extend_from_slice(&[0u8, 0]); // short
+        t.extend_from_slice(&[0u8, 0]);
         assert!(decode_value(&t, 0).is_none());
     }
 

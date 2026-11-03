@@ -1,14 +1,3 @@
-//! Pure-Rust in-app per-user eyebrow calibration: data path + head-fit glue.
-//!
-//! Loads the frames captured by [`crate::brow_calib`] (`brow_data/`) through the FROZEN conv
-//! backbone of an existing `brow.bin`, fits ONLY the output head
-//! ([`crate::ml::brow_fit::fit_head`]), and returns a fresh `BROWNET1` blob (frozen conv +
-//! new head). No Python, nothing proprietary — the conv backbone is reused, so a per-user
-//! recalibration is a plain regression over cached 1024-d features and finishes in seconds.
-//!
-//! CORRECTNESS: the RIGHT eye is ALREADY horizontally mirrored on disk (see
-//! [`crate::brow_calib`]'s `write_gray_png`), so every frame — `_l_` and `_r_` alike — is
-//! preprocessed with `flip_h=false`; flipping again would un-canonicalize the right eye.
 
 use std::path::Path;
 
@@ -16,23 +5,13 @@ use crate::ml::brow_fit::fit_head;
 use crate::ml::brow_net::BrowNet;
 use crate::ml::preprocess::{brow_input, BROW_SIDE};
 
-/// A decoded, feature-extracted dataset ready for [`fit_head`]: one 1024-d feature row + one
-/// `out_dim`-length label row per USABLE frame (missing/bad frames are skipped, not fatal).
 pub struct Dataset {
-    /// Frozen-backbone features, one 1024-d row per usable frame.
     pub features: Vec<Vec<f32>>,
-    /// Labels, one `out_dim`-length row per usable frame (`[brow]` or `[brow, inner, outer]`).
     pub labels: Vec<Vec<f32>>,
-    /// Total data rows seen in labels.csv (usable + skipped).
     pub rows: usize,
-    /// Frames skipped because the image was missing / unreadable / not 8-bit grayscale.
     pub skipped: usize,
 }
 
-/// Decode every labeled frame through `backbone`'s frozen conv backbone into 1024-d features
-/// + `out_dim` labels. `out_dim` comes from `backbone.out_dim()` (1 => `[brow]`; 3 =>
-/// `[brow, inner, outer]`). Errors on a missing/malformed `labels.csv`, an unparseable brow
-/// value, or zero usable frames; a single missing/bad image is SKIPPED, not fatal.
 pub fn load_dataset(brow_data_dir: &Path, backbone: &mut BrowNet) -> Result<Dataset, String> {
     let out_dim = backbone.out_dim();
     let labels_path = brow_data_dir.join("labels.csv");
@@ -58,10 +37,8 @@ pub fn load_dataset(brow_data_dir: &Path, backbone: &mut BrowNet) -> Result<Data
             continue;
         }
         rows += 1;
-        // filename,brow,inner,outer — split on ',' and trim each field.
         let mut it = line.split(',');
         let fname = it.next().unwrap_or("").trim();
-        // brow is required; inner/outer default to 0 (the brow-only capture protocol).
         let brow = match it
             .next()
             .map(|s| s.trim())
@@ -86,11 +63,9 @@ pub fn load_dataset(brow_data_dir: &Path, backbone: &mut BrowNet) -> Result<Data
             vec![brow]
         };
 
-        // images/<filename> — Path::join splits the '/' in `filename` correctly on Windows too.
         let img_path = images_dir.join(fname);
         match decode_gray8(&img_path) {
             Some((w, h, px)) => {
-                // flip_h=false for BOTH eyes: the right eye is already mirrored on disk.
                 brow_input(&px, w, h, false, &mut buf);
                 features.push(backbone.brow_features(&buf));
                 labels.push(label);
@@ -113,9 +88,6 @@ pub fn load_dataset(brow_data_dir: &Path, backbone: &mut BrowNet) -> Result<Data
     })
 }
 
-/// Fit the head onto `brow_data` using `backbone_bin` as the FROZEN backbone; return a fresh
-/// `BROWNET1` blob (frozen conv + new head). Errors on a missing/invalid backbone, a
-/// missing/malformed `labels.csv`, or zero usable frames.
 pub fn fit_to_bytes(
     brow_data_dir: &Path,
     backbone_bin: &Path,
@@ -128,9 +100,6 @@ pub fn fit_to_bytes(
     backbone.to_bytes_with_head(&head)
 }
 
-/// Decode `path` as an 8-bit grayscale PNG into `(w, h, pixels)`. Returns `None` (a SKIP, not
-/// an error) when the file is missing/unreadable or not 8-bit grayscale, so one bad frame
-/// never aborts the whole fit.
 fn decode_gray8(path: &Path) -> Option<(usize, usize, Vec<u8>)> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = png::Decoder::new(file).read_info().ok()?;
@@ -140,7 +109,6 @@ fn decode_gray8(path: &Path) -> Option<(usize, usize, Vec<u8>)> {
         return None;
     }
     let (w, h) = (info.width as usize, info.height as usize);
-    // 8-bit grayscale => buffer_size == w*h; trim any decoder slack, then guard the length.
     buf.truncate(info.buffer_size());
     if buf.len() < w * h {
         return None;
@@ -154,7 +122,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A distinct scratch dir per test (isolated, cleaned at the end).
     fn tmp_dir(tag: &str) -> PathBuf {
         let d =
             std::env::temp_dir().join(format!("sranibro_calfit_{}_{}", tag, std::process::id()));
@@ -163,7 +130,6 @@ mod tests {
         d
     }
 
-    /// Deterministic finite f32s in [-0.5, 0.5) from a seed (no `rand`).
     fn det_f32s(n: usize, seed: u64) -> Vec<f32> {
         let mut st = seed | 1;
         (0..n)
@@ -176,7 +142,6 @@ mod tests {
             .collect()
     }
 
-    /// A synthetic `BROWNET1` backbone blob (small conv weights so activations stay finite).
     fn synth_backbone_bytes(out_dim: usize) -> Vec<u8> {
         fn put(out: &mut Vec<u8>, v: &[f32]) {
             for &x in v {
@@ -208,7 +173,6 @@ mod tests {
         bytes
     }
 
-    /// Write a `w`x`h` 8-bit grayscale PNG (parent dir must already exist).
     fn write_png(path: &Path, w: u32, h: u32, px: &[u8]) {
         let file = std::fs::File::create(path).unwrap();
         let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
@@ -218,8 +182,6 @@ mod tests {
         wr.write_image_data(px).unwrap();
     }
 
-    /// Byte length of the conv (backbone) region of a BROWNET1 blob: 12-byte header + all
-    /// conv weight/bias f32s.
     fn conv_region_end() -> usize {
         let conv_f32: usize = [(1usize, 16usize), (16, 32), (32, 64), (64, 64)]
             .iter()
@@ -232,7 +194,6 @@ mod tests {
     fn fit_to_bytes_produces_loadable_model() {
         let dir = tmp_dir("fit_bytes");
         let images = dir.join("images");
-        // ~8 small grayscale PNGs across 2 folders, varying content + labels.
         let mut csv = String::from("filename,brow,inner,outer\n");
         for (folder, brow) in [("neutral", 0.0f32), ("brow_up", 1.0f32)] {
             std::fs::create_dir_all(images.join(folder)).unwrap();
@@ -262,7 +223,6 @@ mod tests {
         assert_eq!(y.len(), 1);
         assert!(y[0].is_finite(), "forward is finite");
 
-        // Frozen conv backbone: the conv byte-region equals the source backbone's.
         let backbone_bytes = std::fs::read(&backbone_bin).unwrap();
         let end = conv_region_end();
         assert_eq!(

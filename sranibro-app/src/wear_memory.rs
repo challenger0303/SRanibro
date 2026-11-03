@@ -1,10 +1,3 @@
-//! Appearance-conditioned, explicitly taught wearing-position calibration memory.
-//!
-//! A profile is created only after the user explicitly confirms that the complete
-//! live response is correct. Recenter, threshold edits and Wide-neutral are draft
-//! operations and never teach the matcher on their own. Runtime matching is
-//! deliberately incapable of creating or mutating profiles: an uncertain image can
-//! therefore fail closed, but can never teach SRanibro a progressively worse baseline.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -19,8 +12,6 @@ use crate::config::EyelidResponseProfile;
 use crate::core::eye_state::CalibStore;
 use crate::pipeline::{CalibrationFrameSnapshot, WearingCalibrationTarget};
 
-// Schema 1 could contain partial profiles captured after individual editing actions.
-// Do not import those into the explicit good-state memory.
 const SCHEMA_VERSION: u32 = 2;
 const SIDE: usize = 24;
 const PIXELS: usize = SIDE * SIDE;
@@ -33,12 +24,7 @@ const MAX_DESCRIPTOR_FRAMES: usize = 42;
 const MAX_PROFILES: usize = 8;
 const MATCH_MIN: f32 = 0.75;
 const MATCH_MARGIN: f32 = 0.018;
-/// Saving uses an alignment-sensitive duplicate test, unlike live matching. A
-/// small physical reseat should create another learnable state, while repeated
-/// captures of the same state update it instead of creating ambiguous twins.
 const UPDATE_EXISTING_MIN: f32 = 0.965;
-/// Near-identical pictures alone do not establish that a newly verified response
-/// is a correction of the same state. Retain materially different coordinates.
 const SAME_STATE_COORD_TOLERANCE: f32 = 0.015;
 const CANDIDATE_CONFIRMATIONS: u8 = 6;
 const LOST_CONFIRMATIONS: u8 = 12;
@@ -53,9 +39,6 @@ pub struct Context {
     pub pipeline_fingerprint: u64,
 }
 
-// TOML integers are signed 64-bit, but an image-domain fingerprint uses all
-// 64 bits. Keep the hash and filename unchanged; only encode the stored value
-// as fixed-width hex. Previously saved nonnegative integer values still load.
 mod fingerprint_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -116,11 +99,6 @@ pub struct ClosedPointEstimate {
     pub sample_count: usize,
 }
 
-/// Select the longest stable *final* portion of a closed-point recording. Times
-/// must identify fresh model observations, not repeated UI reads of one frame.
-/// Four samples at 10 Hz are sufficient: duration and continuity, not a nominal
-/// 120 Hz camera quota, establish coverage. The caller checks that the last sample
-/// is recent enough relative to its capture deadline before committing anything.
 pub fn closed_point_from_samples(
     samples: &[(Duration, f32)],
 ) -> Result<ClosedPointEstimate, String> {
@@ -157,8 +135,6 @@ pub fn closed_point_from_samples(
         let middle = sorted[sorted.len() / 2];
         let third = (tail.len() / 3).max(1);
         let drift = (median(&tail[..third]) - median(&tail[tail.len() - third..])).abs();
-        // Robust quantiles may discard isolated noise inside the window, but must
-        // not hide a reopening at its end, even at a high sample rate.
         let end_is_stable = tail
             .iter()
             .rev()
@@ -276,7 +252,6 @@ fn calibrations_compatible(a: LiveCalibration, b: LiveCalibration) -> bool {
     })
 }
 
-/// Pure staging: a failed persistence operation never mutates the live store.
 fn stage_remember(
     store: &Store,
     descriptor: Descriptor,
@@ -364,8 +339,6 @@ struct Analysis {
     scores: Vec<(usize, f32)>,
 }
 
-/// Native invalid data must not be mistaken for an unsupported capability.
-/// The fallback is supplied only when the processed/model evidence is valid.
 pub fn neutral_openness(
     native: &crate::core::types::EyeSample,
     fallback: Option<f32>,
@@ -532,9 +505,6 @@ impl Memory {
         let mut events = Vec::new();
         self.expire_evidence(now, &mut events);
         if let Some(pending) = self.pending {
-            // Validate throughout the settled capture, not just at its final frame.
-            // In particular, unknown native openness must not silently authorize
-            // a closed-eye reference on devices using the UI's ML fallback.
             if now.saturating_duration_since(pending.started) >= CAPTURE_SETTLE && !eligible_neutral
             {
                 self.pending = None;
@@ -903,9 +873,6 @@ fn recovery_score(reference: &Descriptor, current: &Descriptor) -> Option<f32> {
     )
 }
 
-/// Stricter, alignment-sensitive comparison used only when deciding whether a
-/// Save is a duplicate. Live recovery intentionally searches a ±2 px window;
-/// doing that here merged distinct wearing positions into a permanent "1 saved".
 fn descriptor_duplicate_score(reference: &Descriptor, current: &Descriptor) -> Option<f32> {
     if reference.dimensions != current.dimensions {
         return None;
@@ -1025,10 +992,6 @@ fn load_store_with_recovery_at(
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Versions using two renames could be interrupted after moving the
-            // primary file to .bak. Recover only a valid, matching-context backup,
-            // and keep it intact until a subsequent save has really published.
-            // An existing but invalid primary is never silently hidden by this.
             match fs::read_to_string(path.with_extension("bak")) {
                 Ok(text) => {
                     return decode_store(context, &text)
@@ -1041,7 +1004,6 @@ fn load_store_with_recovery_at(
                     return Err(format!("wearing memory backup could not be read: {error}"))
                 }
             }
-            // Read the old shared file only when its complete context matches.
             let suffix = format!("-{:016x}.toml", context.pipeline_fingerprint);
             let name = path.file_name().unwrap().to_string_lossy();
             let Some(stem) = name.strip_suffix(&suffix) else {
@@ -1117,8 +1079,6 @@ fn publish_atomic(partial: &Path, path: &Path) -> std::io::Result<()> {
         };
         let from: Vec<u16> = partial.as_os_str().encode_wide().chain(Some(0)).collect();
         let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        // Same-directory replacement keeps the old primary present until the
-        // replacement succeeds. Do not delete it or its recovery backup first.
         if unsafe {
             MoveFileExW(
                 from.as_ptr(),
@@ -1451,8 +1411,6 @@ mod tests {
 
     #[test]
     fn store_save_load_and_overwrite_support_high_bit_fingerprints() {
-        // Only this newly created temporary directory is written. Never use
-        // path_for/save_store here: tests must not touch the user's memory.
         struct TestDirectory(PathBuf);
         impl Drop for TestDirectory {
             fn drop(&mut self) {

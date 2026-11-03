@@ -1,6 +1,3 @@
-//! Lossless-at-the-adapter-boundary evidence for the standalone recorder.
-//! Flags are separate from values. Raw wearable messages allow later decoder
-//! audits; these are data messages only, never authentication/control traffic.
 use sranibro_rs::core::types::GazeSample;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -31,8 +28,6 @@ pub fn csv(rows: &[EvidenceRow]) -> String {
     let mut out = String::from("index,eye,frame_generation,camera_age_us,openness_raw,openness_bits,openness_reported,openness_valid,openness_age_us,openness_timestamp_us,gaze_reported,gaze_valid,gaze_age_us,gaze_x,gaze_y,gaze_z,pupil_pos_reported,pupil_pos_valid,pupil_x,pupil_y,wearable_packet,wearable_packet_age_us\n");
     for (index, row) in rows.iter().enumerate() {
         for (eye, sample) in [row.sample.left, row.sample.right].iter().enumerate() {
-            // Nonfinite values remain explicit; bit representation also preserves
-            // exact decoder output. A false validity flag NEVER changes the value.
             writeln!(
                 out,
                 "{index},{},{},{},{},{:08x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
@@ -74,7 +69,6 @@ pub fn append_to_archive(path: &Path, rows: &[EvidenceRow]) -> io::Result<()> {
             "native evidence count outside recorder limits",
         ));
     }
-    // Verify alignment before modifying the incomplete archive.
     {
         let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         let mut samples = String::new();

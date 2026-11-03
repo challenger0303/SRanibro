@@ -1,8 +1,3 @@
-//! Optional head-locked SteamVR target for XR5 residual research recordings.
-//!
-//! OpenVR is loaded dynamically and only while a target is requested. SRanibro
-//! therefore keeps working on systems without SteamVR and does not redistribute
-//! Valve's runtime DLL. All OpenVR calls live on one worker thread.
 
 use crate::recorder_fixation::{self, Feedback, Matrix34, PoseHistory, WorldPose};
 use std::sync::{mpsc, Arc, Mutex};
@@ -14,7 +9,6 @@ use crate::geometry_calib::GazeTarget;
 pub const TARGET_HORIZONTAL_DEG: f32 = 20.0;
 pub const TARGET_VERTICAL_DEG: f32 = 11.0;
 
-/// Transparent texture for the world-fixed recorder overlay, 0.075 m wide.
 pub fn world_target_rgba() -> Vec<u8> {
     let mut rgba = vec![0; 128 * 128 * 4];
     for y in 0..128_i32 {
@@ -51,7 +45,6 @@ pub enum VrEyePose {
     Open,
     HalfOpen,
     Closed,
-    /// Expected openness from 0 (closed) to 100 (open).
     Slow(u8),
     Blink,
     LeftWink,
@@ -63,7 +56,6 @@ pub struct VrTargetFrame {
     pub target: Option<GazeTarget>,
     pub state: VrGuideState,
     pub eye_pose: VrEyePose,
-    /// Integer-only so the SteamVR texture changes at most once per second.
     pub countdown: Option<u8>,
     pub progress_percent: Option<u8>,
     pub headline: String,
@@ -86,8 +78,6 @@ enum Command {
     Shutdown,
 }
 
-/// Non-blocking UI-side controller. Rendering and all runtime calls happen on a
-/// dedicated thread so a stopped or starting SteamVR process cannot stall egui.
 pub struct VrResearchOverlay {
     tx: mpsc::Sender<Command>,
     state: Arc<Mutex<VrOverlayState>>,
@@ -110,8 +100,6 @@ impl VrResearchOverlay {
         Self::with_recorder_layout(false)
     }
 
-    /// Compact timer layout for the standalone recorder; normal calibration
-    /// overlays keep their existing renderer and target positioning.
     pub fn new_recorder() -> Self {
         Self::with_recorder_layout(true)
     }
@@ -172,7 +160,6 @@ impl VrResearchOverlay {
         self.world_feedback.clone()
     }
 
-    /// One absolute target per session. Repeated calls never reposition it.
     pub fn present_world(&mut self, session: u64) {
         if self.world_session == Some(session) && !self.hidden {
             return;
@@ -315,8 +302,6 @@ mod windows_impl {
         set_raw: SetOverlayRaw,
         handle: u64,
         shown: bool,
-        /// SetOverlayRaw completes asynchronously. Keep the preceding allocation alive
-        /// while SteamVR imports the replacement instead of freeing it immediately.
         previous_rgba: Option<Vec<u8>>,
         rgba: Vec<u8>,
         world: Option<WorldApi>,
@@ -501,7 +486,6 @@ mod windows_impl {
         unsafe fn start_world(&mut self, session: u64) -> Result<(), String> {
             let interface: VrGetInterface = exported(self.module, b"VR_GetGenericInterface\0")?;
             let mut error = 0;
-            // Function indexes and ABI are pinned to Valve openvr v2.5.1.
             let system =
                 interface(c"FnTable:IVRSystem_022".as_ptr(), &mut error) as *const *const c_void;
             if error != 0 || system.is_null() {
@@ -519,7 +503,7 @@ mod windows_impl {
             let set_width = table_fn::<SetOverlayWidth>(overlay, 21)?;
             let is_visible = table_fn::<IsVisible>(overlay, 43)?;
             let mut pose = TrackedPose::default();
-            get_poses(1, 0.0, &mut pose, 1); // standing origin; zero prediction
+            get_poses(1, 0.0, &mut pose, 1);
             if !pose.valid
                 || !pose.connected
                 || pose.result != 200
@@ -663,7 +647,6 @@ mod windows_impl {
                         if feedback.lock().unwrap().requested_session != Some(session) {
                             continue;
                         }
-                        // Preserve the anchor across Pause/Resume and UI repaints.
                         if world_requested != Some(session) {
                             if let Some(api) = api.as_mut() {
                                 unsafe { api.hide() };
@@ -731,8 +714,6 @@ mod windows_impl {
                             }
                             feedback.lock().unwrap().fail(e.clone());
                             *state.lock().unwrap() = VrOverlayState::Error(e);
-                            // Never reconnect/re-anchor during an anchored session.
-                            // Cancel and start again if the origin or runtime changes.
                         }
                     }
                 }
@@ -1357,7 +1338,6 @@ fn worker_main(
     windows_impl::run(rx, state, visible, recorder_layout, feedback)
 }
 
-/// Same pixels sent to SteamVR, exposed for offline visual verification.
 #[cfg(windows)]
 pub fn recorder_preview_rgba(frame: &VrTargetFrame) -> Vec<u8> {
     windows_impl::render_recorder(frame)

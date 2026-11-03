@@ -1,9 +1,3 @@
-//! All-HMD categorical gaze/eyelid capture.
-//!
-//! This protocol is deliberately independent of Safe Geometry Fit. It records
-//! categorical nine-point gaze instructions plus eyelid actions for the
-//! gaze-dependent eyelid fitter, but never changes geometry, trains a model, alters
-//! gaze output, or treats the instructed target as calibrated gaze truth.
 
 use std::fmt::Write as _;
 use std::io;
@@ -15,25 +9,12 @@ use crate::geometry_calib::{
 };
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
-// Natural blinks need enough temporal resolution to measure the visible bottom.
-// All other phases remain at 20 Hz to bound memory and CPU usage.
 const BLINK_SAMPLE_INTERVAL: Duration = Duration::from_millis(15);
 const STALL_THRESHOLD: Duration = Duration::from_secs(1);
-/// A phase is usable only when it retained at least half of its nominal 20 Hz
-/// samples. This tolerates ordinary UI scheduling jitter while detecting a
-/// stopped eye camera or a capture that ran while frames were unavailable.
 const MIN_SAMPLE_COVERAGE: f32 = 0.50;
 const WARMUP_SECONDS: f32 = 3.0;
-/// Dedicated no-sampling instruction screen before each eyelid-action group.
-/// The old protocol changed action and began settling immediately, so the user
-/// could not finish reading the eyelid directions before the target advanced.
 const PROMPT_SECONDS: f32 = 6.0;
-/// Automatic pose previews use a real three-second visual countdown. Group
-/// explanations are manual and remain visible until the user continues.
 const POSE_COUNTDOWN_SECONDS: f32 = 3.0;
-// 2.20 s leaves at least 0.90 s of stable, post-reaction evidence after the
-// analysis trim. The former 1.60 s phase could never form one valid one-second
-// gaze block, making the pooled residual model mathematically unreachable.
 const OPEN_SECONDS: f32 = 2.20;
 const OPEN_SETTLE_SECONDS: f32 = 0.55;
 const SLOW_SECONDS: f32 = 3.40;
@@ -64,8 +45,6 @@ const TRAIN_ORDER_B: [GazeTarget; 9] = [
     GazeTarget::UpLeft,
 ];
 
-// A different deterministic order prevents the holdout from being an immediate replay
-// of the train sequence while keeping instructions reproducible across machines.
 const HOLDOUT_ORDER_A: [GazeTarget; 9] = [
     GazeTarget::Center,
     GazeTarget::DownRight,
@@ -103,8 +82,6 @@ pub enum CaptureProtocol {
     #[default]
     GazeDirections,
     InitialSetup,
-    /// XR5-only biometric evidence for the offline Python eyelid-model factory.
-    /// This reuses the broad master pose coverage but never applies a live fit.
     PythonEyelidDataset,
 }
 
@@ -151,15 +128,9 @@ impl CaptureAction {
 struct Phase {
     target: Option<GazeTarget>,
     action: Option<CaptureAction>,
-    /// Instruction-only action. Prompt phases never record frames and therefore
-    /// keep `action=None`, preserving the meaning of a recording phase.
     prompt_action: Option<CaptureAction>,
     holdout: bool,
-    /// Whether this phase contributes labelled evidence. Practice phases expose the
-    /// real target/action timing but deliberately never clone or retain camera frames.
     recording: bool,
-    /// An instruction screen that does not advance until the user confirms it.
-    /// Its nominal duration is retained only for deterministic progress estimates.
     wait_for_continue: bool,
     seconds: f32,
     settle_seconds: f32,
@@ -255,8 +226,6 @@ impl Phase {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
     Idle,
-    /// Session resources are locked, but no timer or sampling begins until the
-    /// user confirms that the complete protocol explanation has been read.
     Ready {
         instruction: String,
     },
@@ -272,13 +241,8 @@ pub enum Status {
         paused: bool,
         samples_in_phase: usize,
         stereo_stalled: bool,
-        /// Manual explanation screen. No phase clock or sampling advances until
-        /// `continue_step` is called.
         awaiting_confirmation: bool,
-        /// Time left in the current automatic phase, quantized by the UI for the
-        /// VR countdown so the SteamVR texture is replaced at most once per second.
         phase_remaining_s: f32,
-        /// Expected eyelid openness for the slow-close visual, from 0 to 100.
         pose_progress: Option<u8>,
         instruction: String,
     },
@@ -386,9 +350,6 @@ impl GazeResidualCapture {
         self.is_running() && self.awaiting_ready
     }
 
-    /// Start the first timed phase after the user has read the protocol. This is
-    /// deliberately separate from `start`, which only reserves the session and
-    /// snapshots calibration state.
     pub fn begin(&mut self) -> bool {
         if !self.is_ready() {
             return false;
@@ -408,8 +369,6 @@ impl GazeResidualCapture {
             .is_some_and(|phase| phase.wait_for_continue)
     }
 
-    /// Leave a manual action-family explanation and start the next timed phase.
-    /// Manual reading time is deliberately not charged to the capture clock.
     pub fn continue_step(&mut self) -> bool {
         if !self.is_awaiting_confirmation() {
             return false;
@@ -426,16 +385,12 @@ impl GazeResidualCapture {
         self.paused_at.is_some()
     }
 
-    /// Freeze the current phase clock and sampling gate. The raw camera pipeline
-    /// may continue running, but no hidden/minimized frame can acquire a target label.
     pub fn pause(&mut self) {
         if self.is_running() && !self.awaiting_ready && self.paused_at.is_none() {
             self.paused_at = Some(Instant::now());
         }
     }
 
-    /// Resume without charging the paused wall-clock interval to the active phase
-    /// or to the stereo-stall timer.
     pub fn resume(&mut self) {
         let Some(paused_at) = self.paused_at.take() else {
             return;
@@ -449,8 +404,6 @@ impl GazeResidualCapture {
         }
     }
 
-    /// Remove an event-loop hiatus from the active prompt and discard the hidden
-    /// camera generations produced while no usable instruction was visible.
     pub fn suspend_for(&mut self, duration: Duration, generation: [u64; 2]) {
         if !self.is_running() || self.awaiting_ready || self.is_paused() || duration.is_zero() {
             return;
@@ -532,8 +485,6 @@ impl GazeResidualCapture {
         }
     }
 
-    /// True only when cloning the latest stereo frame can result in an accepted
-    /// 20 Hz sample. UI callers use this before copying the two 200x200 buffers.
     pub fn wants_frame(&self, generation: [u64; 2]) -> bool {
         self.wants_frame_at(generation, Instant::now())
     }
@@ -677,8 +628,6 @@ impl GazeResidualCapture {
         export_dataset_recording(path, &self.dataset, &metadata)
     }
 
-    /// Move a completed biometric dataset into a background exporter without cloning
-    /// its image buffers. The caller must restore the dataset if the export fails.
     pub(crate) fn take_export_dataset(
         &mut self,
         metadata: &str,
@@ -700,7 +649,6 @@ impl GazeResidualCapture {
         Ok((std::mem::take(&mut self.dataset), metadata))
     }
 
-    /// Return ownership after a failed background export so Retry remains lossless.
     pub(crate) fn restore_export_dataset(&mut self, dataset: GeometryDataset) {
         if self.is_done() && self.dataset.samples.is_empty() {
             self.completed_sample_count = dataset.samples.len();
@@ -708,8 +656,6 @@ impl GazeResidualCapture {
         }
     }
 
-    /// Drop biometric image buffers immediately after a successful ZIP export while
-    /// retaining the completed status and sample count for the UI.
     pub fn release_exported_frames(&mut self) {
         if !self.is_done() {
             return;
@@ -897,9 +843,6 @@ fn instruction_phase(
     }
 }
 
-/// Put an untimed reading screen in front of a visible three-second pose
-/// countdown.  The user, not the render clock, decides when the instruction has
-/// been understood; recording still cannot begin immediately after the click.
 fn append_ready_countdown(phases: &mut Vec<Phase>, action: CaptureAction, holdout: bool) {
     phases.push(instruction_phase(action, holdout, 0.0, true));
     phases.push(instruction_phase(
@@ -1657,8 +1600,6 @@ mod tests {
             }
         }
 
-        // 1.55 active seconds at the source cadence yields roughly 97 samples;
-        // sampling only the 24 Hz UI callbacks would produce fewer than 40.
         assert!(capture.accepted_per_phase[index] >= 90);
         assert!(capture.phase.unwrap() > index);
     }
@@ -1719,12 +1660,10 @@ mod tests {
         capture.start([0, 0]);
         assert!(capture.begin());
 
-        // The non-recording warmup remains purely time-driven.
         capture.entered = Instant::now() - Duration::from_secs_f32(WARMUP_SECONDS);
         capture.tick();
         assert_eq!(capture.phase, Some(1));
 
-        // The separate explanation screen is user-driven and records nothing.
         capture.entered = Instant::now() - Duration::from_secs_f32(PROMPT_SECONDS);
         capture.tick();
         assert_eq!(capture.phase, Some(1));
@@ -1766,8 +1705,6 @@ mod tests {
         let mut capture = GazeResidualCapture::new();
         capture.start([0, 0]);
         assert!(capture.begin());
-        // Exercise the defensive completed-state handling directly. Normal runtime
-        // progression now refuses to cross a recording phase with a missing quota.
         capture.phase = Some(capture.phases.len());
         assert!(capture.is_done());
         let missing = match capture.status() {

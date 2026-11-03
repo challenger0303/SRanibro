@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""Bake a TinyBrowNet (eyebrow) model into SRanibro's flat `BROWNET1` weights file.
-
-Folds BatchNorm into the preceding conv/linear so the Rust runtime (src/ml/brow_net.rs)
-runs plain conv+bias+relu / linear — no BN, no ONNX runtime. Also writes a golden
-input/output fixture so the Rust `pytorch_parity` test can assert numerical agreement.
-
-Usage:
-    python bake_brow_weights.py --pth model.pth --out <dir>     # bake a trained model
-    python bake_brow_weights.py --random --out <dir>            # random model (parity test)
-
-Output in <dir>: brow.bin (BROWNET1), brow_in.f32, brow_out.f32 (1x1x64x64 input + output).
-Then in sranibro-rs:  BROW_FIXTURE_DIR=<dir> cargo test --lib pytorch_parity
-
-Self-contained: TinyBrowNet is defined inline (matches the vr_eyebrow model.py), so a .pth
-state_dict of the same architecture loads without the original project on PYTHONPATH.
-"""
+""
 import argparse
 import struct
 import sys
@@ -26,7 +11,7 @@ import torch.nn.functional as F
 
 
 class TinyBrowNet(nn.Module):
-    """Mirror of vr_eyebrow/model.py TinyBrowNet (1-channel default)."""
+    ""
 
     def __init__(self, out_dim=3, in_channels=1):
         super().__init__()
@@ -50,7 +35,7 @@ class TinyBrowNet(nn.Module):
 
 
 def fold_conv_bn(conv, bn, eps=1e-5):
-    """Return folded (weight[oc,ic,3,3], bias[oc]) so relu(bn(conv(x)))==relu(W'x+b')."""
+    ""
     w = conv.weight.detach().double()
     b = (conv.bias.detach().double() if conv.bias is not None
          else torch.zeros(w.shape[0], dtype=torch.float64))
@@ -110,8 +95,8 @@ def main():
     else:
         out_dim = args.out_dim
         model = TinyBrowNet(out_dim=out_dim)
-        # Non-trivial BN running stats so the fold is actually exercised (defaults make
-        # BN an identity). Parity-only; not a usable model.
+
+
         for bn in (model.bn1, model.bn2, model.bn3, model.bn4, model.bn_fc):
             bn.running_mean.normal_(0.0, 0.5)
             bn.running_var.uniform_(0.5, 1.5)
@@ -120,7 +105,7 @@ def main():
 
     model.eval()
 
-    # Fold BN -> conv/fc.
+
     convs = [(model.conv1, model.bn1), (model.conv2, model.bn2),
              (model.conv3, model.bn3), (model.conv4, model.bn4)]
     folded = [fold_conv_bn(c, b) for c, b in convs]
@@ -128,7 +113,7 @@ def main():
     fc2_w = model.fc2.weight.detach().numpy().astype(np.float32)
     fc2_b = model.fc2.bias.detach().numpy().astype(np.float32)
 
-    # Write BROWNET1: magic, u32 out_dim, then f32 arrays in module order.
+
     blob = bytearray(b"BROWNET1")
     blob += struct.pack("<I", out_dim)
 
@@ -143,7 +128,7 @@ def main():
     with open(os.path.join(args.out, "brow.bin"), "wb") as f:
         f.write(blob)
 
-    # Golden fixture: a random z-scored 64x64 input + the PyTorch output.
+
     rng = np.random.default_rng(1)
     inp = rng.standard_normal((1, 1, 64, 64)).astype(np.float32)
     with torch.no_grad():

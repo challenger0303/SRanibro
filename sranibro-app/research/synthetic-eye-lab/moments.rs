@@ -1,7 +1,3 @@
-//! Renderer-only preparation for the preregistered Phase 1.2 two-moment study.
-//!
-//! This module never loads or calls EyeNet. It solves every photometric trajectory,
-//! applies the frozen renderer gates, and freezes the common index set first.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,20 +1,4 @@
-//! Brow post-processing: turn the raw brow CNN output into the emitted signed brow
-//! expression per eye. Runs in the emit thread (which owns the blink flag + recenter).
-//!
-//! The signal is "deviation of your eye-shape from neutral". This stage:
-//! 1. EMA-smooths the RAW output, but ONLY on a new, NON-blink inference — a blink
-//!    deforms the eye, so a blink sample must never enter the filter or the baseline
-//!    (otherwise the eye spikes on reopening).
-//! 2. Subtracts a frozen NEUTRAL baseline captured (from the smoothed value) on the
-//!    first open frame and re-captured on recenter.
-//! 3. BLINK-GATES: during a blink hold the last open value briefly, then decay to neutral.
-//! 4. Applies an optional power curve (deadzone).
-//!
-//! `process` returns `None` until the first real inference + neutral are available, so the
-//! pipeline never emits a brow value derived from a zero placeholder.
 
-/// Frames (at the ~120 Hz emit rate) to HOLD the last value when a blink starts
-/// (~125 ms), then to DECAY it to neutral over (~375 ms more).
 const HOLD_FRAMES: u16 = 15;
 const DECAY_FRAMES: u16 = 45;
 
@@ -23,16 +7,14 @@ struct Eye {
     ema: f32,
     have_ema: bool,
     neutral: Option<f32>,
-    last: f32, // last non-blink centered value (held through a blink)
+    last: f32,
     have_last: bool,
     blink_frames: u16,
 }
 
 pub struct BrowState {
     eyes: [Eye; 2],
-    /// EMA factor per NEW inference (0..1).
     alpha: f32,
-    /// Power-curve exponent. Guarded: non-finite or <=0 falls back to linear.
     gamma: f32,
 }
 
@@ -43,8 +25,6 @@ impl Default for BrowState {
 }
 
 impl BrowState {
-    /// Re-capture the neutral baseline (and clear blink/hold state) on the next open
-    /// sample for both eyes. Keeps the EMA (only the baseline is re-learned).
     pub fn recenter(&mut self) {
         for e in &mut self.eyes {
             e.neutral = None;
@@ -63,9 +43,6 @@ impl BrowState {
         }
     }
 
-    /// Process one eye. `is_new` = a fresh inference arrived this tick (gate the EMA so
-    /// it advances once per inference, not per emit tick). `blink` holds/decays the
-    /// output and is excluded from the EMA + baseline. Returns `None` until ready.
     pub fn process(&mut self, eye: usize, raw: f32, is_new: bool, blink: bool, recenter: bool) -> Option<f32> {
         if recenter {
             let e = &mut self.eyes[eye];
@@ -73,7 +50,6 @@ impl BrowState {
             e.have_last = false;
             e.blink_frames = 0;
         }
-        // Advance the EMA + capture neutral ONLY on a fresh, non-blink, finite sample.
         if is_new && !blink && raw.is_finite() {
             let e = &mut self.eyes[eye];
             if e.have_ema {
@@ -89,7 +65,7 @@ impl BrowState {
         let e = &mut self.eyes[eye];
         let (ema, neutral) = match (e.have_ema, e.neutral) {
             (true, Some(n)) => (e.ema, n),
-            _ => return None, // not ready: no open inference / baseline yet
+            _ => return None,
         };
         if !blink {
             e.blink_frames = 0;
@@ -98,8 +74,6 @@ impl BrowState {
             e.have_last = true;
             return Some(self.curve(c));
         }
-        // Blink: hold the last OPEN value, then decay to neutral. If we've never seen an
-        // open frame since (re)start, just sit at neutral.
         if !e.have_last {
             return Some(0.0);
         }
@@ -123,21 +97,17 @@ mod tests {
     #[test]
     fn not_ready_until_first_open_inference() {
         let mut b = BrowState::default();
-        // No inference yet -> None.
         assert!(b.process(0, 0.0, false, false, false).is_none());
-        // A blink-only inference must not establish a baseline.
         assert!(b.process(0, 0.4, true, true, false).is_none());
-        // First OPEN inference establishes ema+neutral -> ~0.
         assert!(b.process(0, 0.4, true, false, false).unwrap().abs() < 1e-6);
     }
 
     #[test]
     fn neutral_subtracts_and_recenters() {
         let mut b = BrowState::default();
-        b.alpha = 1.0; // make the EMA track exactly for the test
-        assert!(b.process(0, 0.4, true, false, false).unwrap().abs() < 1e-6); // neutral=0.4
+        b.alpha = 1.0;
+        assert!(b.process(0, 0.4, true, false, false).unwrap().abs() < 1e-6);
         assert!((b.process(0, 0.7, true, false, false).unwrap() - 0.3).abs() < 1e-6);
-        // Recenter re-baselines to the next open sample.
         assert!(b.process(0, 0.7, true, false, true).unwrap().abs() < 1e-6);
     }
 
@@ -145,15 +115,13 @@ mod tests {
     fn blink_holds_then_decays_and_excludes_ema() {
         let mut b = BrowState::default();
         b.alpha = 1.0;
-        b.process(0, 0.0, true, false, false); // neutral 0
+        b.process(0, 0.0, true, false, false);
         assert!((b.process(0, 0.8, true, false, false).unwrap() - 0.8).abs() < 1e-6);
-        // A blink sample with a wild raw must NOT move the EMA.
         for _ in 0..HOLD_FRAMES {
             assert!((b.process(0, 5.0, true, true, false).unwrap() - 0.8).abs() < 1e-6);
         }
         let d = b.process(0, 5.0, true, true, false).unwrap();
         assert!(d < 0.8, "decaying: {d}");
-        // On reopen the EMA is still 0.8 (blink excluded), not contaminated by 5.0.
         let r = b.process(0, 0.8, true, false, false).unwrap();
         assert!((r - 0.8).abs() < 1e-6, "post-blink {r}");
     }

@@ -1,10 +1,3 @@
-//! Pimax VR4 adapter: DLL-free, service-free eye acquisition over WinUSB.
-//!
-//! Ties [`super::usb`] (WinUSB transport) to the TTP protocol: runs the EyeChip
-//! handshake (control init -> channel upgrade -> HMAC-MD5 auth -> subscribe),
-//! then streams, routing the selected per-eye gaze (1285 or 1289) and camera
-//! images (1291) to the callbacks.
-//! Requires the platform service stopped: `net stop "Tobii VR4PIMAXP3B Platform Runtime"`.
 
 #![cfg(any(windows, target_os = "linux"))]
 
@@ -32,34 +25,16 @@ use super::{FrameFn, GazeFn, HmdAdapter};
 use crate::config::Vr4GazeSource;
 use crate::core::types::{DeviceProfile, Eye};
 
-// Region->eye mapping for the standard EyeChip unit (verified on a Crystal Super):
-// region 0 = Right, region 1 = Left — see `region_to_eye` below. Units that ship
-// with the cameras swapped are corrected at the pipeline level via `swap_eyes`.
 pub struct Vr4Adapter {
     profile: DeviceProfile,
-    /// Stable adapter identity for [`HmdAdapter::name`] (the trait wants a
-    /// `&'static str`, so this is a fixed tag chosen at construction, NOT the
-    /// user-facing `profile.name`). The XR5 delegate picks a different tag.
     tag: &'static str,
-    /// Log prefix (`"[vr4]"` / `"[xr5]"`) so the same pump/handshake code emits
-    /// device-appropriate bring-up lines.
     log_tag: &'static str,
-    /// User-supplied common Tobii DLL path. When `require_dll`, the connection is
-    /// gated on loading it — SRanibro ships inert and only opens the EyeChip once
-    /// the user adds this (distribution stance; see config.tobii_dll).
     dll_path: Option<String>,
     require_dll: bool,
-    /// Legacy developer/XR5 routing; the product VR4 preference below takes
-    /// precedence. Never merge the two gaze streams.
     wearable_gaze_source: bool,
-    /// Product VR4 source. None retains legacy developer/XR5 constructor routing.
     vr4_gaze_source: Option<Vr4GazeSource>,
 
-    /// XR5-only source selection inside pid 1289. When true, shape the EyeChip's
-    /// fused column-5 direction as both eyes instead of columns 3/4. Fixed for the
-    /// lifetime of the stream to avoid source-switch jitter.
     combined_gaze_source: bool,
-    /// Optional independent-eye tap, before XR5 fused-gaze selection.
     raw_gaze_callback: Option<GazeFn>,
     native_evidence_callback: Option<GazeFn>,
     #[cfg(feature = "xr5-only")]
@@ -78,24 +53,16 @@ impl Default for Vr4Adapter {
 }
 
 impl Vr4Adapter {
-    /// Collector-only diagnostic tap. Only wearable data messages are supplied;
-    /// authentication/control traffic is never captured here.
     #[cfg(feature = "xr5-only")]
     pub fn set_wearable_packet_callback(&mut self, callback: Box<dyn FnMut(&[u8]) + Send>) {
         self.wearable_packet_callback = Some(callback);
     }
-    /// Recorder-only gaze data tap. Called only for streaming PID1289 messages.
     #[cfg(feature = "xr5-only")]
     pub fn set_gaze_packet_callback(&mut self, callback: Box<dyn FnMut(&[u8]) + Send>) {
         self.gaze_packet_callback = Some(callback);
     }
-    /// The default Pimax VR4 / Crystal Super profile. Factored out so the XR5
-    /// delegate can build its own profile without duplicating the shared fields.
     fn vr4_profile() -> DeviceProfile {
         DeviceProfile {
-            // Display name; the EyeChip/transport is shared with the Crystal Super,
-            // which is the unit this adapter serves. `ml_device` ("vr4") is the
-            // preprocessing route and is intentionally separate.
             name: "Pimax Crystal Super".into(),
             ml_device: "vr4".into(),
             transport: "WinUSB · native TTP".into(),
@@ -105,8 +72,6 @@ impl Vr4Adapter {
         }
     }
 
-    /// DLL-free constructor for the developer raw-capture subcommands (vr4/mlcheck/
-    /// capture). The product connection path uses [`Vr4Adapter::new_gated`] instead.
     pub fn new() -> Self {
         Self::build(
             Self::vr4_profile(),
@@ -119,9 +84,6 @@ impl Vr4Adapter {
         )
     }
 
-    /// Product constructor: the connection REQUIRES the user-supplied Tobii DLL
-    /// (`dll_path`). Without it the adapter refuses to open the EyeChip — so the
-    /// distributed binary cannot connect until the user adds the DLL.
     pub fn new_gated(dll_path: Option<String>) -> Self {
         Self::build(
             Self::vr4_profile(),
@@ -135,8 +97,6 @@ impl Vr4Adapter {
         .with_gaze_source(Vr4GazeSource::default())
     }
 
-    /// Explicitly opt the VR4 product route into a single provider. Never change
-    /// the XR5 delegate or any other profile through this Pimax-only preference.
     pub fn with_gaze_source(mut self, source: Vr4GazeSource) -> Self {
         if self.tag == "pimax-vr4" {
             self.vr4_gaze_source = Some(source);
@@ -145,11 +105,6 @@ impl Vr4Adapter {
         self
     }
 
-    /// Build the DLL-free WinUSB+TTP adapter with an arbitrary [`DeviceProfile`].
-    /// This is the seam the XR5 adapter delegates through: the acquisition path
-    /// (open → init → auth → subscribe → pump 1289/1285/1291) is byte-identical to
-    /// VR4; only the profile (`ml_device`, name, transport strings) differs. `tag`
-    /// is the static [`HmdAdapter::name`] and `log_tag` is the `eprintln!` prefix.
     pub fn with_profile(
         profile: DeviceProfile,
         tag: &'static str,
@@ -200,7 +155,6 @@ impl Vr4Adapter {
         }
     }
 
-    /// Live device status string (for the UI's diagnostic line).
     pub fn status_arc(&self) -> Arc<Mutex<String>> {
         self.status.clone()
     }
@@ -224,8 +178,6 @@ fn set_status(s: &Arc<Mutex<String>>, msg: impl Into<String>) {
     }
 }
 
-/// RAII handle to the loaded Tobii DLL: FreeLibrary on drop (at the pump thread's
-/// end). Created and dropped on the same thread, so it never crosses threads.
 #[cfg(windows)]
 struct DllGuard(*mut c_void);
 #[cfg(windows)]
@@ -235,9 +187,6 @@ impl Drop for DllGuard {
     }
 }
 
-/// Distribution gate: load the user-supplied Tobii DLL, returning a guard that frees
-/// it when the connection ends. `None` (with a status message) means "no DLL -> do
-/// not connect". The DLL is the user's licensed component; SRanibro bundles nothing.
 #[cfg(windows)]
 fn load_required_dll(
     dll_path: &Option<String>,
@@ -285,29 +234,17 @@ fn load_required_dll(_: &Option<String>, status: &Arc<Mutex<String>>, _: &str) -
 }
 
 
-/// Subscribe-command payload for a stream id.
 fn subscribe_payload(stream_id: u32) -> Vec<u8> {
     let mut p = encode_u32(stream_id);
     p.extend(encode_u32_vector(&[]));
     p
 }
 
-/// Run the full EyeChip bring-up handshake. `log_tag` (`"[vr4]"` / `"[xr5]"`)
-/// prefixes the bring-up lines so the shared flow logs per-device.
-///
-/// TODO(hardware, XR5): this init → channel-upgrade → HMAC-MD5 auth → subscribe
-/// sequence is confirmed on VR4/Crystal Super and on the XR5 EyeChip via a Python
-/// bridge; if a real XR5 unit ever rejects the auth/subscribe here, the documented
-/// fallback is a named-pipe + DLL relay (the Python `ttp_bridge_xr5.py` approach).
-/// We do DLL-free FIRST because it reuses this whole VR4 stack and is far simpler.
 fn handshake(dev: &mut UsbDevice, log_tag: &str, stop: &AtomicBool) -> io::Result<()> {
     let _ = (dev, log_tag, stop);
     Err(super::runtime_access::unavailable())
 }
 
-/// Wait until the previous in-process WinUSB session has been closed long enough
-/// for EyeChip firmware to accept a fresh authentication handshake. The wait lives
-/// on the adapter thread, reports status, and checks `stop` every 50 ms.
 fn wait_for_reopen_quiet_period(
     stop: &AtomicBool,
     status: &Arc<Mutex<String>>,
@@ -341,10 +278,6 @@ fn wait_for_reopen_quiet_period(
     }
 }
 
-/// Region→eye mapping shared by VR4 and the XR5 delegate. The TTP image decoder
-/// yields `region = 1 - (region_byte & 1)` (see `ttp::decode_image`), so this maps
-/// region 1 → LEFT, region 0 (and unknown) → RIGHT — matching the Python XR5
-/// bridge's `1-(byte&1)` (region 1 = LEFT). Same EyeChip, same mapping.
 fn region_to_eye(region: i32) -> Eye {
     if region == 1 {
         Eye::Left
@@ -407,13 +340,10 @@ impl HmdAdapter for Vr4Adapter {
                     source.stream_id()
                 );
             }
-            // Distribution gate: the product path requires the user-supplied Tobii
-            // DLL before any EyeChip access. Held for the whole session (freed on
-            // exit). Dev raw-capture tools pass require_dll=false (DLL-free).
             let _dll_guard = if require_dll {
                 match load_required_dll(&dll_path, &status, log_tag) {
                     Some(g) => Some(g),
-                    None => return, // status set; no connection without the DLL
+                    None => return,
                 }
             } else {
                 None
@@ -473,9 +403,6 @@ impl HmdAdapter for Vr4Adapter {
                     }
                 }
                 if attempt < START_ATTEMPTS {
-                    // Dropping the failed WinUSB handle is not immediately observable by
-                    // every EyeChip firmware. Give it 500 ms, while remaining responsive
-                    // to an app stop/reload request.
                     for _ in 0..RETRY_STEPS {
                         if stop.load(Ordering::Relaxed) {
                             return;
@@ -495,9 +422,6 @@ impl HmdAdapter for Vr4Adapter {
             eprintln!("{log_tag} streaming");
             set_status(&status, "streaming");
 
-            // Bring-up counters: log the first image's real W×H, the first few
-            // region→eye routing decisions, and first gaze/wearable arrival — the
-            // logs ARE the debugger for hardware bring-up (esp. the XR5 delegate).
             let mut frames_seen: u32 = 0;
             let mut gaze_seen = false;
             let mut gaze_diag_seen: u8 = 0;
@@ -515,7 +439,6 @@ impl HmdAdapter for Vr4Adapter {
                         break;
                     }
                 };
-                // Streaming frames carry msg_id 0; skip command responses.
                 if msg.len() < 8 || u32::from_be_bytes(msg[4..8].try_into().unwrap()) != 0 {
                     continue;
                 }
@@ -546,8 +469,6 @@ impl HmdAdapter for Vr4Adapter {
                                 let sample = if log_tag == "[xr5]" && combined_gaze_source {
                                     combined_sample
                                 } else {
-                                    // VR4 and XR5 share stream 1289 and both require
-                                    // per-vector validity; packet status is not a valid bit.
                                     per_eye_sample
                                 };
                                 if gaze_diag_seen < 8 {
@@ -608,15 +529,11 @@ impl HmdAdapter for Vr4Adapter {
                                 }
                                 on_gaze(tracking);
                             } else if wearable_gaze_source {
-                                // Hardware explicitly configured for wearable gaze:
-                                // keep 1285 as the sole gaze source.
                                 if let Some(callback) = &mut on_raw_gaze {
                                     callback(w.to_gaze_sample());
                                 }
                                 on_gaze(w.to_gaze_sample());
                             } else {
-                                // VR4: 1289 is canonical; merge only pupil/openness
-                                // from the duplicate wearable stream.
                                 if let Some(callback) = &mut on_raw_gaze {
                                     callback(w.to_aux_sample());
                                 }
@@ -667,8 +584,6 @@ impl HmdAdapter for Vr4Adapter {
         self.status.clone()
     }
 
-    // DLL-free WinUSB path: needs the Tobii Platform Runtime stopped to claim the
-    // EyeChip directly.
     fn needs_eyechip_handoff(&self) -> bool {
         true
     }

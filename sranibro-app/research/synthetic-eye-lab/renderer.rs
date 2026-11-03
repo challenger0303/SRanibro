@@ -18,11 +18,9 @@ pub enum StereoPolicy {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PhotometricTransform {
     Identity,
-    /// Add a normalized level after the deterministic camera-like u8 render.
     Offset {
         delta: f32,
     },
-    /// Scale deviations around this image's own mean. Mean is preserved unless clipping occurs.
     ContrastAroundOwnMean {
         gain: f32,
     },
@@ -65,8 +63,6 @@ impl EyeComponents {
     }
 }
 
-/// Phase-0 stimulus. Positions and sizes are output-pixel units on the 100x100 canvas.
-/// `aperture` multiplies `normal_opening_px`: 0=closed, 1=normal, >1=synthetic wide.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SyntheticEyeSpec {
     pub canvas_level: f32,
@@ -180,9 +176,6 @@ pub struct ImageCovariates {
     pub visible_area_fraction: f32,
     pub measured_aperture_geometry: f32,
     pub measured_aperture_raster: f32,
-    /// A declared rendered primitive touches or crosses the canonical frame boundary.
-    /// Such a case remains observable, but is excluded from causal summaries because
-    /// scale/rotation and implicit cropping would otherwise be confounded.
     pub frame_truncated: bool,
 }
 
@@ -207,8 +200,6 @@ pub struct GrayMoments {
     pub stddev: f64,
 }
 
-/// Population moments in gray-level units, accumulated from the quantized bytes.
-/// This is also the canonical check used by the two-moment solver.
 pub fn gray_moments(pixels: &[u8]) -> GrayMoments {
     let mut sum = 0.0f64;
     let mut sum_sq = 0.0f64;
@@ -237,12 +228,6 @@ struct PhotometricBin {
     multiplicity: usize,
 }
 
-/// Exact fast path for searches that vary only `skin_level` and `sclera_level`.
-///
-/// Every output pixel retains the final material assignment of all 16 canonical
-/// supersamples after renderer layer precedence. Search moments use aggregated bins;
-/// the ordered coefficients reconstruct the complete byte image for the mandatory
-/// independent-canonical parity check.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhotometricBasis {
     pixels: Vec<PhotometricPixel>,
@@ -288,7 +273,6 @@ impl PhotometricBasis {
             .collect()
     }
 
-    /// Population moments in gray-level units 0..255, after exact u8 quantization.
     pub fn moments(&self, skin_level: f32, sclera_level: f32) -> GrayMoments {
         let mut sum = 0.0f64;
         let mut sum_sq = 0.0f64;
@@ -535,8 +519,6 @@ fn raster_center_aperture(spec: &SyntheticEyeSpec) -> f32 {
 }
 
 fn frame_truncated(spec: &SyntheticEyeSpec) -> bool {
-    // The skin-region ellipse is the broadest initial primitive. For a rotated ellipse,
-    // these are the exact axis-aligned half-extents of its transformed bounding box.
     let radius_x = spec.eye_width_px * 0.62 * spec.scale_x;
     let radius_y = spec.eye_width_px * 0.42 * spec.scale_y;
     let theta = spec.rotation_deg.to_radians();

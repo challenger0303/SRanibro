@@ -1,7 +1,3 @@
-//! Offline, research-only synthetic stimulus laboratory for the fixed SRanipal EyeNet.
-//!
-//! This binary is unavailable unless `research-synthetic-eye-lab` is explicitly enabled.
-//! It never changes SRanibro configuration or runtime state and never writes model bytes.
 
 mod experiment;
 mod luminance;
@@ -31,8 +27,6 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args = Args::parse(std::env::args().skip(1))?;
-    // Phase 1.2 is renderer-gated before model bytes are read. A NO-GO is a complete,
-    // reportable instrument result and must not fall through to Phase 0 or EyeNet.
     let (two_moment_cases, two_moment_plan) = if args.experiment == Experiment::TwoMomentMatch {
         match two_moment_cases() {
             Ok((cases, plan)) => {
@@ -61,8 +55,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else {
         (Vec::new(), None)
     };
-    // Complete Phase 1.1 renderer feasibility before model bytes are even loaded, so
-    // model outcomes can never influence its selected aperture range.
     let (luminance_cases, luminance_plan, luminance_renderer_no_go_reason) = if args.experiment
         == Experiment::LuminanceMatch
     {

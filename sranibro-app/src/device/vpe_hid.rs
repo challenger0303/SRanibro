@@ -1,15 +1,3 @@
-//! `vpewake` — Vive Pro Eye eyechip native wake via the **Windows HID API** (2026-06-30).
-//!
-//! The vpescan map showed the always-present eyechip control interface is
-//! `USB\VID_0BB4&PID_0309`, class HIDClass, driver **HidUsb** — i.e. it lives on the HID
-//! stack, NOT WinUSB. testvpe.exe (Go/gousb) reaches it through libusb's Windows HID
-//! backend. So SRanibro must drive the wake with the **HID API** (`HidD_SetFeature` +
-//! `ReadFile` for input reports), which needs NO service pause and NO exclusive claim.
-//!
-//! Protocol (RE'd from testvpe, see project_vpe_native_wake): the chip emits 64-B input
-//! reports beginning `03 D0 2C` (challenge); reply with a Feature report (ID 0x04, 64 B)
-//! whose 3 checksum bytes are CRC32(serial)+challenge-tail. Sustain @500 ms and the chip
-//! stays awake → the `2104:020F` WinUSB camera device appears for SRanibro to stream.
 
 #![cfg(windows)]
 
@@ -42,7 +30,6 @@ const GENERIC_RW: u32 = 0xC000_0000;
 const ERROR_IO_PENDING: u32 = 997;
 const HIDP_STATUS_SUCCESS: i32 = 0x0011_0000;
 
-/// Find + open the VPE HID control interface (0BB4:0309). Returns its raw HANDLE.
 unsafe fn open_vpe_hid() -> Option<(HANDLE, String, bool)> {
     let mut hid_guid: GUID = std::mem::zeroed();
     HidD_GetHidGuid(&mut hid_guid);
@@ -68,9 +55,7 @@ unsafe fn open_vpe_hid() -> Option<(HANDLE, String, bool)> {
         }
         idx += 1;
 
-        // Get the device path (variable-length detail struct; cbSize=8 on x64).
         let mut detail = [0u8; 1024];
-        // SP_DEVICE_INTERFACE_DETAIL_DATA_W { cbSize: u32, DevicePath: [u16;1] }
         detail[0..4].copy_from_slice(&8u32.to_le_bytes());
         let mut req = 0u32;
         if SetupDiGetDeviceInterfaceDetailW(
@@ -84,7 +69,6 @@ unsafe fn open_vpe_hid() -> Option<(HANDLE, String, bool)> {
         {
             continue;
         }
-        // DevicePath wide string starts at byte offset 4.
         let path_u16: Vec<u16> = detail[4..]
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -95,7 +79,6 @@ unsafe fn open_vpe_hid() -> Option<(HANDLE, String, bool)> {
         }
         let path: Vec<u16> = path_u16.iter().copied().chain(std::iter::once(0)).collect();
 
-        // Open shared (HID class allows it); try RW then read-only fallback.
         let mut writable = true;
         let mut h = CreateFileW(
             path.as_ptr(),
@@ -152,7 +135,6 @@ unsafe fn caps(h: HANDLE) -> Option<HIDP_CAPS> {
     }
 }
 
-/// One overlapped input report read with a timeout. Ok(0) on timeout.
 unsafe fn read_report(
     h: HANDLE,
     ev: HANDLE,
@@ -175,8 +157,6 @@ unsafe fn read_report(
                     ));
                 }
             } else {
-                // Timeout: cancel AND wait for the cancel to finish before `ov` (a stack
-                // local) drops — otherwise the kernel writes to freed memory later.
                 CancelIo(h);
                 let _ = GetOverlappedResult(h, &ov, &mut got, 1);
                 return Ok(0);
@@ -191,7 +171,6 @@ unsafe fn read_report(
     Ok(got as usize)
 }
 
-/// `vpewake` subcommand entry.
 pub fn run() {
     println!("=== SRanibro VPE eyechip wake (HID API) ===");
     println!("Opens 0BB4:0309 via the HID stack (no service pause). Ctrl-C to stop.\n");
@@ -209,7 +188,6 @@ pub fn run() {
         (h, ev)
     };
 
-    // Report lengths + serial (for the CRC).
     let (in_len, feat_len) = unsafe {
         match caps(h) {
             Some(c) => {
@@ -259,7 +237,6 @@ pub fn run() {
             continue;
         }
         reads += 1;
-        // Input report may carry a leading report-ID byte; match the 03 D0 2C anywhere in the first 4.
         let head = &buf[..n.min(6)];
         let off = head.windows(3).position(|w| w == [0x03, 0xD0, 0x2C]);
         let Some(_p) = off else {
@@ -270,7 +247,6 @@ pub fn run() {
         };
         challenges += 1;
 
-        // CRC = update(0, serial) then update(crc, report[n-2..n]).
         let mut crc = crc32_update(&table, 0, &serial_bytes);
         if n >= 2 {
             crc = crc32_update(&table, crc, &buf[n - 2..n]);

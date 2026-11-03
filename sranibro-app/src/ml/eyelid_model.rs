@@ -1,8 +1,3 @@
-//! Internal contract between the canonical stereo eyelid tensor and raw eyelid inference.
-//!
-//! Phase 1 deliberately keeps preprocessing, gaze, wide, brow, blink, calibration, and
-//! smoothing outside this boundary. The legacy adapter only gives names to the existing
-//! five EyeNet outputs; it does not reinterpret them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,7 +12,6 @@ pub(crate) const EYELID_INPUT_HEIGHT: usize = 100;
 pub(crate) const EYELID_INPUT_LEN: usize =
     EYELID_INPUT_CHANNELS * EYELID_INPUT_WIDTH * EYELID_INPUT_HEIGHT;
 
-/// Already-preprocessed contiguous CHW tensor with shape `[2, 100, 100]`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CanonicalStereoInput<'a> {
     tensor: &'a [f32; EYELID_INPUT_LEN],
@@ -48,9 +42,6 @@ impl<'a> TryFrom<&'a [f32]> for CanonicalStereoInput<'a> {
     }
 }
 
-/// Raw model capabilities. `None` means unsupported by the backend, never invalid,
-/// low-confidence, or non-finite. The legacy adapter therefore always returns `Some`,
-/// including `Some(NaN)` and `Some(infinity)` when those are the raw model values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RawEyelidPrediction {
     pub(crate) presence: Option<f32>,
@@ -58,8 +49,6 @@ pub(crate) struct RawEyelidPrediction {
     pub(crate) squeeze: [Option<f32>; 2],
 }
 
-/// Phase 1's Legacy backend is infallible, so this is intentionally uninhabited.
-/// Future backends may add fixed, allocation-free error variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelError {}
 
@@ -72,7 +61,6 @@ pub(crate) enum RequiredOutput {
     RightSqueeze,
 }
 
-/// Exact bridge into the existing post-processor input layout.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LegacyPublishFrame {
     pub(crate) ml_raw: [f32; 2],
@@ -88,8 +76,6 @@ impl RawEyelidPrediction {
         }
     }
 
-    /// Require the five capabilities used by the current legacy post-processor.
-    /// Structural channels 2 and 4 stay literal zeroes exactly as before Phase 1.
     pub(crate) fn require_legacy_frame(self) -> Result<LegacyPublishFrame, RequiredOutput> {
         let presence = self.presence.ok_or(RequiredOutput::Presence)?;
         let left_open = self.openness[0].ok_or(RequiredOutput::LeftOpenness)?;
@@ -110,8 +96,6 @@ pub(crate) trait EyelidModel: Send {
     fn infer(&mut self, input: CanonicalStereoInput<'_>)
         -> Result<RawEyelidPrediction, ModelError>;
 
-    /// Live inference may be pipelined by a GPU backend. `None` means that the newest
-    /// submission is still in flight; callers retain the preceding published sample.
     fn infer_live(
         &mut self,
         input: CanonicalStereoInput<'_>,
@@ -119,9 +103,6 @@ pub(crate) trait EyelidModel: Send {
         self.infer(input).map(Some)
     }
 
-    /// Evaluate the live tensor and its optional alternate routing tensor together.
-    /// CPU backends preserve the old sequential behavior; the GPU backend overrides
-    /// this to dispatch both samples as one batch.
     fn infer_pair(
         &mut self,
         primary: CanonicalStereoInput<'_>,
@@ -149,8 +130,6 @@ pub(crate) struct EyelidBackendReport {
     pub(crate) note: String,
 }
 
-/// Legacy renderer context retained for caller compatibility. Compute now runs in a
-/// supervised child process, so none of these renderer-owned handles are used.
 #[cfg(any(windows, target_os = "linux"))]
 #[derive(Clone)]
 pub(crate) struct EyelidGpuContext {
@@ -174,7 +153,6 @@ impl EyelidBackendReport {
     }
 }
 
-/// Thin behavior-preserving adapter over the existing SRanipal-compatible EyeNet.
 pub(crate) struct LegacyEyelidModel {
     net: EyeNet,
 }
@@ -247,9 +225,6 @@ impl<G: GpuEyelidBackend> HybridGpuEyelidModel<G> {
         if let Some(gpu) = self.gpu.take() {
             self.runtime_gpu_active.store(false, Ordering::Relaxed);
             eprintln!("[ml:gpu] runtime failure; continuing on CPU: {error}");
-            // Only the supervised worker client is dropped here, never an in-process
-            // driver device. Leave the slot empty for the rest of this model's life;
-            // errors must not trigger an automatic GPU recreation loop.
             drop(gpu);
         }
     }
@@ -332,9 +307,6 @@ impl<G: GpuEyelidBackend> EyelidModel for HybridGpuEyelidModel<G> {
     }
 }
 
-/// Build the live backend. GPU output is checked against the CPU implementation using
-/// both samples before it can become active. `Auto` additionally requires a meaningful
-/// pair-inference speedup; explicit GPU still retains transparent CPU fallback.
 pub(crate) fn build_eyelid_model(
     net: EyeNet,
     preference: EyelidInferenceBackend,
@@ -356,9 +328,6 @@ pub(crate) fn build_eyelid_model(
 
     #[cfg(any(windows, target_os = "linux"))]
     {
-        // A release build aborts on panic, so catch_unwind cannot protect the app
-        // against driver/backend panics. The GPU worker owns the device in another
-        // process; its regular errors, deadline failures and exit become CPU fallback.
         build_with_gpu_factory(net, preference, super::gpu_worker::GpuWorkerClient::new)
     }
 
@@ -392,8 +361,6 @@ fn build_with_gpu_factory<G: GpuEyelidBackend + 'static>(
         *value = ((index * 73 + 29) % 241) as f32 / 240.0;
     }
 
-    // Warm both paths before comparing or timing. This excludes first-use scratch
-    // allocation and shader compilation from the backend decision.
     let cpu_expected = [net.forward_one(&primary), net.forward_one(&secondary)];
     let gpu_expected = match gpu.infer_batch(&primary, Some(&secondary)) {
         Ok(values) => values,
@@ -578,8 +545,6 @@ mod tests {
             tensor("fc6_10_bias", &[5], output.to_vec()),
         );
         if input_sensitive {
-            // Route one positive input through the first neuron at every layer.
-            // Uniform test tensors then yield output bias + the current input.
             for name in [
                 "conv1_weight",
                 "conv2_weight",
@@ -666,7 +631,6 @@ mod tests {
 
         #[test]
         fn every_startup_error_returns_a_working_cpu_model() {
-            // First call validates; calls 2 through 6 measure the GPU path.
             for fail_sync_at in 1..=6 {
                 let calls = Arc::new(Calls::default());
                 let mut gpu = MockGpu::new(calls.clone());
@@ -881,7 +845,6 @@ mod tests {
             let frame = RawEyelidPrediction::from_legacy_raw(raw)
                 .require_legacy_frame()
                 .unwrap();
-            // This is the exact assignment used by the runtime brightness feedback loop.
             prev_open = frame.ml_raw;
             assert_eq!(prev_open, expected_raw[index]);
             assert_eq!(frame.ml5, expected_ml5[index]);

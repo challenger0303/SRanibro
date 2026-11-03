@@ -1,9 +1,3 @@
-//! Pure-Rust per-wearer EyeWide head fitting.
-//!
-//! The convolution backbone comes from a generic XR5 `wide.bin`; only the small
-//! regression head is fitted locally. Completed captures are split by SESSION: all
-//! earlier sessions train, while the newest session is held out for validation. This
-//! avoids the overly optimistic random-adjacent-frame split common in video datasets.
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +5,6 @@ use crate::ml::brow_fit::{fit_head_with_validation, FitHeadReport};
 use crate::ml::preprocess::{wide_input, WIDE_SIDE};
 use crate::ml::wide_net::WideNet;
 
-// Consecutive 60 Hz frames are highly redundant. Bounding the pure-Rust head fit keeps
-// it interactive while an even index spread retains every capture phase.
 const MAX_TRAIN_FRAMES_PER_SESSION: usize = 600;
 const MAX_VALIDATION_FRAMES: usize = 800;
 
@@ -32,8 +24,6 @@ pub struct FitOutput {
     pub val_mse: f64,
 }
 
-/// Sorted completed capture sessions. A directory is complete only when labels.csv
-/// exists; aborted/partial sessions are intentionally ignored.
 pub fn completed_sessions(wide_data_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let root = wide_data_dir.join("sessions");
     let entries =
@@ -80,7 +70,6 @@ pub fn load_session(session: &Path, backbone: &mut WideNet) -> Result<Dataset, S
         let image = images_dir.join(filename);
         match decode_gray8(&image) {
             Some((w, h, pixels)) => {
-                // Right images are canonicalized (mirrored) while being captured.
                 wide_input(&pixels, w, h, false, &mut input);
                 features.push(backbone.features(&input));
                 labels.push(vec![label]);
@@ -102,9 +91,6 @@ pub fn load_session(session: &Path, backbone: &mut WideNet) -> Result<Dataset, S
     })
 }
 
-/// Fit a one-output head, holding out the newest complete session. At least two
-/// separately captured sessions are required so the reported validation error measures
-/// a real reseat/time boundary instead of neighboring video frames.
 pub fn fit_to_bytes(
     wide_data_dir: &Path,
     backbone_bin: &Path,
@@ -148,7 +134,6 @@ pub fn fit_to_bytes(
         return Err("Wide fit produced a non-finite validation error".into());
     }
     let bytes = backbone.to_bytes_with_head(&weights)?;
-    // Validate the final task header and tensor sizes before the caller writes anything.
     WideNet::from_bytes(&bytes).map_err(|e| format!("fitted Wide model validation: {e}"))?;
     Ok(FitOutput {
         bytes,

@@ -1,5 +1,3 @@
-//! XR5 USB transport for Linux. Only the matching EyeChip bulk interface is claimed.
-//! No device reset, configuration change, kernel-driver detach or service manipulation.
 use std::io;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,4 +1,3 @@
-//! Preregistered Phase 1.4 XR5 real-recording audit entry point.
 
 #![recursion_limit = "256"]
 
@@ -45,9 +44,6 @@ fn execute(args: Args) -> Result<RunOutcome, Box<dyn Error>> {
 fn execute_seal_input(paths: CommonPaths) -> Result<RunOutcome, Box<dyn Error>> {
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    // This preflight intentionally has no recording-root parameter.  Source,
-    // build, repository, Phase 1.3, and output trust are established before the
-    // private XR5 tree is even enumerated.
     let repository = xr5_transfer_output::preflight(
         &repository_root,
         &paths.phase13_decision,
@@ -73,8 +69,6 @@ fn execute_seal_input(paths: CommonPaths) -> Result<RunOutcome, Box<dyn Error>> 
     let second = xr5_transfer::build_input_plan(&paths.wide_data)?;
     require_matching_plan("recording input during sealing", &first, &second)?;
 
-    // Close every external-state verification window immediately before the
-    // destination is created.  No frame pixels have been decoded here.
     xr5_transfer_output::verify_phase13_artifacts(
         &paths.phase13_decision,
         &paths.phase13_confirmation,
@@ -111,7 +105,6 @@ fn execute_seal_input(paths: CommonPaths) -> Result<RunOutcome, Box<dyn Error>> 
 fn execute_analyze(paths: AnalyzePaths) -> Result<RunOutcome, Box<dyn Error>> {
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    // As with seal-input, this finishes before the recording root is opened.
     let repository = xr5_transfer_output::preflight(
         &repository_root,
         &paths.common.phase13_decision,
@@ -153,9 +146,6 @@ fn execute_analyze(paths: AnalyzePaths) -> Result<RunOutcome, Box<dyn Error>> {
         return Err("analysis produced a non-preregistered payload allowlist".into());
     }
 
-    // Reconstruct and bit-compare the private tree after all inference.  This
-    // happens before creating the output destination, so a race is a hard
-    // failure and cannot leave a scientific-looking artifact.
     let after = xr5_transfer::build_input_plan(&paths.common.wide_data)?;
     require_matching_plan("recording input during analysis", &before, &after)?;
     require_plan_matches_seal(&after, &input)?;
@@ -215,10 +205,6 @@ fn require_matching_plan(
     Ok(())
 }
 
-/// The artifact writer creates a deterministic staging sibling before rename,
-/// so validating the canonical output parent also protects that staging path.
-/// This runs only after the source/build/seal preflight, but before enumeration
-/// or any write involving the private XR5 root.
 fn require_output_outside_protected_roots(
     output: &Path,
     protected_roots: &[(&str, &Path)],

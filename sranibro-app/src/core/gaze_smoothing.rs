@@ -1,5 +1,3 @@
-//! The legacy motion-adaptive gaze EMA, shared by avatar and optional Gaze OSC
-//! smoothing. Callers own independent per-eye history and validity policies.
 
 pub const INITIAL_GAZE: [f32; 3] = [0.0, 0.0, -1.0];
 

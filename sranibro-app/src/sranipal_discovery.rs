@@ -1,8 +1,3 @@
-//! SRanipal installation discovery.
-//!
-//! Users should not need to remember an installer-specific directory. A valid root
-//! is the folder containing `sr_runtime.exe` and the EyePrediction model expected by
-//! SRanibro. Discovery is deliberately bounded and runs only when requested.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -22,9 +17,6 @@ pub struct Found {
     pub source: &'static str,
 }
 
-/// Resolve a selected folder, `sr_runtime.exe`, or nested model path to a valid
-/// SRanipal root. A model is the actual requirement; `sr_runtime.exe` provides the
-/// concrete landmark users can recognize in a file picker.
 pub fn resolve(candidate: &Path) -> Option<PathBuf> {
     let start = if candidate.is_file() {
         candidate.parent()?
@@ -45,8 +37,6 @@ pub fn discover() -> Option<Found> {
         }
     }
 
-    // A recursive uninstall-registry query is comparatively slow. Keep it after
-    // all cheap candidates so normal installs return without paying that cost.
     for path in uninstall_registry_candidates() {
         if let Some(root) = resolve(&path) {
             return Some(Found {
@@ -161,8 +151,6 @@ fn direct_candidates() -> Vec<(PathBuf, &'static str)> {
         }
     }
 
-    // Downloaded standalone copies are common. Check recognizable immediate
-    // children before the broader bounded walk so the usual case returns quickly.
     for root in user_search_roots() {
         for name in ["SRanipal", "SR_Runtime", "VIVE SRanipal"] {
             push(root.join(name), "user-folder install");

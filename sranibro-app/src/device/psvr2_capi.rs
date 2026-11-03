@@ -1,15 +1,3 @@
-//! Read-only PlayStation VR2 Toolkit CAPI bridge.
-//!
-//! The Toolkit publishes gaze state and the paired eye-camera preview through its
-//! installed `psvr2_toolkit_capi.dll` (Windows) or native Linux `.so`. SRanibro discovers it from the
-//! Toolkit's temporary path hint, active OpenVR drivers, and every registered
-//! Steam library. This keeps the application self-contained without copying or
-//! redistributing Toolkit binaries.
-//!
-//! This low-level module deliberately exposes raw camera halves as `A` and `B`.
-//! The product adapter applies the anatomical mapping established by a labelled
-//! hardware recording; the standalone probe retains neutral A/B names so future
-//! Toolkit or headset revisions can be audited without assuming that mapping.
 
 #![cfg(any(windows, target_os = "linux"))]
 
@@ -49,7 +37,6 @@ pub const RESULT_NO_SLOT: i32 = -2;
 
 #[cfg(windows)]
 const CAPI_LIBRARIES: &[&str] = &["psvr2_toolkit_capi.dll"];
-// Upstream CMake/loader use the lib prefix; some Ignition packages omit it.
 #[cfg(target_os = "linux")]
 const CAPI_LIBRARIES: &[&str] = &["libpsvr2_toolkit_capi.so", "psvr2_toolkit_capi.so"];
 const PSVR2_APP_DIR: &str = "PlayStation VR2 App";
@@ -76,9 +63,6 @@ pub struct LensConfig {
     pub right: GazeVec3,
 }
 
-/// `hmd2_gaze_wearable_eye_t` from PSVR2Toolkit's current `hmd2_gaze.h`.
-///
-/// Toolkit booleans are explicitly 32-bit integers, not C/Rust `bool`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WearableEye {
@@ -146,7 +130,6 @@ pub struct FoveatedGaze {
     pub convergence_distance_mm: f32,
 }
 
-/// Exact 0x148-byte status block emitted by current PSVR2Toolkit.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GazeStatus {
@@ -180,7 +163,6 @@ fn finite_vec3(v: GazeVec3) -> bool {
     v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
 }
 
-/// Copied, stable subset of one Toolkit eye-image buffer.
 #[derive(Clone, Debug)]
 pub struct EyeImageFrame {
     pub header: [u8; IMAGE_HEADER_BYTES],
@@ -192,12 +174,6 @@ pub struct EyeImageFrame {
 }
 
 impl EyeImageFrame {
-    /// Copy a CAPI-owned frame before the circular buffer advances.
-    ///
-    /// # Safety
-    /// `source` must be the non-null pointer returned by
-    /// `psvr2_toolkit_gaze_image` and remain valid for at least
-    /// `IMAGE_HEADER_BYTES + IMAGE_PIXELS` readable bytes during this call.
     pub unsafe fn copy_from_capi(source: *const u8) -> io::Result<Self> {
         if source.is_null() {
             return Err(io::Error::new(
@@ -248,8 +224,6 @@ impl EyeImageFrame {
         })
     }
 
-    /// Split the 400x200 preview into two 200x200 camera planes without claiming
-    /// that either plane is anatomically left or right.
     pub fn split_camera_planes(&self) -> [Vec<u8>; 2] {
         let mut a = vec![0u8; CAMERA_WIDTH * CAMERA_HEIGHT];
         let mut b = vec![0u8; CAMERA_WIDTH * CAMERA_HEIGHT];
@@ -265,18 +239,13 @@ impl EyeImageFrame {
 
 type InitFn = unsafe extern "C" fn() -> i32;
 type DeinitFn = unsafe extern "C" fn();
-// The exported functions return C++ bool (one byte on both supported x86_64
-// ABIs), unlike the uint32_t enum flags embedded inside GazeStatus.
 type DriverActiveFn = unsafe extern "C" fn() -> u8;
 type GazeStatusFn = unsafe extern "C" fn(*mut GazeStatus, u32) -> u8;
 type GazeImageFn = unsafe extern "C" fn(*mut *mut u8, u32) -> u8;
 
-/// Dynamically loaded, read-only subset of PSVR2Toolkit CAPI.
 pub struct Psvr2Capi {
     #[cfg(windows)]
     module: HMODULE,
-    // Fields drop in declaration order, after our Drop runs deinit: unload CAPI
-    // before releasing its explicitly preloaded IPC dependency.
     #[cfg(target_os = "linux")]
     _module: libloading::os::unix::Library,
     #[cfg(target_os = "linux")]
@@ -294,9 +263,6 @@ impl Psvr2Capi {
     pub fn load() -> io::Result<Self> {
         #[cfg(windows)]
         let candidates = capi_candidates();
-        // An explicit Linux override is authoritative and intentionally trusted
-        // by the user. Never silently fall back to a different automatic library
-        // if the chosen file is absent or fails to load.
         #[cfg(target_os = "linux")]
         let explicit_override = std::env::var_os("PSVR2_TOOLKIT_CAPI");
         #[cfg(target_os = "linux")]
@@ -408,17 +374,12 @@ impl Psvr2Capi {
     unsafe fn load_path(path: &Path, automatic: bool) -> io::Result<Self> {
         use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
 
-        // An absolute path avoids dlopen's bare-filename search and makes a
-        // relative PSVR2_TOOLKIT_CAPI override behave predictably.
         let path = if automatic {
             trusted_linux_library_path(path)?
         } else {
             std::fs::canonicalize(path)?
         };
         let dependency = path.parent().unwrap().join("libcrossipc.so");
-        // Automatic discovery requires the known private dependency to be safe
-        // as well. Load its validated canonical target, not the original symlink
-        // path, so another user cannot replace a link between validation/dlopen.
         let dependency = if automatic {
             trusted_linux_library_path(&dependency).map_err(|error| {
                 io::Error::new(
@@ -445,8 +406,6 @@ impl Psvr2Capi {
                 })?,
             )
         } else {
-            // Official builds have $ORIGIN RUNPATH. Let the linker report its
-            // precise missing dependency/architecture/version error if absent.
             None
         };
         let module = Library::open(Some(&path), RTLD_NOW | RTLD_LOCAL).map_err(|error| {
@@ -577,8 +536,6 @@ fn capi_candidates() -> Vec<PathBuf> {
     }
 
     let mut temp_dirs = vec![std::env::temp_dir()];
-    // Ignition's Windows driver writes the hint into /tmp even if this process
-    // was launched with TMPDIR set to another location.
     #[cfg(target_os = "linux")]
     temp_dirs.push(PathBuf::from("/tmp"));
     for temp in temp_dirs.drain(..) {
@@ -655,10 +612,6 @@ fn check_linux_file_metadata(metadata: &std::fs::Metadata, current_uid: u32) -> 
     Ok(())
 }
 
-/// Upstream's Wine writer uses std::ofstream in /tmp (normally mode 0644 under
-/// umask 022). Open without following the final symlink and inspect this exact
-/// descriptor, not a separate pathname stat. NONBLOCK avoids hanging on a FIFO
-/// maliciously placed at the well-known global hint path.
 #[cfg(target_os = "linux")]
 fn read_trusted_linux_hint(path: &Path) -> io::Result<String> {
     let file = std::fs::OpenOptions::new()
@@ -686,12 +639,6 @@ fn read_trusted_linux_hint(path: &Path) -> io::Result<String> {
     Ok(text)
 }
 
-/// Canonicalize first and only pass this validated target to dlopen. Inspect
-/// regular-file metadata from an opened descriptor, and reject directories that
-/// let another user replace the file or inject $ORIGIN dependencies. Root-owned
-/// sticky ancestors such as /tmp are fine, but the immediate library directory
-/// must not be group/world writable. A user deliberately using a shared Steam
-/// library can opt in with PSVR2_TOOLKIT_CAPI instead of automatic discovery.
 #[cfg(target_os = "linux")]
 fn trusted_linux_library_path(path: &Path) -> io::Result<PathBuf> {
     let canonical = std::fs::canonicalize(path)?;
@@ -741,7 +688,6 @@ fn driver_capi_candidates(root: &Path) -> Vec<PathBuf> {
     let mut directories = vec![root.to_path_buf()];
     #[cfg(target_os = "linux")]
     directories.push(root.join("bin").join("linux64"));
-    // Ignition's Linux libraries are distributed beside the Windows driver.
     directories.push(root.join("bin").join("win64"));
     #[cfg(target_os = "linux")]
     directories.push(root.join("SteamVR_Plug-In").join("bin").join("linux64"));
@@ -805,8 +751,6 @@ fn steam_library_roots() -> Vec<PathBuf> {
                 push_existing_path(&mut roots, &mut seen, PathBuf::from(base).join("Steam"));
             }
         }
-        // Registry discovery normally finds Steam. These bounded fallbacks also
-        // cover portable installs and machines whose registry entry was removed.
         for letter in b'C'..=b'Z' {
             let drive = format!("{}:\\", letter as char);
             for relative in ["SteamLibrary", "Steam", r"Program Files (x86)\Steam"] {
@@ -1083,7 +1027,6 @@ mod tests {
                 .open(&path)
                 .unwrap();
             file.write_all(bytes).unwrap();
-            // Set exact test permissions independently of the runner's umask.
             file.set_permissions(std::fs::Permissions::from_mode(mode))
                 .unwrap();
             path
@@ -1173,8 +1116,6 @@ mod tests {
             trusted_linux_library_path(&library).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        // A sticky immediate directory still permits unrelated users to plant
-        // dependencies, unlike a sticky ancestor protecting our owned subdir.
         std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o1777)).unwrap();
         assert!(trusted_linux_library_path(&library).is_err());
         std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1368,9 +1309,6 @@ mod tests {
             .contains("missing CAPI export sranibro_test_missing_capi_export"));
     }
 
-    /// Explicit opt-in integration test: compile tools/linux/mock_psvr2_capi.c,
-    /// set SRANIBRO_PSVR2_TEST_CAPI to the resulting file and
-    /// SRANIBRO_PSVR2_MOCK=1, then run this test with --ignored.
     #[test]
     #[cfg(target_os = "linux")]
     #[ignore = "requires explicitly built test-only CAPI and SRANIBRO_PSVR2_MOCK=1"]
@@ -1392,8 +1330,6 @@ mod tests {
         let [left, right] = image.split_camera_planes();
         assert_eq!(left, right);
         assert!(left.iter().any(|pixel| *pixel == 15));
-        // Keep a second library handle so the shared mock state remains alive
-        // while verifying that our Drop called deinit before unloading.
         let observer = unsafe {
             libloading::os::unix::Library::open(Some(&path), libloading::os::unix::RTLD_NOW)
         }

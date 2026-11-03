@@ -1,4 +1,3 @@
-//! ML: load SRanipal's EyePrediction eyelid model from the user's SRanipal dir.
 pub mod brightness;
 pub mod brow_calfit;
 pub mod brow_fit;

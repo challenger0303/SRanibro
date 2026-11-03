@@ -1,37 +1,7 @@
-//! Brow post-processing: turn the raw brow CNN output into the emitted signed
-//! expression per eye. This runs in the 120 Hz emit thread, but advances only
-//! when the event-driven brow worker publishes a genuinely new stereo inference.
-//!
-//! The old standalone eyebrow tracker was stable because it used a continuous,
-//! fixed-response EMA and a real neutral deadzone. The previous in-app path used
-//! a fast/calm EMA switch plus a moving output deadband; noisy CLAHE input could
-//! therefore sit still for several frames and then jump ("stick-slip"). This
-//! implementation restores the old signal shape without changing the input
-//! preprocessing expected by the current trained model:
-//!
-//! 1. EMA response is time-based, so 60, 90 and 120 Hz camera sources have the
-//!    same latency.
-//! 2. Neutral is averaged from a short run of open-eye samples, not one frame.
-//! 3. A fixed neutral deadzone removes small noise continuously; there is no
-//!    moving deadband at the destination.
-//! 4. Blink samples never enter the EMA or baseline. The last open expression is
-//!    held for the entire blink instead of decaying and visibly twitching.
-//!
-//! `process` returns `None` until a stable neutral baseline exists, so the
-//! pipeline never emits a value derived from a zero placeholder.
 
-/// Old tracker setting `smooth = 68` meant alpha=0.32 at its effective 100 Hz
-/// update rate (about 26 ms). The current model must retain its noisier CLAHE
-/// preprocessing, so replay of its recorded sequences uses twice that constant:
-/// still responsive, but with old-tracker-like peak step noise.
 const DEFAULT_EMA_TAU_S: f32 = 0.052;
-/// Match the old tracker's per-eye neutral deadzone.
 const DEFAULT_DEADZONE: f32 = 0.10;
-/// Roughly 100 ms at 120 Hz: long enough not to use a noisy single frame, short
-/// enough that brow output becomes ready immediately after startup/recenter.
 const BASELINE_SAMPLES: u16 = 12;
-/// If the filtered signal moves substantially while neutral is being captured,
-/// restart the short window instead of averaging an eyebrow gesture into neutral.
 const BASELINE_MAX_SPAN: f32 = 0.12;
 const FALLBACK_INFER_DT_S: f32 = 1.0 / 120.0;
 
@@ -72,7 +42,6 @@ impl Eye {
         let min = self.neutral_min.min(value);
         let max = self.neutral_max.max(value);
         if max - min > BASELINE_MAX_SPAN {
-            // Start a fresh stable suffix at the newest value.
             self.neutral_sum = value;
             self.neutral_samples = 1;
             self.neutral_min = value;
@@ -92,11 +61,8 @@ impl Eye {
 
 pub struct BrowState {
     eyes: [Eye; 2],
-    /// Continuous-time EMA constant in seconds.
     tau_s: f32,
-    /// Exact neutral zone before the response curve.
     deadzone: f32,
-    /// Same optional power curve used by the old tracker (default Curve=5).
     gamma: f32,
 }
 
@@ -112,8 +78,6 @@ impl Default for BrowState {
 }
 
 impl BrowState {
-    /// Re-capture the neutral baseline on the next stable run of open samples.
-    /// The EMA itself is retained so recenter never introduces a filter jump.
     pub fn recenter(&mut self) {
         for eye in &mut self.eyes {
             eye.reset_neutral();
@@ -154,11 +118,6 @@ impl BrowState {
         }
     }
 
-    /// Process one eye.
-    ///
-    /// `is_new` means the worker produced a new stereo inference; `infer_dt_s`
-    /// is the elapsed time since the previous inference. Emit-only ticks never
-    /// advance the EMA. Blink frames are held and excluded from all learning.
     pub fn process(
         &mut self,
         eye: usize,
@@ -193,9 +152,6 @@ impl BrowState {
 
         let state = &mut self.eyes[eye];
         if blink {
-            // The brow model sees an eye-shaped crop and is not trained to interpret
-            // eyelid occlusion. Holding the last open result is safer than allowing a
-            // blink to pull the brow down and then spring back.
             return Some(if state.have_output { state.output } else { 0.0 });
         }
 

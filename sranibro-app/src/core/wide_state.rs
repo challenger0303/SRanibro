@@ -1,10 +1,5 @@
-//! Post-processing for the Dream Air/XR5 image-based EyeWide model.
-//!
-//! This intentionally does not reuse the eyelid state machine. The custom model already
-//! predicts a wide score; this layer only removes per-user offset/range, neutral jitter,
-//! blink contamination, and optional bilateral imbalance.
 
-const BOOTSTRAP_SAMPLES: u32 = 24; // about 0.57 s at 42 inference/s
+const BOOTSTRAP_SAMPLES: u32 = 24;
 const BOOTSTRAP_MAX_RAW: f32 = 0.35;
 const BOOTSTRAP_FALLBACK_AFTER: u32 = BOOTSTRAP_SAMPLES * 3;
 const BOOTSTRAP_FALLBACK_BAND: f32 = 0.10;
@@ -13,8 +8,6 @@ const ENTER: f32 = 0.08;
 const EXIT: f32 = 0.04;
 const MOTION_RAW: f32 = 0.04;
 const CALM_RAW: f32 = 0.03;
-// A deliberate wide expression is a large raw step. Follow that edge quickly while
-// retaining the much slower calm path below for neutral jitter suppression.
 const FILTER_MOVE_TAU: f32 = 0.020;
 const FILTER_CALM_TAU: f32 = 0.180;
 const BASELINE_TAU: f32 = 30.0;
@@ -58,9 +51,6 @@ impl Default for Eye {
         Self {
             filtered: 0.0,
             neutral: 0.0,
-            // Start at the safe floor. The first real wide observation expands this
-            // immediately, so a user whose fitted head reaches only e.g. 0.45 still gets
-            // full usable range instead of waiting minutes for a 1.0 seed to decay.
             span: MIN_SPAN,
             target: 0.0,
             output: 0.0,
@@ -110,9 +100,6 @@ impl WideState {
         self.gate = 0.0;
     }
 
-    /// Update a fresh stereo prediction and advance the 120 Hz output envelope.
-    /// `infer_dt` matters only when `is_new`; `emit_dt` advances the final slew every call.
-    /// Returns `None` per eye until a relaxed neutral bootstrap has completed.
     pub fn process_pair(
         &mut self,
         raw: [f32; 2],
@@ -143,12 +130,6 @@ impl WideState {
                 eye.bootstrap_min = eye.bootstrap_min.min(eye.filtered);
 
                 if eye.neutral_n < BOOTSTRAP_SAMPLES {
-                    // A user who starts while holding wide cannot become the neutral.
-                    // Normally enforce an absolute score ceiling. A generic model can
-                    // have a harmless per-wearer offset, though, so after three expected
-                    // bootstrap windows accept only values close to the lowest score seen.
-                    // This avoids a permanent Custom=0/Auto fallback deadlock while still
-                    // rejecting transient high/wide samples during the normal window.
                     let offset_fallback = eye.bootstrap_seen >= BOOTSTRAP_FALLBACK_AFTER
                         && eye.filtered <= eye.bootstrap_min + BOOTSTRAP_FALLBACK_BAND;
                     if eye.filtered <= BOOTSTRAP_MAX_RAW || offset_fallback {
@@ -162,15 +143,10 @@ impl WideState {
                 let dev = eye.filtered - eye.neutral;
                 let norm = (dev.max(0.0) / eye.span.max(MIN_SPAN)).clamp(0.0, 1.0);
 
-                // Learn neutral only inside the already-neutral basin and only while
-                // measurement motion is calm. A held real wide expression is outside the
-                // basin and therefore cannot be silently calibrated away.
                 if !eye.active && norm < ENTER && (raw[i] - eye.filtered).abs() < CALM_RAW {
                     eye.neutral += alpha(infer_dt, BASELINE_TAU) * (eye.filtered - eye.neutral);
                 }
 
-                // Per-eye range: reach a newly-observed maximum immediately, then relax
-                // toward a safe floor over minutes so one outlier cannot desensitize forever.
                 let positive = (eye.filtered - eye.neutral).max(0.0);
                 if positive > eye.span {
                     eye.span = positive;
@@ -202,8 +178,6 @@ impl WideState {
             let eye = &mut self.eyes[i];
             ready[i] = eye.neutral_n >= BOOTSTRAP_SAMPLES;
             if blink[i] {
-                // EyeWide must never remain visible through a closed eye. The measurement,
-                // baseline, and range were already frozen above.
                 eye.output = 0.0;
                 continue;
             }

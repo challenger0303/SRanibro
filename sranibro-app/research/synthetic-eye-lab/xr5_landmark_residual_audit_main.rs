@@ -1,10 +1,3 @@
-//! Research-only, non-mutating audit of XR5 image evidence and EyeNet residuals.
-//!
-//! Raw-image landmark values are deliberately QA-only: the real-image detector is not
-//! calibrated and is excluded from every association, regression, and selection.  The
-//! only enabled explanatory variables are candidate-independent raw photometric
-//! measurements. The supplied EyeNet model follows the production preprocessing and
-//! inference seam, but legacy recordings cannot prove capture-time model-hash parity.
 
 #[path = "xr5_recording.rs"]
 mod xr5_recording;
@@ -25,8 +18,6 @@ use sranibro_rs::ml::{eye_net::EyeNet, tvm_params};
 
 const AUDIT_SCHEMA: &str = "xr5-landmark-residual-audit-v1";
 const EXPECTED_RECORDED_PHASES: usize = 56;
-// The 2.20 s RelaxedOpen phase leaves enough post-reaction evidence for eleven
-// stable 20 Hz rows while still tolerating the static end guard.
 const MIN_COMMANDED_STABLE_ROWS_PER_PHASE: usize = 11;
 const BASE_PHOTO_NAMES: [&str; 9] = [
     "p10",
@@ -46,14 +37,8 @@ const MIN_DISCOVERY_SESSIONS_FOR_RIDGE: usize = 3;
 const MIN_ASSOCIATION_SELECTION_BLOCKS: usize = 10;
 const MIN_BLOCK_FRAMES: usize = 10;
 const MIN_BLOCK_SPAN_S: f32 = 0.90;
-// A nominal one-second block must represent a continuous observation, not two dense
-// bursts separated by UI/worker starvation. This still leaves >3x headroom over the
-// real 64 ms capture cadence exercised by the reachability regression test.
 const MAX_BLOCK_GAP_S: f32 = 0.20;
 
-/// v2 adds no-sampling instruction phases and a wider SteamVR presentation. v3 adds
-/// unrecorded action rehearsals. All retain the same 56 labelled recording phases,
-/// target repetitions, and sample quotas consumed by this audit.
 fn residual_protocol_supported(protocol: Option<&str>) -> bool {
     matches!(
         protocol,
@@ -576,8 +561,6 @@ fn analyse_session(
             });
         }
     }
-    // All mode-selection QC is frozen from discovery-train evidence. Holdout rows remain
-    // available in the CSV/report, but can never rescue or tune a failed detector.
     let qc = landmark_qc(&rows, "train");
     let (direction_mode, absolute_direction_supported, mut limitations) = assign_direction_bins(
         &mut rows,
@@ -1436,8 +1419,6 @@ fn mark_selected_association(rows: &mut [AssociationRow]) {
     }
 }
 
-/// Collapse autocorrelated 20 Hz frames into phase-local one-second blocks before any
-/// correlation or regression. Eyes are never pooled.
 fn regression_blocks(
     session: &SessionAnalysis,
     split: &str,
@@ -1660,9 +1641,6 @@ fn model_comparison(
         contributing_session_ids_per_eye: contributing,
         one_second_blocks_per_eye: std::array::from_fn(|eye| training[eye].len()),
         fitted_per_eye: std::array::from_fn(|eye| ridge[eye].is_some()),
-        // The current ridge is deliberately exploratory. A future preregistered
-        // implementation must add leave-one-session-out feature/prediction stability
-        // before this can ever become true.
         session_wise_feature_stability_evaluated: false,
         eligible_for_hypothesis_freeze: false,
         excluded_sessions,
@@ -1672,9 +1650,6 @@ fn model_comparison(
 }
 
 fn fit_ridge(data: &[([f32; PHOTO_COUNT], f32)]) -> Option<RidgeModel> {
-    // Do not fit a nominally regularized 36-variable model to a handful of highly
-    // autocorrelated blocks.  Ridge stabilizes coefficients; it does not create
-    // independent evidence.  Future repeated nine-point sessions can clear this gate.
     if data.len() < MIN_RIDGE_BLOCKS {
         return None;
     }
@@ -1930,9 +1905,6 @@ fn direction_bins(sessions: &[SessionAnalysis]) -> Vec<DirectionRow> {
         BTreeMap::<(usize, String, String, usize, String, String), Vec<&FrameRow>>::new();
     for session in sessions {
         for row in &session.rows {
-            // Direction summaries must contain only relaxed-open evidence. The v3
-            // protocol also attaches targets to slow-close and blink actions; mixing
-            // those actions here would manufacture a target-dependent openness loss.
             if !matches!(row.family, SampleFamily::Neutral | SampleFamily::GazeSweep) {
                 continue;
             }
@@ -2046,7 +2018,6 @@ fn write_frame_features(out: &Path, sessions: &[SessionAnalysis]) -> Result<(), 
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
                 format!("{:.9}", row.fixed_ir_flare_proxy),
-                // Intentionally blank until the pupil detector is calibrated.
                 String::new(),
             ];
             fields.extend(row.photo.iter().map(|value| format!("{value:.9}")));
@@ -2824,9 +2795,6 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(hash_bytes(&bytes))
 }
 
-/// Fingerprint the actual statistical evidence, excluding mutable path/provenance
-/// metadata. This prevents an identical recording copied to another directory from
-/// being counted as another independent discovery session.
 fn hash_recording_evidence(
     root: &Path,
     frames: &[xr5_recording::RecordingFrame],
@@ -2913,8 +2881,6 @@ mod tests {
                     } else {
                         SampleFamily::GazeSweep
                     };
-                    // Mirror a minimally complete 17-frame RelaxedOpen phase after
-                    // production stability selection: eleven retained, six excluded.
                     for sample in 0..17 {
                         evidence.push((
                             0,
@@ -3161,8 +3127,6 @@ mod tests {
         let continuous_refs = continuous.iter().collect::<Vec<_>>();
         assert!(block_has_one_second_support(&continuous_refs));
 
-        // Ten frames and 0.98 s of endpoint span used to pass even though the middle
-        // 0.78 s had no evidence. The cadence gap must now make it ineligible.
         let times = [0.00, 0.04, 0.08, 0.12, 0.16, 0.94, 0.95, 0.96, 0.97, 0.98];
         let clustered = times
             .iter()
@@ -3177,11 +3141,6 @@ mod tests {
 
     #[test]
     fn real_protocol_timing_yields_sixteen_train_gaze_blocks_per_eye_and_reaches_ridge() {
-        // OPEN_SECONDS=2.20 and OPEN_SETTLE_SECONDS=0.55 leave 1.65 s of
-        // recorded evidence. Exercise the production stability classifier at a
-        // realistic 64 ms UI cadence: after the 0.50 s trim and two-frame gaze
-        // departure, 0.576..1.536 still supports a 0.96 s block with 16 frames.
-        // Each train pass has eight non-centre targets.
         let non_center_phases = (1usize..=18)
             .filter(|phase| !matches!(phase, 1 | 10))
             .collect::<Vec<_>>();

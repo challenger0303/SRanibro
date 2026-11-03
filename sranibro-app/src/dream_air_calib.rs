@@ -1,18 +1,8 @@
-//! Guided Dream Air / XR5 onboarding and live quality evaluation.
-//!
-//! The fixed XR5 warp is only a starting point.  This module deliberately does not
-//! auto-edit geometry: it measures the user's real relaxed/closed/wide ranges, seeds
-//! the existing post-processor, and reports when the source signal is too weak.  All
-//! calculations are UI-independent so recorded sessions can exercise them in tests.
 
 use crate::core::eye_state::{CalibSnapshot, CalibStore};
 use crate::core::types::{EyeResult, GazeSample};
 
 const PRESENT_GATE: f32 = 0.05;
-/// The dual-eye SRanipal network takes ~24 ms per stereo inference on the
-/// reference Dream Air machine (about 42/s).  Requiring 45/s made a healthy,
-/// stable stream impossible to pass.  35/s preserves headroom for short load
-/// spikes while still rejecting a genuinely stalled/overloaded model.
 const MIN_ML_RATE: f32 = 35.0;
 const SETTLE_SAMPLES: u32 = 30;
 
@@ -66,9 +56,6 @@ impl GuidedStep {
     }
 
     pub fn sample_budget(self) -> u32 {
-        // EyeNet runs at ~60 Hz.  The whole flow is about 20 seconds; the first
-        // half-second of every gesture is ignored so instruction reaction time does
-        // not contaminate the measurement.
         match self {
             Self::Relaxed => 180,
             Self::SlowBlinks => 330,
@@ -176,8 +163,6 @@ impl GuidedCalibration {
         }
     }
 
-    /// Add exactly one new EyeNet inference.  The caller must de-duplicate on the
-    /// pipeline ML generation counter; UI repaint cadence is not a sampling clock.
     pub fn push(&mut self, ml: [[f32; 5]; 2], gaze: &GazeSample) {
         let Some(index) = self.step.index() else {
             return;
@@ -504,8 +489,6 @@ pub fn evaluate_quality(input: &QualityInput) -> QualityReport {
         reasons.push("Tobii openness endpoint stream is missing".into());
         0.0
     };
-    // Only inspect baseline drift while both eyes are visibly relaxed. Expressions are
-    // expected to move the raw value and must never turn the quality lamp red.
     let relaxed = input
         .results
         .iter()
@@ -546,9 +529,6 @@ fn gaze_x_deg(gaze: [f32; 3]) -> f32 {
     gaze[0].atan2(-gaze[2]).to_degrees()
 }
 
-/// Smallest separation on a circular degree axis. A raw subtraction across the
-/// -180/+180 seam turns a real 7.4-degree L/R residual into the bogus 352.6 degrees
-/// observed on XR5 when looking slightly away from centre.
 fn shortest_angle_delta_deg(a: f32, b: f32) -> f32 {
     let delta = (a - b).rem_euclid(360.0);
     delta.min(360.0 - delta)
@@ -623,13 +603,13 @@ mod tests {
     #[test]
     fn guided_flow_measures_ranges_and_mapping() {
         let mut c = GuidedCalibration::new();
-        fill_step(&mut c, (0.65, 0.66), true); // relaxed
-        fill_step(&mut c, (0.50, 0.51), true); // slow blinks
-        fill_step(&mut c, (0.30, 0.31), false); // closed
-        fill_step(&mut c, (0.72, 0.73), true); // wide
-        fill_step(&mut c, (0.28, 0.29), false); // squeeze
-        fill_step(&mut c, (0.32, 0.65), true); // left wink
-        fill_step(&mut c, (0.65, 0.33), true); // right wink
+        fill_step(&mut c, (0.65, 0.66), true);
+        fill_step(&mut c, (0.50, 0.51), true);
+        fill_step(&mut c, (0.30, 0.31), false);
+        fill_step(&mut c, (0.72, 0.73), true);
+        fill_step(&mut c, (0.28, 0.29), false);
+        fill_step(&mut c, (0.32, 0.65), true);
+        fill_step(&mut c, (0.65, 0.33), true);
         let report = c.report().unwrap();
         assert!(report.passed, "{report:?}");
         assert_eq!(report.mapping, MappingVerdict::Correct);

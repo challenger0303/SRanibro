@@ -1,6 +1,3 @@
-//! A single, connection-scoped gaze provider for Crystal / Crystal Super.
-//! Both avatar input and the independent OSC tap use the selected source; there
-//! is no fallback on tracking loss, no combined gaze and no extra smoothing.
 
 use super::gaze::{GazeData, WearableData};
 use crate::config::Vr4GazeSource;
@@ -19,13 +16,10 @@ impl Vr4GazeRouter {
         }
     }
 
-    /// v1 never publishes gaze from 1289, even when 1285 tracking is invalid.
     pub fn foveated(&self, data: &GazeData) -> Option<GazeSample> {
         (self.source == Vr4GazeSource::V2).then(|| data.to_gaze_sample())
     }
 
-    /// First result is the unfiltered native tap, second is avatar input.
-    /// v2 still receives auxiliary pupil/openness, but no duplicate gaze event.
     pub fn wearable(&mut self, data: &WearableData) -> (GazeSample, GazeSample) {
         if self.source == Vr4GazeSource::V2 {
             let aux = data.to_aux_sample();
@@ -37,8 +31,6 @@ impl Vr4GazeRouter {
         if fresh {
             self.last_timestamp = tracking.timestamp_us;
         }
-        // Match the tested direct trial: guard avatar freshness/invalid rays,
-        // but never turn a missing eye into its partner or limit its gaze range.
         for eye in [&mut tracking.left, &mut tracking.right] {
             let ray = eye.gaze;
             let norm_sq = ray.iter().map(|v| v * v).sum::<f32>();
@@ -146,7 +138,6 @@ mod tests {
             assert!(raw.left.gaze_valid);
             assert_eq!(tracking.left.pupil_mm, raw.left.pupil_mm);
         }
-        // A newly constructed connection has no stale timestamp/provider state.
         assert!(
             Vr4GazeRouter::new(Vr4GazeSource::V1)
                 .wearable(&native())

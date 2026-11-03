@@ -1,9 +1,3 @@
-//! Shared loader for research-only XR5 recording replays.
-//!
-//! Recording CSV columns are resolved by name rather than position.  The production
-//! exporter may append fields in newer schema versions without changing older replay
-//! tools; every source column is also retained in [`RecordingFrame::fields`] for tools
-//! which understand those extensions.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -17,11 +11,8 @@ use sranibro_rs::geometry_calib::{
 
 #[derive(Clone, Debug)]
 pub struct RecordingMetadata {
-    /// Metadata schema. Historical recordings without an explicit version are v1.
     pub schema_version: u32,
-    /// Exact metadata contents as exported by SRanibro.
     pub raw: String,
-    /// Parsed `key=value` entries. Unknown entries are intentionally retained.
     pub fields: BTreeMap<String, String>,
 }
 
@@ -33,14 +24,10 @@ impl RecordingMetadata {
 
 #[derive(Clone, Debug)]
 pub struct RecordingFrame {
-    /// Source index declared by `samples.csv`; it need not equal the vector position.
     pub source_index: usize,
-    /// Explicit split label from the CSV. The replay dataset also carries the split in
-    /// `SampleKind`, but retaining this value lets audit tools report malformed exports.
     pub holdout: bool,
     pub left_file: PathBuf,
     pub right_file: PathBuf,
-    /// All source columns, including future schema additions unknown to this loader.
     pub fields: BTreeMap<String, String>,
 }
 

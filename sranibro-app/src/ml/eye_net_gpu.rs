@@ -1,9 +1,3 @@
-//! DX12/WebGPU compute backend for the fixed SRanipal EyePrediction network.
-//!
-//! The user's parsed weights remain the source of truth. They are uploaded once and
-//! kept resident; each live update uploads only one or two `[2,100,100]` tensors and
-//! reads back five floats per tensor. The two-input path evaluates the normal tensor
-//! and the mirrored/swapped right-eye tensor in one command submission.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -38,8 +32,6 @@ enum GpuFailure {
     Internal,
 }
 
-/// Callbacks can run under wgpu 22's internal error-sink lock. Record one bounded
-/// signal only: no logging, channel waits, device calls, or recovery in a callback.
 #[derive(Default)]
 struct GpuHealth {
     first_failure: AtomicU8,
@@ -76,8 +68,6 @@ impl GpuHealth {
     }
 }
 
-/// Absolute, monotonic deadline. Repeated polls and delayed callbacks never renew
-/// the budget. An expired result is rejected even if its callback is already queued.
 #[derive(Clone, Copy)]
 struct ReadbackDeadline(Instant);
 
@@ -349,11 +339,7 @@ struct Stage {
     dispatch: Dispatch,
 }
 
-/// Fixed-network GPU executor. It is used only behind the validated hybrid model in
-/// `eyelid_model`; errors are returned so the caller can keep tracking on CPU.
 pub(crate) struct GpuEyeNet {
-    // Production GPU work is isolated from the GUI process. Arc also permits the
-    // diagnostic from_device path without duplicating resource-building code.
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     input: wgpu::Buffer,
@@ -410,10 +396,6 @@ impl GpuEyeNet {
         Self::from_device(net, Arc::new(device), Arc::new(queue), info.name)
     }
 
-    /// Build EyeNet resources on an externally supplied device/queue for diagnostics.
-    /// This executor takes ownership of the device's health callbacks. Do not pass a
-    /// GUI device whose callback policy must remain independent. Production uses a
-    /// private device inside the supervised GPU worker, not the renderer's device.
     pub(crate) fn from_device(
         net: &EyeNet,
         device: Arc<wgpu::Device>,
@@ -635,9 +617,6 @@ impl GpuEyeNet {
     ) -> Result<[[f32; OUT_DIM]; MAX_BATCH], String> {
         self.check_health()?;
         let deadline = ReadbackDeadline(Instant::now() + SYNC_READBACK_TIMEOUT);
-        // Synchronous diagnostics may interrupt the live pipelined path. Finish and
-        // discard its older sample before reusing the single readback buffer. Both
-        // draining and this submission share one deadline, not two renewed waits.
         if self.pending.is_some() {
             let _ = self.finish_pending(true, Some(deadline))?;
         }
@@ -647,12 +626,6 @@ impl GpuEyeNet {
             .ok_or_else(|| "GPU EyeNet synchronous readback did not complete".to_string())
     }
 
-    /// Queue diagnostic live inference with one bounded readback in flight.
-    ///
-    /// The first call enqueues work. Later calls publish the preceding result and
-    /// immediately enqueue the newest input. This adds one model tick of latency but
-    /// bounds callback waiting on each tick. Production uses the supervised worker
-    /// instead, so fatal native-driver failures cannot abort the tracking process.
     pub(crate) fn infer_live_batch(
         &mut self,
         primary: &[f32],
@@ -682,8 +655,6 @@ impl GpuEyeNet {
         if completed_batch == requested_batch {
             Ok(Some(result))
         } else {
-            // A live routing toggle changed the batch shape. Do not reinterpret an old
-            // single result as an A/B pair, or an old pair as the new single sample.
             Ok(None)
         }
     }
@@ -761,8 +732,6 @@ impl GpuEyeNet {
         let slice = self.readback.slice(..output_bytes);
         let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| {
-            // A retired request owns no receiver. A late callback is discarded and
-            // never waits on the tracking thread or retains a device/queue handle.
             let _ = sender.try_send(result);
         });
         self.pending = Some(PendingInference {
@@ -789,9 +758,6 @@ impl GpuEyeNet {
             if let Err(failure) = deadline.remaining(Instant::now()) {
                 return self.fail(failure);
             }
-            // Never ask the driver to wait for a submission. The external worker
-            // supervisor is still needed: even Poll/submit/drop can stall inside a
-            // broken native driver and cannot be interrupted by this Rust deadline.
             self.device.poll(wgpu::Maintain::Poll);
             self.check_health()?;
             let remaining = match deadline.remaining(Instant::now()) {
@@ -805,8 +771,6 @@ impl GpuEyeNet {
                 .receiver
                 .recv_timeout(CALLBACK_POLL_INTERVAL.min(remaining));
             self.check_health()?;
-            // Reject a completion delivered after the total deadline; it must not
-            // become a fresh eye sample simply because the channel became readable.
             if let Err(failure) = deadline.remaining(Instant::now()) {
                 return self.fail(failure);
             }
@@ -844,9 +808,6 @@ impl GpuEyeNet {
     fn check_health(&mut self) -> Result<(), String> {
         let result = self.health.check();
         if result.is_err() {
-            // Invalidate the receiver without calling back into an unhealthy driver.
-            // At most one map, one channel slot and the fixed buffers remain until
-            // teardown. This executor can never accept another submission afterward.
             self.pending.take();
         }
         result
@@ -960,7 +921,6 @@ mod tests {
         assert_eq!(pending.capped(Some(operation)).0, operation.0);
         let earlier = ReadbackDeadline(start + LIVE_READBACK_TIMEOUT);
         assert_eq!(earlier.capped(Some(operation)).0, earlier.0);
-        // Spending time draining does not grant the next submission another 2 s.
         assert_eq!(
             operation.remaining(start + Duration::from_millis(1950)),
             Ok(Duration::from_millis(50))
@@ -1009,7 +969,6 @@ mod tests {
         let deadline = ReadbackDeadline(now);
         let (sender, receiver) = mpsc::sync_channel(1);
         sender.try_send(Ok::<(), ()>(())).unwrap();
-        // Production checks the total deadline even after receiving a completion.
         assert!(receiver.try_recv().unwrap().is_ok());
         assert_eq!(deadline.remaining(now), Err(GpuFailure::ReadbackTimeout));
     }

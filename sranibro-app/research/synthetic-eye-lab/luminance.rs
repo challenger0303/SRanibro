@@ -1,7 +1,3 @@
-//! Renderer-only preregistration for the Phase 1.1 whole-image-mean experiment.
-//!
-//! This module never calls EyeNet. It deterministically selects the feasible aperture
-//! range and solves bounded sclera levels before any model inference is allowed.
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -400,7 +396,6 @@ fn solve_level(aperture: f32, target: f32) -> Result<SolvedLevel, String> {
             selected.absolute_error, MAX_MEAN_ERROR
         ));
     }
-    // Re-render the selected value so every accepted point independently passes guards.
     let selected_mean = guarded_mean(&spec(aperture, selected.sclera_level))?;
     Ok(SolvedLevel {
         level: selected.sclera_level,

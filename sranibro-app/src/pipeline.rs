@@ -1,12 +1,3 @@
-//! Orchestration: adapter -> ML -> SRanipalState -> output sinks, with live
-//! telemetry + controls for the UI.
-//!
-//! Thread layout mirrors the Python `core/pipeline.py`:
-//!   adapter --frames--> latest[L/R] --(60Hz)--> EyeNet --> openness raw[L/R]
-//!   adapter --gaze----> GazeSample
-//!                            |
-//!                       (120Hz emit)
-//!         SRanipalState::process_frame -> [EyeResult;2] -> Telemetry + sinks
 
 use std::collections::VecDeque;
 use std::io;
@@ -41,8 +32,6 @@ use crate::ml::wide_net::WideNet;
 use crate::output::OutputSink;
 use crate::wink_fit::ApplyRequest as WinkApplyRequest;
 
-/// One atomically published camera frame. The generation belongs to these exact
-/// pixels; consumers must not pair a separately loaded counter with an image.
 #[derive(Clone)]
 pub struct EyeFrame {
     pub generation: u64,
@@ -57,12 +46,6 @@ impl EyeFrame {
     }
 }
 
-/// One coherent calibration source sample published by the 60 Hz EyeNet worker.
-///
-/// The UI may present at 24/30 Hz or temporarily stop receiving callbacks.
-/// Calibration must therefore consume camera generations,
-/// not UI repaints.  Keeping a short, bounded history of Arc-backed frames lets the
-/// UI drain every unprocessed sample without copying image payloads here.
 #[derive(Clone)]
 pub struct CalibrationFrameSnapshot {
     pub captured_at: Instant,
@@ -78,13 +61,7 @@ impl CalibrationFrameSnapshot {
     }
 }
 
-/// A little over two seconds at the EyeNet worker's nominal 60 Hz.  A normal
-/// 24 Hz UI drains this every ~42 ms; the extra headroom is for compositor jitter.
-/// Long event-loop gaps are detected separately and intentionally discarded.
 const CALIBRATION_HISTORY_CAPACITY: usize = 128;
-/// Prevent high-resolution Varjo/PSVR2 frames from turning the time-oriented
-/// history into a large idle-memory tax. Always retain the newest sample even
-/// when one unusually large pair exceeds this budget by itself.
 const CALIBRATION_HISTORY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 fn trim_calibration_history(
@@ -104,11 +81,6 @@ fn trim_calibration_history(
     }
 }
 
-/// The fixed manual-brightness transform and the exact stereo camera pair to which it was
-/// applied. Keeping the frame handles in the same mutex snapshot
-/// avoids a 120 Hz camera / 60 Hz ML race: a capture consumer can persist the
-/// precise pixels described by `affine` instead of accidentally pairing it with
-/// newer camera pixels. Cloning this value only clones the two `Arc` handles.
 #[derive(Clone)]
 pub struct BrightAffineSnapshot {
     pub source_generation: [u64; 2],
@@ -125,13 +97,11 @@ impl BrightAffineSnapshot {
         }
     }
 
-    /// Return the exact raw stereo pair used to produce this affine snapshot.
     pub fn stereo_frames(&self) -> [Option<EyeFrame>; 2] {
         self.source_frames.clone()
     }
 }
 
-/// Selected expression strength immediately before and after the user range map.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ExpressionResponseLive {
     pub wide_input: f32,
@@ -140,17 +110,11 @@ pub struct ExpressionResponseLive {
     pub squeeze_output: f32,
 }
 
-/// Runtime-only calibration recalled from a user-confirmed eye-image appearance.
-/// The emit thread owns all smoothing; selecting a profile never rewrites the
-/// per-HMD TOML calibration or the user's base response sliders.
 #[derive(Clone, Copy, Debug)]
 pub struct WearingCalibrationTarget {
     pub baseline: [f32; 2],
     pub wide_baseline: [f32; 2],
     pub wide_entry_ref: [f32; 2],
-    /// Only the image-dependent endpoint coordinates are recalled. Blink timing,
-    /// response curve, Squeeze and expression ranges remain the user's current
-    /// global settings and cannot change when an appearance match changes.
     pub manual_range: bool,
     pub open_point_offset: [f32; 2],
     pub closed_point_depth: [f32; 2],
@@ -158,9 +122,6 @@ pub struct WearingCalibrationTarget {
     pub confidence: f32,
 }
 
-/// A manual Wide recenter overrides only the current memory's Wide coordinates.
-/// Eyelid recovery remains active. A different/lost appearance match releases the
-/// override, so a subsequent recalled state can still restore its saved Wide.
 #[derive(Default)]
 struct WideRecallOverride {
     profile: Option<u64>,
@@ -183,9 +144,6 @@ impl WideRecallOverride {
     }
 }
 
-/// Diagnostic-only result after horizontally mirroring both canonical eye inputs and
-/// swapping their model channels. Values remain indexed by PHYSICAL eye, so index 1
-/// means "the right-eye image evaluated by the model's left-eye output head".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EyeHeadComparison {
     pub normal_openness: [f32; 2],
@@ -194,8 +152,6 @@ pub struct EyeHeadComparison {
     pub squeeze: [f32; 2],
 }
 
-/// Predictor identity and its latest stereo result travel together. A hot-loaded
-/// model must never reuse the previous model's raw sample or neutral coordinate.
 #[derive(Clone, Copy, Debug, Default)]
 struct BrowModelSample {
     revision: u64,
@@ -232,8 +188,6 @@ impl BrowOutputState {
         results: &mut [EyeResult; 2],
     ) {
         if self.revision != sample.revision {
-            // Recenter deliberately retains an EMA for the same model. A different
-            // model is a different coordinate system: discard the entire filter.
             self.state = BrowState::default();
             self.revision = sample.revision;
             self.last_generation = 0;
@@ -266,7 +220,6 @@ impl BrowOutputState {
     }
 }
 
-/// Live snapshot of the running pipeline, shared with the UI (read-only there).
 pub struct Telemetry {
     #[cfg(feature = "external-eyelid-model")]
     pub xr5_gaze: Mutex<crate::ml::xr5_gaze::Snapshot>,
@@ -288,96 +241,50 @@ pub struct Telemetry {
     pub xr5_raw_frames: Mutex<[Option<crate::ml::xr5_research::RawFrame>;2]>,
     #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
     pub xr5_set_open: AtomicBool,
-    /// Newest eye frame per eye as `(width, height, bytes)` — dimensions travel with
-    /// the frame so resolution is per-HMD (VR4/StarVR 200x200, Varjo higher).
     pub frames: Mutex<[Option<EyeFrame>; 2]>,
     image_epoch: Mutex<u64>,
     image_changed: Condvar,
-    /// Bounded camera-generation clock for calibration consumers. Payloads are Arc
-    /// handles, but retaining a frame also retains its pixels, so this must stay capped.
     calibration_history: Mutex<VecDeque<CalibrationFrameSnapshot>>,
-    /// Nominal eye-camera resolution from the device profile — the UI's fallback
-    /// label before any frame arrives (the live frame's own dims win once streaming).
     pub eye_w: u32,
     pub eye_h: u32,
     pub gaze: Mutex<GazeSample>,
-    /// Wall-clock time of the newest VALID gaze report for each eye. Tobii 1289
-    /// interleaves short invalid-status packets with valid samples; validity is
-    /// therefore freshness-based instead of being cleared by one transient packet.
     gaze_last_valid: Mutex<[Option<Instant>; 2]>,
-    /// Newest packet that explicitly reported wearable pupil position/openness. These
-    /// streams are sample-and-hold in the merged gaze state, so research capture must
-    /// age them out rather than repeating stale native evidence indefinitely.
     pupil_pos_last_reported: Mutex<[Option<Instant>; 2]>,
     openness_last_reported: Mutex<[Option<Instant>; 2]>,
     native_timestamp_last_reported: Mutex<Option<Instant>>,
     pub ml_raw: Mutex<[f32; 2]>,
-    /// Legacy per-eye post-processor input layout reconstructed from the stereo
-    /// EyeNet output. Only presence, openness, and squeeze are populated in Phase 1;
-    /// structural channels 2 and 4 remain zero exactly as in the previous path.
     pub ml5: Mutex<[[f32; 5]; 2]>,
-    /// Shadow inference mapped back to physical L/R eyes. Besides the optional A/B
-    /// diagnostic, the emit thread uses the right-head values as the SRanipal EyeWide
-    /// source while the production mirrored-right route is active. Eyelid openness and
-    /// blink output remain on the left head.
     pub eye_head_comparison: Mutex<Option<EyeHeadComparison>>,
-    /// Native pupil diameter (mm, valid) per eye [L, R], from stream 1285 when available.
     pub pupil: Mutex<[(f32, bool); 2]>,
-    /// RAW brow CNN output per eye [L, R] (one per inference, NOT smoothed/clamped).
-    /// The emit thread does the time-based EMA, neutral baseline, and blink hold.
-    /// `c_brow` is the inference generation, so the EMA advances once per new
-    /// stereo camera pair rather than once per emit tick.
     pub brow_raw: Mutex<[f32; 2]>,
     pub c_brow: AtomicU64,
     brow_sample: Mutex<BrowModelSample>,
-    /// Whether an eyebrow model is currently loaded. An `AtomicBool` (not a fixed flag) so
-    /// [`Pipeline::set_brow`] can hot-load a freshly trained model into the LIVE pipeline
-    /// without a device reconnect — the emit thread and the UI both observe the flip.
     pub brow_loaded: AtomicBool,
-    /// Custom XR5 image-based EyeWide: raw model score, post-processed comparison,
-    /// and the legacy SRanipal-derived value from the same emit frame.
     pub wide_raw: Mutex<[f32; 2]>,
     pub wide_custom: Mutex<[f32; 2]>,
     pub wide_sranipal: Mutex<[f32; 2]>,
     pub c_wide: AtomicU64,
     pub wide_loaded: AtomicBool,
-    /// True only while the custom result is fresh, calibrated, and selected for output.
     pub wide_custom_active: AtomicBool,
-    /// Custom model neutral-bootstrap visibility for the XR5 card.
     pub wide_ready: Mutex<[bool; 2]>,
     pub wide_bootstrap_seen: Mutex<[u32; 2]>,
     pub results: Mutex<[EyeResult; 2]>,
     pub baselines: Mutex<[f32; 2]>,
-    /// Calibrated baseline of the independent ch2 EyeWide state.
     pub wide_baselines: Mutex<[f32; 2]>,
-    /// Exact live eyelid-response stages and the reason for any forced close.
-    /// The Open / closed editor uses this to distinguish endpoint mapping from a
-    /// native/fast-blink snap instead of guessing from the final value.
     pub eyelid_live: Mutex<[EyelidLiveDiag; 2]>,
-    /// Final Wide/Squeeze provider output before and after the visual response range.
     pub expression_live: Mutex<[ExpressionResponseLive; 2]>,
-    /// Full post-processor calibration snapshot.  The guided onboarding flow
-    /// reads this to preserve learned curve anchors when replacing baseline and
-    /// blink depth.
     pub calibration: Mutex<Option<CalibStore>>,
-    /// The EXACT per-eye image last fed to the eye net (100x100 u8, all filters +
-    /// geometry applied), un-mirrored back to natural orientation — the dashboard's
-    /// "NET" view shows what the model actually sees.
     pub ml_input: Mutex<[Option<Vec<u8>>; 2]>,
     pub ml_loaded: bool,
     pub device_name: String,
-    /// Device-supplied descriptors for the dashboard's pipeline-node detail cards, so the
-    /// UI reflects the ACTIVE adapter (Varjo/StarVR/VR4) instead of hardcoding Pimax.
     pub transport: String,
     pub streams: String,
     pub gaze_src: String,
-    // Monotonic counters; the UI derives rates from deltas over time.
     pub c_frame_l: AtomicU64,
     pub c_frame_r: AtomicU64,
     pub c_gaze: AtomicU64,
     pub c_ml: AtomicU64,
     pub c_emit: AtomicU64,
-    /// Emit cycles that overran the 120Hz period (a real dropped-frame count).
     pub c_drop: AtomicU64,
 }
 
@@ -388,8 +295,6 @@ impl Telemetry {
         self.image_changed.notify_all();
     }
 
-    /// Event-driven latest-frame delivery, independent of UI rate and Windows'
-    /// sleep timer granularity. The timeout checks disconnected/quiet clients.
     pub fn wait_image_frame(&self, seen: &mut u64) {
         let epoch = self.image_epoch.lock().unwrap();
         let (epoch, _) = self.image_changed.wait_timeout_while(
@@ -452,9 +357,6 @@ impl Telemetry {
             openness_last_reported: Mutex::new([None, None]),
             native_timestamp_last_reported: Mutex::new(None),
             ml_raw: Mutex::new([0.5, 0.5]),
-            // Neutral seed: ch0=1.0 (eye present, so the gate doesn't force-close
-            // before the first inference / when ML is absent), ch1=0.5 (neutral
-            // openness), matching the `ml_raw` [0.5,0.5] no-ML path.
             ml5: Mutex::new([[1.0, 0.5, 0.0, 0.0, 0.0]; 2]),
             eye_head_comparison: Mutex::new(None),
             pupil: Mutex::new([(0.0, false), (0.0, false)]),
@@ -475,8 +377,6 @@ impl Telemetry {
         })
     }
 
-    /// Caller holds the model mutex, just like publication, so an inference from
-    /// the old model cannot repopulate this cache after a replacement.
     fn reset_brow_model_sample(&self) {
         let mut sample = self.brow_sample.lock().unwrap();
         *sample = BrowModelSample {
@@ -498,9 +398,6 @@ impl Telemetry {
         self.c_brow.fetch_add(1, Ordering::Release);
     }
 
-    /// Latest gaze with the same freshness rule used by the 120 Hz emit thread.
-    /// The UI uses this for XR5 centre capture so a stale-but-sticky coordinate cannot
-    /// be mistaken for a full second of valid calibration samples.
     pub fn fresh_gaze(&self) -> GazeSample {
         let mut gaze = *self.gaze.lock().unwrap();
         if let Ok(last) = self.gaze_last_valid.lock() {
@@ -511,9 +408,6 @@ impl Telemetry {
         gaze
     }
 
-    /// Runtime sample with independent freshness for gaze and native openness.
-    /// The eyelid post-processor uses this so a stalled 1285 stream cannot leave a
-    /// sticky open-state sample authorizing session-only reseat recovery.
     pub fn fresh_runtime_sample(&self) -> GazeSample {
         let mut gaze = self.fresh_gaze();
         let now = Instant::now();
@@ -528,9 +422,6 @@ impl Telemetry {
         gaze
     }
 
-    /// Latest native sample with independent freshness for 1289 gaze and 1285
-    /// pupil/openness fields. Intended for timestamp-adjacent diagnostic capture;
-    /// stale sample-and-hold values become explicitly absent.
     pub fn fresh_capture_sample(&self) -> GazeSample {
         let mut gaze = self.fresh_runtime_sample();
         let now = Instant::now();
@@ -550,10 +441,6 @@ impl Telemetry {
         gaze
     }
 
-    /// Commit one completed prediction and its matching ch2 comparison together.
-    /// `None` as the outer comparison update means still pending: retain the last
-    /// completed pair, without counting it as a new inference. `Some(None)` clears
-    /// a completed invalid/incompatible pair or an explicitly disabled route.
     fn publish_eyelid_result(
         &self,
         frame: Option<LegacyPublishFrame>,
@@ -562,8 +449,6 @@ impl Telemetry {
         if frame.is_none() && comparison_update.is_none() {
             return;
         }
-        // Keep this order aligned with eyelid_model_snapshot. Holding ml5 while
-        // updating the comparison prevents emit from mixing two model generations.
         let mut ml5 = self.ml5.lock().unwrap_or_else(|p| p.into_inner());
         let mut comparison = self
             .eye_head_comparison
@@ -593,8 +478,6 @@ impl Telemetry {
         (*ml5, *comparison)
     }
 
-    /// Copy both frame handles under one lock. Cloning an `EyeFrame` only clones its
-    /// Arc, so capture and UI readers do not copy the camera payload.
     pub fn stereo_frames(&self) -> [Option<EyeFrame>; 2] {
         self.frames.lock().unwrap().clone()
     }
@@ -628,8 +511,6 @@ impl Telemetry {
         );
     }
 
-    /// Return coherent samples for which both eye generations are newer than the
-    /// consumer cursor.  The returned values only clone Arc handles.
     pub fn calibration_frames_after(&self, generation: [u64; 2]) -> Vec<CalibrationFrameSnapshot> {
         self.calibration_history
             .lock()
@@ -644,20 +525,13 @@ impl Telemetry {
     }
 }
 
-/// Per-unit camera, auxiliary-data, and gaze mapping (handles hardware variants).
 #[derive(Clone, Copy, Default)]
 pub struct DeviceMap {
-    /// Swap the complete physical left/right eye streams.
     pub swap_eyes: bool,
-    /// Horizontally mirror each eye image.
     pub flip_image: bool,
-    /// Negate the gaze X (left/right) sign at the output.
     pub flip_gaze_x: bool,
 }
 
-/// Complete live state installed before the adapter and worker threads start. Keeping
-/// this separate from [`DeviceMap`] avoids a one-frame identity/default window at startup
-/// and keeps the product UI and diagnostic `run` entrypoint on the same initialization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EyelidModelIdentity {
     pub crc32: u32,
@@ -678,8 +552,6 @@ pub struct PipelineInit {
     pub gaze_smoothing: bool,
     pub raw_gaze_osc_smoothing: bool,
     pub eyebrow_enabled: bool,
-    /// Global EyeWide output master. This does not stop either Wide provider or its
-    /// diagnostics; it only controls the final values and Custom Wide pose assist.
     pub eye_wide_enabled: bool,
     pub right_eye_left_head: bool,
     pub eyelid_inference_backend: crate::config::EyelidInferenceBackend,
@@ -697,7 +569,6 @@ pub struct PipelineInit {
     pub eyelid_response_profile: EyelidResponseProfile,
     pub wide_enabled: [bool; 2],
     pub wide_source: WideSource,
-    /// Fingerprint of the exact file bytes parsed into the live EyeNet.
     pub eyelid_model_identity: Option<EyelidModelIdentity>,
 }
 
@@ -737,13 +608,8 @@ impl Default for PipelineInit {
     }
 }
 
-/// On-demand occlusion-heatmap request/result, shared with the ML thread (which owns the
-/// net). The UI sets `req` + `mode`; the ML thread computes both eyes on its next tick — a
-/// On-demand blocking diagnostic — and publishes `result`, toggling `computing` around it.
-/// High-resolution centred sensitivity modes take longer than the one-pass probes.
 pub struct HeatState {
     pub req: AtomicBool,
-    // 0 = occlusion, 1 = glint, 2 = local brightness, 3 = local contrast.
     pub mode: std::sync::atomic::AtomicU8,
     pub computing: AtomicBool,
     pub result: Mutex<Option<crate::ml::heatmap::HeatResult>>,
@@ -767,119 +633,54 @@ pub struct Pipeline {
     raw_gaze_osc: Arc<Mutex<Option<crate::raw_gaze_osc::RawGazeOsc>>>,
     raw_gaze_osc_smoothing: bool,
     adapter: Option<Box<dyn HmdAdapter>>,
-    /// Canonical key for the adapter that is actually running. Unlike `[hmd].device`,
-    /// this is resolved after `auto` sniffing and therefore selects the correct per-HMD
-    /// geometry/mapping bucket in the live UI.
     pub device_key: String,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    /// Optional loopback HTTP/MJPEG server. It is stopped before an engine reload so
-    /// the replacement engine can immediately bind the same port.
     pub(crate) eye_image_http: Option<EyeImageHttpServer>,
     pub tele: Arc<Telemetry>,
-    /// Exact input-byte identity captured when the currently loaded EyeNet was parsed.
     pub eyelid_model_identity: Option<EyelidModelIdentity>,
-    /// Startup validation/benchmark result for the selected eyelid inference backend.
     pub(crate) eyelid_backend_report: EyelidBackendReport,
-    /// When true, the emit thread keeps telemetry live but stops feeding sinks.
     pub paused: Arc<AtomicBool>,
-    /// Set to request a one-shot calibration recenter (cleared by the engine).
     pub recenter: Arc<AtomicBool>,
-    /// Full eyelid reset, processed and persisted by the emit owner, not the UI.
     eyelid_reset: Arc<Mutex<Option<mpsc::SyncSender<Result<(), String>>>>>,
-    /// One-shot calibrated state installed by the guided Dream Air flow.  The
-    /// emit thread owns `SRanipalState`, so UI code hands the value across here
-    /// rather than mutating processor internals concurrently.
     pub guided_calibration: Arc<Mutex<Option<CalibStore>>>,
-    /// One-shot explicit endpoint apply/removal request. The emit thread is the
-    /// sole owner of SRanipalState and changes only the requested eye(s).
     pub endpoint_apply: Arc<Mutex<Option<EndpointApplyRequest>>>,
-    /// One-shot installation of a holdout-validated gaze-dependent eyelid profile.
-    /// The emit thread owns both the active profile and its smoothing state.
     pub gaze_eyelid_apply: Arc<Mutex<Option<GazeEyelidApplyRequest>>>,
-    /// One-shot installation of a holdout-validated per-eye wink response.
     pub wink_apply: Arc<Mutex<Option<WinkApplyRequest>>>,
-    /// One-shot installation of natural-blink visible-bottom timing.
     pub blink_timing_apply: Arc<Mutex<Option<BlinkTimingApplyRequest>>>,
-    /// Diagnostic CSV recorder toggle (dashboard REC button): while true, the
-    /// emit thread writes one row per frame — raw ml values next to every
-    /// post-processing internal — to `sranibro_diag_<unix>.csv` in the app dir.
     pub diag_rec: Arc<AtomicBool>,
-    /// On-demand diagnostic: compare each physical eye through the opposite model head
-    /// using a mirrored+swapped canonical tensor. Never persisted or used for output.
     pub eye_head_comparison_enabled: Arc<AtomicBool>,
-    /// Live production route: replace only the physical right eye's raw openness and
-    /// squeeze with the mirrored right image evaluated by EyeNet's left output head.
     pub right_eye_left_head: Arc<AtomicBool>,
-    /// One-shot per-eye relaxed-baseline recenter request. Bit 0 = left, bit 1 = right.
     recenter_eye_mask: Arc<AtomicU8>,
-    /// Live whole-stream eye identity mapping.
     pub swap_eyes: Arc<AtomicBool>,
     pub flip_image: Arc<AtomicBool>,
-    /// Per-eye horizontal mirror applied ONLY to the ML input (A/B experiment for
-    /// matching the model's expected eye handedness; see preprocess::vr4_to_input_stereo_flip).
     pub ml_mirror_l: Arc<AtomicBool>,
     pub ml_mirror_r: Arc<AtomicBool>,
-    /// Negate gaze X (left/right) at the output — per-device gaze handedness fix.
     pub flip_gaze_x: Arc<AtomicBool>,
-    /// Live per-device Pimax post-calibration gaze trim.
     pub gaze_correction: Arc<Mutex<GazeCorrection>>,
-    /// Per-eye EyeWide capability gate. Weak source signals are reported and
-    /// disabled instead of being amplified into false expressions.
     pub wide_enabled: Arc<Mutex<[bool; 2]>>,
-    /// Live XR5 EyeWide provider. Changing it never tears down the camera adapter.
     pub wide_source: Arc<Mutex<WideSource>>,
-    /// Global live EyeWide output master. Raw SRanipal/Custom inference and telemetry
-    /// continue while false; only final output and Custom Wide pose assist are disabled.
     pub eye_wide_enabled: Arc<AtomicBool>,
-    /// Live master switch for eyebrow inference/output. The model remains loaded while
-    /// disabled so tracking can resume without rebuilding the pipeline.
     pub eyebrow_enabled: Arc<AtomicBool>,
-    /// Live calibration parameters (UI exposes these as sliders).
     pub tuning: Arc<Mutex<Tuning>>,
-    /// Per-HMD response trim. UI drags write only this live preview; persistence
-    /// happens explicitly when the user presses Apply.
     pub eyelid_response: Arc<Mutex<EyelidResponseProfile>>,
-    /// Appearance-conditioned target selected by the UI-side matcher. `None`
-    /// fades transient offsets back to the normal per-HMD calibration.
     pub wearing_calibration_target: Arc<Mutex<Option<WearingCalibrationTarget>>>,
-    /// Manual endpoint edits must take effect on the very next emit frame. This
-    /// clears the emit-thread's private blend state without changing saved memory.
     wearing_response_reset: Arc<AtomicBool>,
     manual_endpoint_edit: Arc<Mutex<Option<([f32; 2], EyelidResponseProfile)>>>,
-    /// Live PER-EYE ML-input geometry `[left, right]` (crop/stretch/rotation), read by
-    /// the ML thread each frame and edited live in the gear modal. Identity = legacy
-    /// resize for that eye.
     pub geometry: Arc<Mutex<[crate::core::types::MlGeometry; 2]>>,
-    /// Live per-device specular-dot suppression applied to the ML input (before geometry).
     pub despeckle: Arc<Mutex<crate::core::types::DespeckleParams>>,
-    /// Live per-device illumination flatten (close-up shadow removal), after despeckle.
     pub flatten: Arc<Mutex<crate::core::types::FlattenParams>>,
-    /// Live per-device manual eye-image brightness. Legacy adaptive fields remain in the
-    /// persisted type for compatibility but are deliberately ignored by the ML path.
     pub brightness: Arc<Mutex<crate::core::types::BrightnessNorm>>,
-    /// Fixed, fitted correction after manual brightness and before geometry.
     pub photometric_correction: Arc<Mutex<PhotometricCorrection>>,
-    /// The per-eye brightness affine (a,b) the ML thread last applied — for the UI preview.
-    /// Source generations and exact source frame handles are published under
-    /// the same mutex as the affine. Recording paths must use that bundled pair.
     pub bright_affine: Arc<Mutex<BrightAffineSnapshot>>,
-    /// On-demand ML occlusion heatmap (diagnostic), computed by the ML thread.
     pub heatmap: Arc<HeatState>,
-    /// Live device status string (for the UI's diagnostic line).
     pub device_status: Arc<Mutex<String>>,
-    /// The live eyebrow model, shared with the brow worker so a freshly trained model can be
-    /// hot-swapped in ([`Pipeline::set_brow`]) with no device reconnect. `None` = no brow.
     brow: Arc<Mutex<Option<BrowNet>>>,
-    /// Optional custom XR5 EyeWide model; shared so a fitted model can be hot-loaded later.
     wide: Arc<Mutex<Option<WideNet>>>,
-    /// Dedicated reset for custom Wide normalization when its model is hot-swapped.
     wide_recenter: Arc<AtomicBool>,
-    /// The model source is fixed for this pipeline's lifetime, including worker loss.
     xr5_native_output: bool,
 }
 
-/// Horizontally mirror a `w`x`h` grayscale image (row-major).
 fn mirror_h(px: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![0u8; w * h];
     for y in 0..h {
@@ -891,8 +692,6 @@ fn mirror_h(px: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-/// Consume a stereo brow pair only after both eyes have advanced. Alternating
-/// L/R callbacks therefore cannot re-infer the unchanged eye image.
 fn stereo_pair_advanced(generation: [u64; 2], previous: [u64; 2]) -> bool {
     generation[0] != 0
         && generation[1] != 0
@@ -938,9 +737,6 @@ fn merge_gaze_sample(dst: &mut GazeSample, src: GazeSample) {
     merge_eye_sample(&mut dst.right, src.right);
 }
 
-/// Correct a physically reversed unit by exchanging the complete eye streams.
-/// Keeping every eye-scoped field together prevents a normal conjugate look from
-/// hiding an inverted vergence channel order.
 fn route_eye_sample(mut sample: GazeSample, swap_eye_streams: bool) -> GazeSample {
     if swap_eye_streams {
         std::mem::swap(&mut sample.left, &mut sample.right);
@@ -948,8 +744,6 @@ fn route_eye_sample(mut sample: GazeSample, swap_eye_streams: bool) -> GazeSampl
     sample
 }
 
-/// A separate native-sample tap: never read the merged telemetry (which can
-/// retain last-good gaze), EyeResult, or avatar handedness/range settings here.
 fn raw_gaze_callback(
     output: Arc<Mutex<Option<crate::raw_gaze_osc::RawGazeOsc>>>,
     swap: Arc<AtomicBool>,
@@ -968,15 +762,9 @@ fn raw_gaze_callback(
         }
         let swapped = swap.load(Ordering::Relaxed);
         let mut sample = route_eye_sample(sample, swapped);
-        // PSVR2's adapter maps a *valid* closed blink classification to Disable
-        // for the eyelid core. The raw protocol can represent that known 0 directly.
-        // Do not make the same assumption for an invalid vendor openness value.
         if binary_blink {
             for eye in [&mut sample.left, &mut sample.right] {
                 if !eye.openness_reported {
-                    // PSVR2 has an explicit blink-valid bit on every gaze
-                    // sample: its absence here means validity was lost, not
-                    // that this is a separate gaze-only Tobii packet.
                     eye.openness_reported = true;
                     eye.openness_valid = false;
                 } else if !eye.openness_valid {
@@ -985,8 +773,6 @@ fn raw_gaze_callback(
                 }
             }
         }
-        // UDP is best effort. A settings change must not block the acquisition
-        // callback; skip the sample if the short configuration lock is busy.
         if let Ok(mut output) = output.try_lock() {
             if let Some(sender) = output.as_mut() {
                 if last_swap != Some(swapped) {
@@ -1007,19 +793,11 @@ fn apply_gaze_x_handedness(results: &mut [EyeResult; 2], flip: bool) {
     }
 }
 
-/// Return a continuous confidence that the legacy lid already represents an open eye.
-/// Custom Wide may strengthen an open lid, but it must not reinterpret a narrowed or
-/// closing lid as Wide. A smooth ramp avoids a one-frame mode switch at either boundary.
 fn custom_wide_pose_eligibility(openness: f32) -> f32 {
     let t = ((openness.clamp(0.0, 1.0) - 0.35) / (0.75 - 0.35)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Blend the legacy openness/squeeze pose toward fully open in proportion to Custom Wide.
-/// The Wide envelope has a short release tail, so eligibility is derived continuously from
-/// the current lid pose rather than from WideState's per-eye boolean `active` flag. When a
-/// bilateral gesture is credible, the more-open eye is the reference; a closing eye must
-/// never drag its open partner downward.
 fn apply_custom_wide_pose(
     results: &mut [EyeResult; 2],
     use_custom: bool,
@@ -1063,10 +841,6 @@ fn apply_custom_wide_pose(
     }
 }
 
-/// Apply the final EyeWide output policy after provider selection. Per-eye capability is
-/// intentionally independent from the global master: guided XR5 setup may update the
-/// former, but must never re-enable the user's avatar-level preference. Returning whether
-/// Custom Wide is actually exposed keeps telemetry aligned with the values sent to sinks.
 fn eye_wide_capability(native_xr5: bool, legacy: [bool; 2]) -> [bool; 2] {
     if native_xr5 { [true; 2] } else { legacy }
 }
@@ -1085,8 +859,6 @@ fn apply_eye_wide_output_policy(
             }
         }
     } else {
-        // Emit explicit zeroes rather than relying on missing/invalid semantics: every
-        // sink should actively release an avatar's previously latched EyeWide pose.
         results[0].wide = 0.0;
         results[1].wide = 0.0;
     }
@@ -1164,9 +936,6 @@ fn response_profiles_near(a: EyelidResponseProfile, b: EyelidResponseProfile) ->
     max_delta <= 0.0005 && a.manual_range == b.manual_range && a.auto_reseat == b.auto_reseat
 }
 
-/// Apply the user-facing expression ranges only after the Wide provider and capability
-/// policy are settled. Internal blink/wink recognition therefore continues to see the
-/// model's established signals, while every output sink sees the same final mapping.
 fn apply_expression_response_ranges(
     results: &mut [EyeResult; 2],
     profile: EyelidResponseProfile,
@@ -1195,10 +964,6 @@ fn apply_expression_response_ranges(
         }
     }
     if wide_requires_both {
-        // The provider already applies its bilateral gesture envelope. Preserve it
-        // after asymmetric per-eye range/exclusivity mapping, using the same stronger-
-        // eye policy as both Wide providers. A disabled/missing side or a wink must
-        // not be resurrected by copying the other eye's magnitude.
         let bilateral =
             live.iter().all(|eye| eye.wide_input > 0.0) && results.iter().all(|eye| !eye.blink);
         let shared = if bilateral {
@@ -1216,8 +981,6 @@ fn apply_expression_response_ranges(
     live
 }
 
-/// Keep core model/endpoint diagnostics intact, but show the exact avatar value
-/// after provider-specific pose assistance (notably XR5 Custom Wide).
 fn final_eyelid_live_diag(
     mut diag: [EyelidLiveDiag; 2],
     results: &[EyeResult; 2],
@@ -1228,9 +991,6 @@ fn final_eyelid_live_diag(
     diag
 }
 
-/// Optionally collapse a valid stereo eyebrow pair to one shared signed value.
-/// Averaging happens after each eye's own baseline, deadzone and smoothing, so the
-/// switch removes residual L/R imbalance without changing either model input.
 fn apply_brow_lr_sync(results: &mut [EyeResult; 2], enabled: bool) {
     if !enabled || !results[0].brow_valid || !results[1].brow_valid {
         return;
@@ -1240,10 +1000,6 @@ fn apply_brow_lr_sync(results: &mut [EyeResult; 2], enabled: bool) {
     results[1].brow = shared;
 }
 
-/// Convert canonical `[L, R]` model input into `[mirror(R), mirror(L)]`. This preserves
-/// the paired stereo context while evaluating each physical eye through the opposite
-/// handedness/output head. The destination is caller-owned so the diagnostic can reuse
-/// one buffer instead of allocating on every probe.
 fn mirror_swap_canonical_stereo(src: &[f32], dst: &mut [f32]) -> bool {
     let side = preprocess::DST;
     let plane = side * side;
@@ -1266,8 +1022,6 @@ fn physical_eye_head_comparison(
     normal_ml5: [[f32; 5]; 2],
     shadow_ml5: [[f32; 5]; 2],
 ) -> EyeHeadComparison {
-    // shadow ch0/out-left contains physical RIGHT; shadow ch1/out-right contains
-    // physical LEFT. Map back to the UI's ordinary [physical L, physical R] order.
     EyeHeadComparison {
         normal_openness: [normal_ml5[0][1], normal_ml5[1][1]],
         normal_squeeze: [normal_ml5[0][3], normal_ml5[1][3]],
@@ -1276,8 +1030,6 @@ fn physical_eye_head_comparison(
     }
 }
 
-/// Replace only physical RIGHT eyelid capabilities. Presence remains the normal
-/// stereo inference's value, and structural channels stay untouched.
 fn apply_right_left_head(frame: &mut LegacyPublishFrame, comparison: EyeHeadComparison) {
     frame.ml_raw[1] = comparison.openness[1];
     frame.ml5[1][1] = comparison.openness[1];
@@ -1296,12 +1048,6 @@ fn route_eye_head_pair(
     (normal, comparison)
 }
 
-/// Build the per-physical-eye right-head frame used only for EyeWide detection.
-///
-/// Normal inference is `[L, R]`, so its ch2/ch4 belong to physical RIGHT. Shadow
-/// inference is `[mirror(R), mirror(L)]`, so its ch2/ch4 belong to physical LEFT.
-/// Mapping those two values back to `[L, R]` lets both eyes use the same right EyeNet
-/// head, exactly mirroring the production eyelid route where both eyes use ch1/ch3.
 fn ch2_wide_frame(production_ml5: [[f32; 5]; 2], comparison: EyeHeadComparison) -> [[f32; 5]; 2] {
     [
         [
@@ -1321,26 +1067,18 @@ fn ch2_wide_frame(production_ml5: [[f32; 5]; 2], comparison: EyeHeadComparison) 
     ]
 }
 
-/// Open the sole Wide-to-non-Wide interaction while output is disabled, without
-/// mutating the user's saved tuning. Otherwise a hidden Wide value could attenuate
-/// squeeze before the final output policy zeroes EyeWide.
 fn apply_eye_wide_master_to_tuning(tuning: &mut Tuning, master_enabled: bool) {
     if !master_enabled {
         tuning.wide_squeeze_exclusive = false;
     }
 }
 
-/// Explicit Reset writes a cold checkpoint immediately, even without a loaded
-/// model. Periodic gaze-only persistence remains disabled everywhere else.
 fn reset_eyelid_calibration_checkpoint(state: &mut SRanipalState, path: &str) -> Result<(), String> {
     state.reset_eyelid_calibration();
     crate::core::eye_state::save_calib_checked(path, &state.snapshot_all())
         .map_err(|error| format!("Baseline reset is live, but could not be saved: {error}"))
 }
 
-/// Drain one pending explicit-endpoint apply/removal into the live post-processor.
-/// Used during normal frames and once more at shutdown so an endpoint published
-/// just before stop is not overwritten by the old final checkpoint.
 fn drain_endpoint_apply(
     pending: &Mutex<Option<EndpointApplyRequest>>,
     state: &mut SRanipalState,
@@ -1426,7 +1164,6 @@ mod merge_tests {
                 DeviceMap::default(), Arc::new(Mutex::new(String::new())), key, PipelineInit::default()
             ).unwrap();
             let (sender, receiver) = mpsc::sync_channel(1);
-            // Hold the emit reset boundary while staging all obsolete work.
             let mut reset = pipeline.eyelid_reset.lock().unwrap();
             *pipeline.endpoint_apply.lock().unwrap() = Some(EndpointApplyRequest {
                 eyes: std::array::from_fn(|_| Some(EndpointApply { baseline: 0.73, blink_depth: 0.18, calibrated_unix: 123 })),
@@ -1536,8 +1273,6 @@ mod merge_tests {
         );
         assert!(policy.target(eyelid_target, true).is_none());
         for _ in 0..300 {
-            // The emit thread continues receiving the original eyelid target,
-            // while the freshly relearned Wide is not overwritten next frame.
             assert!(policy.target(eyelid_target, false).is_none());
             let target = eyelid_target.unwrap();
             assert_eq!(target.baseline, [0.57, 0.63]);
@@ -1605,7 +1340,7 @@ mod merge_tests {
         assert!(stopped_on.lock().unwrap().is_empty());
         let owner = thread::current().id();
         thread::spawn(shutdown).join().unwrap();
-        pipeline.stop(); // Old UI handle is safe to stop again after ownership moved.
+        pipeline.stop();
         let calls = stopped_on.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_ne!(calls[0], owner);
@@ -1660,8 +1395,8 @@ mod merge_tests {
     fn eye_head_ab_maps_shadow_outputs_back_to_physical_eyes() {
         let normal = [[0.9, 0.81, 0.0, 0.11, 0.0], [0.9, 0.42, 0.0, 0.52, 0.0]];
         let shadow = [
-            [0.8, 0.21, 0.0, 0.31, 0.0], // physical RIGHT through LEFT head
-            [0.8, 0.72, 0.0, 0.62, 0.0], // physical LEFT through RIGHT head
+            [0.8, 0.21, 0.0, 0.31, 0.0],
+            [0.8, 0.72, 0.0, 0.62, 0.0],
         ];
         let comparison = physical_eye_head_comparison(normal, shadow);
         assert_eq!(comparison.normal_openness, [0.81, 0.42]);
@@ -1699,14 +1434,10 @@ mod merge_tests {
 
     #[test]
     fn ch2_wide_frame_routes_both_physical_eyes_through_right_head() {
-        // Production eyelids already use normal ch1 for LEFT and shadow ch1 for RIGHT.
         let production = [[0.91, 0.81, 0.0, 0.11, 0.0], [0.91, 0.21, 0.0, 0.31, 0.0]];
         let comparison = EyeHeadComparison {
-            // Normal ch2/ch4 are physical RIGHT through the right head.
             normal_openness: [0.81, 0.92],
             normal_squeeze: [0.11, 0.12],
-            // Shadow values are mapped to physical [L, R], so index 0 is
-            // mirror(LEFT) through the right head.
             openness: [0.88, 0.21],
             squeeze: [0.18, 0.31],
         };
@@ -1722,7 +1453,6 @@ mod merge_tests {
             ml_raw: [0.81, 0.92],
             ml5: [[0.91, 0.81, 0.0, 0.11, 0.0], [0.91, 0.92, 0.0, 0.12, 0.0]],
         };
-        // Shadow input is [mirror(RIGHT), mirror(LEFT)].
         let shadow = LegacyPublishFrame {
             ml_raw: [0.21, 0.88],
             ml5: [[0.91, 0.21, 0.0, 0.31, 0.0], [0.91, 0.88, 0.0, 0.18, 0.0]],
@@ -2122,11 +1852,9 @@ mod merge_tests {
         );
         assert!(dst.openness_valid);
 
-        // A gaze-only packet must not erase the last wearable state.
         merge_eye_sample(&mut dst, EyeSample::default());
         assert!(dst.openness_valid && dst.openness_reported);
 
-        // A wearable packet carrying Disable must replace the previous Enable.
         merge_eye_sample(
             &mut dst,
             EyeSample {
@@ -2154,8 +1882,6 @@ mod merge_tests {
         assert!(dst.gaze_valid && dst.gaze_reported);
         assert_eq!(dst.gaze, [0.2, -0.1, 0.97]);
 
-        // Wearable 1285 contributes pupil/openness only and must not disturb
-        // the canonical 1289 gaze state.
         merge_eye_sample(
             &mut dst,
             EyeSample {
@@ -2167,8 +1893,6 @@ mod merge_tests {
         assert!(dst.gaze_valid);
         assert_eq!(dst.gaze, [0.2, -0.1, 0.97]);
 
-        // A single 1289 invalid status is only a transient. Freshness aging in
-        // the emit thread clears it if no later valid sample arrives.
         merge_eye_sample(
             &mut dst,
             EyeSample {
@@ -2545,8 +2269,6 @@ mod merge_tests {
         let s=Snapshot {enabled:true,avatar:true,captured_at:Some(now),
             eyes:[EyePrediction {status:0,opening:Some(1.5),..Default::default()};2],..Default::default()};
         let mut out=[EyeResult::new(Eye::Left),EyeResult::new(Eye::Right)];
-        // A previous SRanipal calibration rejected Wide on both eyes. The native
-        // model must still work, while its output master and blink policy apply.
         let capability = eye_wide_capability(true, [false; 2]);
         s.apply_response(&mut out,now,ResponseSettings::default());
         apply_eye_wide_output_policy(&mut out,false,capability,false,true);
@@ -2698,8 +2420,6 @@ mod merge_tests {
                 if custom {
                     assert!(published[eye].final_openness > original[eye].final_openness);
                 }
-                // Compare every diagnostic field, including future additions, after
-                // removing the sole explicitly permitted final-output difference.
                 let mut unchanged = published[eye];
                 unchanged.final_openness = original[eye].final_openness;
                 assert_eq!(format!("{unchanged:?}"), format!("{:?}", original[eye]));
@@ -2742,7 +2462,6 @@ mod merge_tests {
         }
         assert!(results.iter().all(|eye| eye.brow_valid && eye.brow == 0.0));
 
-        // Exactly the reset performed under the model lock by set_brow.
         tele.reset_brow_model_sample();
         assert_eq!(*tele.brow_raw.lock().unwrap(), [0.0; 2]);
         assert_eq!(
@@ -2767,7 +2486,6 @@ mod merge_tests {
             assert_eq!(results[1].brow_valid, sample == 12);
         }
         assert_eq!([results[0].brow, results[1].brow], [0.0; 2]);
-        // The new model remains expressive after its own neutral is established.
         for _ in 0..120 {
             tele.publish_brow_model_sample([1.40, -1.00]);
             now += Duration::from_millis(9);
@@ -2954,24 +2672,16 @@ mod merge_tests {
 }
 
 const GAZE_VALID_GRACE: Duration = Duration::from_millis(150);
-/// Keep corrected gaze in the forward hemisphere.  The UI intentionally permits a
-/// fairly large range multiplier for users whose native XR5 calibration only spans a
-/// few degrees, but multiplying an already-large native angle must saturate rather
-/// than cross 90 degrees and make the avatar eye reverse direction.
 const GAZE_OUTPUT_ANGLE_LIMIT_DEG: f32 = 85.0;
 
 fn gaze_is_fresh(last_valid: Option<Instant>, now: Instant) -> bool {
     last_valid.is_some_and(|t| now.saturating_duration_since(t) <= GAZE_VALID_GRACE)
 }
 
-/// Convert a direction vector to yaw/pitch degrees. `None` rejects the zero/non-finite
-/// sentinel so correction can never turn missing gaze into a valid-looking direction.
 pub(crate) fn gaze_angles_deg(gaze: [f32; 3]) -> Option<[f32; 2]> {
     GazeEyelidProfile::gaze_angles_deg(gaze)
 }
 
-/// Apply angular centre/range/vergence correction while preserving a normalized 3-D
-/// direction. This operates after per-device handedness mapping and before every sink.
 pub(crate) fn apply_gaze_correction(gaze: &mut [f32; 3], eye: Eye, correction: GazeCorrection) {
     if !correction.enabled {
         return;
@@ -3017,8 +2727,6 @@ pub(crate) fn apply_gaze_correction(gaze: &mut [f32; 3], eye: Eye, correction: G
 }
 
 impl Pipeline {
-    /// Start the adapter and the ML + emit threads. `net` is `None` to run
-    /// without ML (gaze still flows; openness held at the neutral 0.5).
     pub fn run(
         adapter: Box<dyn HmdAdapter>,
         net: Option<EyeNet>,
@@ -3109,13 +2817,10 @@ impl Pipeline {
         let (mut net, brow) = if inference_enabled { (net, brow) } else { (None, None) };
         if !inference_enabled {
             wide = None;
-            sinks.clear(); // camera-only must not overwrite another app's avatar expressions
+            sinks.clear();
             #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
             { init.xr5_research = None; }
         }
-        // Defense in depth: Pipeline is public and the diagnostic CLI calls it directly.
-        // Even a stale/global config or future caller must never run XR5 image-Wide on
-        // another HMD, nor a Pimax gaze trim on StarVR, Varjo, or VPE.
         let is_xr5 = crate::config::canonical_device_key(&device_key) == "pimax_xr5";
         #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
         let native_output = init.xr5_research.as_ref().is_some_and(|s| is_xr5 && s.enabled && s.avatar);
@@ -3124,7 +2829,7 @@ impl Pipeline {
         if native_output {
             net = None;
             wide = None;
-            init.wide_source = WideSource::Sranipal; // unused legacy provider
+            init.wide_source = WideSource::Sranipal;
             init.wide_enabled = [true; 2];
         }
         if !is_xr5 {
@@ -3244,8 +2949,6 @@ impl Pipeline {
         };
         let brow_loaded = brow.is_some();
         let wide_loaded = wide.is_some();
-        // Brow lives behind a shared handle so a freshly trained model can be hot-swapped
-        // into the event-driven brow worker (see `set_brow`) without a device reconnect.
         let brow = Arc::new(Mutex::new(brow));
         let wide = Arc::new(Mutex::new(wide));
         #[cfg(feature = "external-eyelid-model")]
@@ -3282,17 +2985,11 @@ impl Pipeline {
             *tele.xr5_response.lock().unwrap() = settings.response.sanitized();
         }
 
-        // A one-slot notification coalesces camera callbacks while the brow worker is
-        // busy. The worker snapshots the newest stereo pair and additionally checks the
-        // generations, so duplicate callbacks never re-run inference on identical pixels.
         let (brow_frame_tx, brow_frame_rx) = mpsc::sync_channel::<()>(1);
 
-        // Adapter callbacks: apply per-unit mapping, then stash newest frame per eye.
         let t_cb = tele.clone();
         let (cb_swap, cb_flip) = (swap_eyes.clone(), flip_image.clone());
         let on_frame = Box::new(move |eye: Eye, w: u32, h: u32, px: &[u8]| {
-            // Research consumes untouched adapter camera pixels, before legacy
-            // stream swapping, image flipping, geometry and photometric filters.
             #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
             if raw_frames_needed && w==200 && h==200 && px.len()==40000 {
                 if let Ok(mut raw)=t_cb.xr5_raw_frames.lock() {
@@ -3306,8 +3003,6 @@ impl Pipeline {
                 eye
             };
             let sz = (w as usize) * (h as usize);
-            // Mirror per the ACTUAL frame width (not a hardcoded 200) so the flip is
-            // correct at any resolution.
             let stored = if cb_flip.load(Ordering::Relaxed) && px.len() >= sz {
                 mirror_h(&px[..sz], w as usize, h as usize)
             } else {
@@ -3319,8 +3014,6 @@ impl Pipeline {
             };
             let mut published = false;
             if let Ok(mut frames) = t_cb.frames.lock() {
-                // Publish the exact bytes and their generation together. The atomics
-                // remain the public rate counters, but capture code reads this field.
                 let generation = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 frames[eye.idx()] = Some(EyeFrame {
                     generation,
@@ -3332,8 +3025,6 @@ impl Pipeline {
             }
             if published {
                 t_cb.notify_image_frame();
-                // Never block the camera callback. A full queue already means the worker
-                // has been told that newer pixels exist and will snapshot the latest pair.
                 let _ = brow_frame_tx.try_send(());
             }
         });
@@ -3342,8 +3033,6 @@ impl Pipeline {
         let make_raw_callback = || raw_gaze_callback(
             raw_gaze_osc.clone(), swap_eyes.clone(), paused.clone(), stop.clone(), &device_key,
         );
-        // XR5 may choose fused gaze for the avatar. Its adapter supplies a
-        // distinct per-eye tap so that choice cannot replace this raw stream.
         #[cfg(feature = "external-eyelid-model")]
         if is_xr5 {
             let tap = tele.clone();
@@ -3375,8 +3064,6 @@ impl Pipeline {
             if !dedicated_raw && !gaze_model_enabled {
                 raw_callback(s);
             }
-            // A reversed Pimax unit swaps the complete L/R streams. Route image,
-            // auxiliary data and gaze identity from one source of truth.
             let s = route_eye_sample(s, eye_stream_swap.load(Ordering::Relaxed));
             let valid = [
                 s.left.gaze_reported && s.left.gaze_valid,
@@ -3460,17 +3147,9 @@ impl Pipeline {
                     *t.xr5_research.lock().unwrap()=state.clone();
                     thread::sleep(Duration::from_millis(2));
                 }
-                // Child process and all GPU descendants are terminated by Bridge.
             }));
         }
 
-        // Eyebrow worker: exactly one inference per newly advanced stereo camera pair.
-        //
-        // This deliberately does not share the eyelid thread's 16 ms polling cadence.
-        // The old standalone tracker only inferred when its frame object changed; doing
-        // the same here avoids duplicate inference and lets a 120 Hz camera drive brow at
-        // its natural rate (subject to inference cost). The bounded notification channel
-        // coalesces backlog instead of accumulating frames or memory.
         {
             let t_brow = tele.clone();
             let brow_stop = stop.clone();
@@ -3518,8 +3197,6 @@ impl Pipeline {
                     let left_input = input;
                     preprocess::brow_input(rp, rw as usize, rh as usize, true, &mut input);
 
-                    // Keep the model lock through publication too: set_brow must
-                    // clear every old sample before the replacement becomes live.
                     if let Ok(mut guard) = brow.lock() {
                         if let Some(model) = guard.as_mut() {
                             let prediction = [
@@ -3534,9 +3211,6 @@ impl Pipeline {
             }));
         }
 
-        // ML thread @ ~60Hz: newest stereo pair -> eye openness/squeeze + optional Wide.
-        // ALWAYS spawned so `set_wide` can hot-load a freshly trained model into a running
-        // pipeline with no reconnect.
         {
             let (t_ml, ms) = (tele.clone(), stop.clone());
             let (mml, mmr) = (ml_mirror_l.clone(), ml_mirror_r.clone());
@@ -3570,13 +3244,6 @@ impl Pipeline {
                         if l.len() >= (lw as usize) * (lh as usize)
                             && r.len() >= (rw as usize) * (rh as usize)
                         {
-                            // Eye net: ONE pass over both eyes (L in ch0, R in ch1), each
-                            // resized to 100x100. Outputs (RE'd 2026-06-26): s0=presence,
-                            // s1=L openness, s2=R openness, s3=L squeeze, s4=R squeeze.
-                            // Keep camera-only tools (reseat and eyebrow collection)
-                            // functional even when no eyelid weights are configured.
-                            // Without EyeNet there is no adaptive affine to describe,
-                            // so the coherent raw pair is published with identity.
                             if net.is_none()
                                 && source_generation[0] > last_calibration_generation[0]
                                 && source_generation[1] > last_calibration_generation[1]
@@ -3601,19 +3268,12 @@ impl Pipeline {
                             }
                             if let Some(net) = net.as_mut() {
                                 let geom = *mgeo.lock().unwrap();
-                                // Suppress specular spots (glasses / IR glints) BEFORE the
-                                // model — the heatmaps showed the net reads brightness as
-                                // "more open", so a reflection inflates/destabilizes openness.
                                 let dsp = *mdsp.lock().unwrap();
                                 let lf = preprocess::despeckle(&l, lw as usize, lh as usize, &dsp);
                                 let rf = preprocess::despeckle(&r, rw as usize, rh as usize, &dsp);
-                                // Illumination flatten (close-up shadow removal), after despeckle.
                                 let flt = *mflt.lock().unwrap();
                                 let lf = preprocess::flatten(&lf, lw as usize, lh as usize, &flt);
                                 let rf = preprocess::flatten(&rf, rw as usize, rh as usize, &flt);
-                                // Fixed manual brightness only. The old adaptive normalizer
-                                // intentionally stays out of the live path: it could chase a
-                                // changed wearing position and move eyelid behaviour over time.
                                 let aff = {
                                     let norm = mbn.lock().unwrap();
                                     let mut affine = [(1.0, 0.0); 2];
@@ -3630,10 +3290,6 @@ impl Pipeline {
                                         source_frames: source_frames.clone(),
                                     };
                                 }
-                                // Calibration consumers run on the UI thread, whose
-                                // presentation rate may be below 60 Hz. Publish every
-                                // coherent EyeNet source pair to a bounded Arc-backed
-                                // history before doing the more expensive forward pass.
                                 if source_generation[0] > last_calibration_generation[0]
                                     && source_generation[1] > last_calibration_generation[1]
                                 {
@@ -3660,9 +3316,6 @@ impl Pipeline {
                                 }
                                 let nlf = crate::ml::brightness::apply(&lf, aff[0].0, aff[0].1);
                                 let nrf = crate::ml::brightness::apply(&rf, aff[1].0, aff[1].1);
-                                // Fixed fit discovered from labelled train evidence and
-                                // accepted only on untouched holdout. Geometry remains
-                                // unchanged for frontal VR4/Varjo cameras.
                                 let photo = *mphoto.lock().unwrap();
                                 let (nlf, nrf) = if photo.enabled {
                                     (
@@ -3684,8 +3337,6 @@ impl Pipeline {
                                         ),
                                     )
                                 } else {
-                                    // Preserve the old path and allocation count exactly
-                                    // until a holdout-validated correction is enabled.
                                     (nlf, nrf)
                                 };
                                 let mirr =
@@ -3694,8 +3345,6 @@ impl Pipeline {
                                     &nlf, lw, lh, &nrf, rw, rh, mirr[0], mirr[1], &geom[0],
                                     &geom[1],
                                 );
-                                // Publish the exact net input for the dashboard's NET
-                                // view, un-mirrored back to natural orientation.
                                 if let Ok(mut mi) = t_ml.ml_input.lock() {
                                     let n = preprocess::DST;
                                     for e in 0..2 {
@@ -3712,18 +3361,12 @@ impl Pipeline {
                                         mi[e] = Some(px);
                                     }
                                 }
-                                // Preprocessing is defined to produce exactly CHW [2, 100, 100].
-                                // The old EyeNet path also relied on this invariant and would fail
-                                // rather than silently retaining a stale sample if it were broken.
                                 debug_assert_eq!(input.len(), EYELID_INPUT_LEN);
                                 let production_right_left =
                                     right_left_head.load(Ordering::Relaxed);
                                 let mut publish = None;
                                 let mut current_comparison = None;
                                 let mut inference_pending = false;
-                                // ch2 EyeWide needs mirror(LEFT) even when RIGHT
-                                // eyelid uses its original head. Eyelid selection
-                                // must not change Wide's model or neutral identity.
                                 let pair_ready = mirror_swap_canonical_stereo(&input, &mut head_ab_input);
                                 if pair_ready {
                                     let canonical = CanonicalStereoInput::try_from(input.as_slice())
@@ -3769,23 +3412,15 @@ impl Pipeline {
                                 let comparison_update = if !inference_pending {
                                     Some(current_comparison)
                                 } else {
-                                    // GPU work is still in flight. Keep ch2 EyeWide
-                                    // attached to the same retained eyelid sample,
-                                    // rather than temporarily switching back to ch1.
                                     None
                                 };
                                 t_ml.publish_eyelid_result(publish, comparison_update);
                                 if publish.is_none() && !inference_pending && !model_error_reported {
-                                    // Unreachable for the only Phase 1 backend. Do not invent
-                                    // zeroes for a missing capability or failed inference.
                                     eprintln!(
                                         "[ml] eyelid backend did not provide the required legacy frame; retaining the previous eyelid sample"
                                     );
                                     model_error_reported = true;
                                 }
-                                // On-demand occlusion heatmap: reuse this frame's input +
-                                // net. Blocks the ML loop ~2s (openness freezes) — a manual
-                                // one-shot diagnostic, so that's acceptable.
                                 if hm.req.swap(false, Ordering::Relaxed) {
                                     hm.computing.store(true, Ordering::Relaxed);
                                     let mode = crate::ml::heatmap::HeatMode::from_u8(
@@ -3802,9 +3437,6 @@ impl Pipeline {
                                     hm.computing.store(false, Ordering::Relaxed);
                                 }
                             }
-                            // Custom Dream Air/XR5 EyeWide model. It shares the TinyEyeNet
-                            // runtime with brow but uses a full-eye crop and its own task-tagged
-                            // weights. The legacy EyeWide path continues in parallel for A/B.
                             if let Ok(mut guard) = wide.lock() {
                                 if let Some(wide) = guard.as_mut() {
                                     preprocess::wide_input(
@@ -3838,7 +3470,6 @@ impl Pipeline {
             }));
         }
 
-        // Emit thread @ ~120Hz: post-process -> telemetry + sinks.
         let calibration_key = if native_output {
             format!("{}_image_model_{:08x}", device_key, eyelid_model_identity.map(|m| m.crc32).unwrap_or(0))
         } else { device_key.clone() };
@@ -3879,10 +3510,6 @@ impl Pipeline {
             let mut origin_seen = false;
             let mut state = SRanipalState::new();
             state.set_gaze_smoothing(init.gaze_smoothing);
-            // EyeWide uses the otherwise-discarded right EyeNet head for BOTH physical
-            // eyes. Keep its baseline/state independent from the ch1 eyelid state: the
-            // two heads have visibly different scales and only ch1 remains authoritative
-            // for openness, blinks and calibration persistence.
             let mut ch2_wide_state = SRanipalState::new();
             ch2_wide_state.set_gaze_smoothing(init.gaze_smoothing);
             ch2_wide_state.set_native_wide_response(native_output);
@@ -3900,11 +3527,6 @@ impl Pipeline {
             let mut wide_fresh_at = Instant::now() - Duration::from_secs(10);
             let period = Duration::from_micros(8333);
             let mut last = std::time::Instant::now();
-            // Persisted PER-HMD calibration: load this camera/model pair's baseline,
-            // blink depth, and mid-close anchor, then re-save periodically and on stop.
-            // Never import the ambiguous legacy shared file into a new device bucket.
-            // A disconnected/gaze-only recovery pipeline has no real openness evidence;
-            // it must never overwrite a valid calibration with the neutral placeholder.
             let persist_calibration = t_em.ml_loaded;
             if persist_calibration {
                 if let Some(store) = crate::core::eye_state::load_calib(&calib_path) {
@@ -3912,14 +3534,11 @@ impl Pipeline {
                 }
             }
             let mut since_save = 0u32;
-            // Diagnostic CSV recorder state (REC button; see Pipeline::diag_rec).
             let mut diag_file: Option<std::io::BufWriter<std::fs::File>> = None;
             let mut diag_t0 = std::time::Instant::now();
             while !es.load(Ordering::Relaxed) {
                 let reset = eyelid_reset_em.lock().unwrap().take();
                 if let Some(completion) = reset {
-                    // Discard old queued edits before rebuilding the reference. A
-                    // deferred apply must never resurrect the calibration being reset.
                     *manual_endpoint_edit_em.lock().unwrap() = None;
                     *guided_seed.lock().unwrap() = None;
                     *endpoint_seed.lock().unwrap() = None;
@@ -3952,18 +3571,12 @@ impl Pipeline {
                     since_save = 0;
                     let _ = completion.try_send(result);
                 }
-                // A cycle that took >=2x the target period means we missed one or
-                // more 120Hz slots — count the shortfall as real dropped frames.
                 let elapsed = last.elapsed();
                 last = std::time::Instant::now();
                 let missed = (elapsed.as_micros() / 8333).saturating_sub(1);
                 if missed > 0 {
                     t_em.c_drop.fetch_add(missed as u64, Ordering::Relaxed);
                 }
-                // Snapshot the master once so SRanipal post-processing and the final
-                // output policy agree for this whole frame.  With EyeWide output off,
-                // Wide must not attenuate squeeze through the optional chain before we
-                // zero the final Wide value.
                 let wide_master_enabled = wide_master.load(Ordering::Relaxed);
                 state.tuning = *t_tune.lock().unwrap();
                 if let Some((baseline, profile)) = manual_endpoint_edit_em.lock().unwrap().take() {
@@ -3982,9 +3595,6 @@ impl Pipeline {
                 if clear_wearing_correction {
                     recalled_response = None;
                 }
-                // Consume the command first: a reset arriving after the target
-                // snapshot must wait for the next fresh snapshot, not suppress
-                // an old profile that a concurrent UI update already replaced.
                 let did_wide_reset = wide_reset.swap(false, Ordering::Relaxed);
                 let wearing_target = *wearing_target_em
                     .lock()
@@ -4002,9 +3612,6 @@ impl Pipeline {
                     recalled_response = Some(blended);
                     blended
                 } else if let Some(current) = recalled_response {
-                    // Losing or replacing a visual match must not make the avatar's
-                    // response jump. Return to the user's base sliders with the same
-                    // gentle slew used when a remembered profile is selected.
                     let blended = blend_response_profile(current, base_response, 0.012);
                     if response_profiles_near(blended, base_response) {
                         recalled_response = None;
@@ -4016,7 +3623,6 @@ impl Pipeline {
                 } else {
                     base_response
                 };
-                // Only recovered endpoints slew. Unrelated controls remain live.
                 response.wide_start = base_response.wide_start;
                 response.wide_full = base_response.wide_full;
                 response.squeeze_start = base_response.squeeze_start;
@@ -4026,8 +3632,6 @@ impl Pipeline {
                 response.blink_close_ms = base_response.blink_close_ms;
                 response.snap_gate_open = base_response.snap_gate_open;
                 if clear_wearing_correction {
-                    // Captures and direct slider edits must observe the uncorrected
-                    // coordinate system, not a slowly fading remembered state.
                     state.clear_appearance_profile();
                     ch2_wide_state.clear_appearance_profile();
                 } else {
@@ -4048,19 +3652,9 @@ impl Pipeline {
                     response.curve_mid_output,
                     response.blink_close_ms,
                     response.snap_gate_open,
-                    // Wearing Memory supersedes the older baseline-only auto-reseat.
-                    // Keeping both active would let two recovery systems fight over
-                    // the same relaxed-open coordinate.
                     false,
                 );
                 apply_eye_wide_master_to_tuning(&mut state.tuning, wide_master_enabled);
-                // Apply exclusivity once, after the active Wide provider and the new
-                // visual ranges are resolved. Direct SRanipalState users retain the
-                // legacy in-core behaviour; the app avoids double attenuation here.
-                // The former dashboard WIDE/SQUEEZE switch was an experimental
-                // mutual attenuator, not an output master. Native squeeze is now
-                // closed-eye gated, so the two expressions are already structurally
-                // exclusive. Ignore legacy persisted `true` values in the app path.
                 let expression_exclusive = false;
                 state.tuning.wide_squeeze_exclusive = false;
                 ch2_wide_state.tuning = state.tuning;
@@ -4100,7 +3694,7 @@ impl Pipeline {
                 if did_recenter {
                     state.recenter();
                     ch2_wide_state.recenter();
-                    brow_state.recenter(); // re-baseline the brow neutral too
+                    brow_state.recenter();
                 } else {
                     if eye_recenter_mask & 0b01 != 0 {
                         state.recenter_eye(Eye::Left);
@@ -4144,11 +3738,6 @@ impl Pipeline {
                     &active_wink,
                     &active_blink_timing,
                 ) };
-                // The left EyeNet head (ch1/ch3) remains authoritative for BOTH
-                // physical eyelids. EyeWide deliberately uses the right head for
-                // BOTH eyes: shadow ch2/ch4 for LEFT, normal ch2/ch4 for RIGHT.
-                // The heads get independent baselines because their numerical scales
-                // differ substantially on real SRanipal weights.
                 let mut sranipal_wide = [results[0].wide, results[1].wide];
                 let mut sranipal_wide_diag = None;
                 if let Some(comparison) = comparison {
@@ -4157,8 +3746,6 @@ impl Pipeline {
                     sranipal_wide = [wide_results[0].wide, wide_results[1].wide];
                     sranipal_wide_diag = Some(ch2_wide_state.eyelid_live_diag());
 
-                    // ch1 owns closure truth. Never let a large or noisy ch2 value
-                    // leak EyeWide through a blink, wink, lost eye, or untrusted lid.
                     if results
                         .iter()
                         .any(|result| result.blink || !result.openness_valid)
@@ -4169,8 +3756,6 @@ impl Pipeline {
                     results[1].wide = sranipal_wide[1];
                 }
                 if native_active {
-                    // Same openness scalar, never the experimental independent
-                    // readout or SRanipal's other head. Keep normal Wide-neutral controls.
                     let wide_results = ch2_wide_state.process_frame_with_model_evidence(
                         m5, &lid_sample, true, &GazeEyelidProfile::default(),
                         &WinkProfile::default(), &BlinkTimingProfile::default(),
@@ -4184,9 +3769,6 @@ impl Pipeline {
                     *value = sranipal_wide;
                 }
 
-                // Always calculate Custom Wide in parallel when a model is loaded, even
-                // while SRanipal remains selected. This gives us same-frame A/B telemetry
-                // before the user entrusts VRCFT output to the new model.
                 let mut custom = [None, None];
                 let mut custom_fresh = false;
                 if t_em.wide_loaded.load(Ordering::Relaxed) {
@@ -4232,14 +3814,9 @@ impl Pipeline {
                     results[0].wide = custom[0].unwrap_or(0.0);
                     results[1].wide = custom[1].unwrap_or(0.0);
                 } else if !native_active && selected_wide_source == WideSource::Custom {
-                    // Strict selection never silently falls back to SRanipal. During the
-                    // short neutral bootstrap (or a stale model) it emits a safe zero.
                     results[0].wide = 0.0;
                     results[1].wide = 0.0;
                 }
-                // External XR5 aperture owns eyelids and Wide before the shared
-                // output policy. Never overwrite its final output after master/range
-                // processing or gate a valid image on native Tobii gaze validity.
                 let mut xr5_recovery_diag = [-1.0f64; 10];
                 #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
                 if native_active {
@@ -4256,9 +3833,6 @@ impl Pipeline {
                         core_open[0] as f64, core_open[1] as f64, modes[0] as f64, modes[1] as f64,
                     ];
                 }
-                // Final output policy: the guided XR5 result is a per-eye capability,
-                // while the global master is the user's avatar-level preference on every
-                // HMD. Neither stops raw SRanipal/Custom calculation or A/B diagnostics.
                 let capability = eye_wide_capability(native_active, *wide_on.lock().unwrap());
                 let custom_output_active = apply_eye_wide_output_policy(
                     &mut results,
@@ -4278,10 +3852,6 @@ impl Pipeline {
                 if let Ok(mut live) = t_em.expression_live.lock() {
                     *live = expression_live;
                 }
-                // Brow: time-based EMA + baseline of the brow worker's raw output, per eye.
-                // `is_new` advances the EMA once per inference (not per 120Hz tick); the
-                // result is None until the first open inference, so we never emit a
-                // baseline derived from the zero placeholder.
                 let brow_sample = *t_em.brow_sample.lock().unwrap();
                 let brow_enabled =
                     brow_on.load(Ordering::Relaxed) && t_em.brow_loaded.load(Ordering::Relaxed);
@@ -4296,11 +3866,7 @@ impl Pipeline {
                 if brow_enabled {
                     apply_brow_lr_sync(&mut results, state.tuning.brow_lr_sync);
                 }
-                // Per-device gaze handedness: negate X so left/right isn't mirrored.
-                // Applied here so telemetry AND all sinks see the same corrected gaze.
                 apply_gaze_x_handedness(&mut results, fgx.load(Ordering::Relaxed));
-                // Model rays already have a declared HMD coordinate system. They
-                // replace native gaze AFTER native handedness/yoking, never eyelids.
                 #[cfg(feature = "external-eyelid-model")]
                 if gaze_model_enabled {
                     let model = t_em.xr5_gaze.lock().unwrap().clone();
@@ -4309,7 +3875,6 @@ impl Pipeline {
                         let native = t_em.xr5_native_anchor.lock().unwrap();
                         let (selected, status) = hybrid.apply(&model, &native, now, fgx.load(Ordering::Relaxed));
                         drop(native);
-                        // Short bounded diagnostic, no eye images or per-frame disk writes.
                         let tick = hybrid_log_start.elapsed().as_secs() / 5;
                         if tick > hybrid_log_tick && tick <= 36 {
                             hybrid_log_tick = tick;
@@ -4361,10 +3926,6 @@ impl Pipeline {
                 }
                 if let Ok(mut live) = t_em.eyelid_live.lock() {
                     let mut published = final_eyelid_live_diag(state.eyelid_live_diag(), &results);
-                    // Openness remains ch1-owned, but the combined visual rail's
-                    // Wide boundary must come from the independent ch2 state that
-                    // actually drives SRanipal EyeWide. This also makes a freshly
-                    // learned Set Wide neutral threshold visible immediately.
                     if let Some(wide_diag) = sranipal_wide_diag {
                         for eye in 0..2 {
                             published[eye].wide_entry_ref = wide_diag[eye].wide_entry_ref;
@@ -4376,9 +3937,6 @@ impl Pipeline {
                 if let Ok(mut calibration) = t_em.calibration.lock() {
                     *calibration = Some(state.snapshot_all());
                 }
-                // Diagnostic recorder: raw ml values next to every post-processing
-                // internal, one CSV row per emit frame, so a mis-correction can be
-                // diagnosed offline from a short recorded session.
                 if edr.load(Ordering::Relaxed) {
                     use std::io::Write;
                     if diag_file.is_none() {
@@ -4477,9 +4035,6 @@ impl Pipeline {
                             d.ep_exit[0] as u8,
                             d.ep_exit[1] as u8,
                             d.pend_w,
-                            // Gaze diagnostics: device-in vs emitted-out + yoke state
-                            // (the emitted gaze has flip_gaze_x already applied above,
-                            // matching exactly what the sinks send).
                             g.left.gaze[0],
                             g.left.gaze[1],
                             g.right.gaze[0],
@@ -4536,12 +4091,7 @@ impl Pipeline {
                 }
                 thread::sleep(period);
             }
-            // The UI may publish a validated endpoint immediately before stop.
-            // Drain once after leaving the emit loop so the final checkpoint cannot
-            // overwrite that update with the pre-apply state.
             drain_endpoint_apply(endpoint_seed.as_ref(), &mut state);
-            // A click followed immediately by Reload/Close still has to clear the
-            // saved baseline. Reset takes precedence over the old endpoint queue.
             if let Some(completion) = eyelid_reset_em.lock().unwrap().take() {
                 let result = reset_eyelid_calibration_checkpoint(&mut state, &calib_path);
                 let _ = completion.try_send(result);
@@ -4607,13 +4157,6 @@ impl Pipeline {
         })
     }
 
-    /// Hot-swap the eyebrow model into the LIVE pipeline with no device reconnect. Pass
-    /// `Some(net)` to load a freshly trained model (e.g. right after B-2 train+bake) or
-    /// `None` to drop brow output. The event-driven brow worker picks it up on the next
-    /// camera notification, and `brow_loaded` flips so the emit thread + UI react.
-    ///
-    /// Brow output is gated by the common eyelid result (EyeNet or the native model),
-    /// including its blink and validity flags, rather than by an EyeNet-only signal.
     pub fn set_brow(&self, net: Option<BrowNet>) {
         if !self.inference_enabled { return; }
         let loaded = net.is_some();
@@ -4624,12 +4167,10 @@ impl Pipeline {
         }
     }
 
-    /// Change this independent UDP output without restarting tracking or models.
     pub fn set_raw_gaze_osc(&self, port: Option<u16>) -> io::Result<()> {
         if self.stop.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Tracking is stopped"));
         }
-        // Bind before taking the callback's lock; failure leaves the old feed intact.
         let sender = port.map(|port| {
             crate::raw_gaze_osc::RawGazeOsc::new(port)
                 .map(|sender| sender.with_gaze_smoothing(self.raw_gaze_osc_smoothing))
@@ -4655,8 +4196,6 @@ impl Pipeline {
         { false }
     }
 
-    /// Selected, untrimmed gaze in the same handedness as avatar correction.
-    /// Center capture must never use native Tobii when model gaze is selected.
     pub fn gaze_center_sample(&self) -> GazeSample {
         #[cfg(feature = "external-eyelid-model")]
         if self.model_gaze_active() {
@@ -4664,7 +4203,6 @@ impl Pipeline {
             let mut eyes = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
             snapshot.apply(&mut eyes, Instant::now(), false);
             let mut sample = snapshot.raw_sample(&eyes);
-            // Used only as a de-duplication identity by Center, not a clock.
             sample.timestamp_us = snapshot.count;
             return sample;
         }
@@ -4676,9 +4214,6 @@ impl Pipeline {
         sample
     }
 
-    /// Switch the physical right eyelid to the mirrored LEFT EyeNet head without
-    /// rebuilding the camera pipeline. A changed raw coordinate invalidates only the
-    /// right relaxed-open baseline, so request a one-eye recenter on the emit thread.
     pub fn set_right_eye_left_head(&self, enabled: bool) -> bool {
         let previous = self.right_eye_left_head.swap(enabled, Ordering::Relaxed);
         if previous != enabled {
@@ -4693,16 +4228,10 @@ impl Pipeline {
         self.right_eye_left_head.load(Ordering::Relaxed)
     }
 
-    /// Relearn only EyeWide's relaxed neutral coordinate. Unlike the main Recenter,
-    /// this leaves eyelid openness, blink/wink endpoints, brow neutral and gaze state
-    /// untouched. Both the SRanipal right-head route and an optional XR5 custom Wide
-    /// provider consume the request on the next emit frame.
     pub fn recenter_wide_neutral(&self) {
         self.wide_recenter.store(true, Ordering::Relaxed);
     }
 
-    /// Restore the complete eyelid reference, not just the open-baseline learner.
-    /// The UI commits default per-HMD settings and pauses memory matching first.
     pub fn reset_eyelid_calibration(&self) -> mpsc::Receiver<Result<(), String>> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let mut pending = self.eyelid_reset.lock().unwrap();
@@ -4727,8 +4256,6 @@ impl Pipeline {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = target;
     }
 
-    /// Release a recalled response immediately so direct manipulation of the visual
-    /// endpoint controls cannot be overwritten by an earlier appearance match.
     pub fn clear_wearing_calibration_target_immediately(&self) {
         self.set_wearing_calibration_target(None);
         self.wearing_response_reset.store(true, Ordering::Release);
@@ -4754,9 +4281,6 @@ impl Pipeline {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Select the XR5 EyeWide provider without restarting the camera or output pipeline.
-    /// Auto/Custom require a loaded model; callers get a recoverable error instead of
-    /// leaving an unstartable setting behind.
     pub fn set_wide_source(&self, requested: WideSource) -> Result<(), &'static str> {
         if self.uses_xr5_native_eyelids() {
             return Err("EyeWide follows the XR5 eyelid model");
@@ -4783,8 +4307,6 @@ impl Pipeline {
         self.xr5_native_output
     }
 
-    /// Hot-swap the custom XR5 EyeWide model. The next ML iteration starts producing
-    /// A/B telemetry; source selection still follows `[hmd].wide_source` after reload.
     pub fn set_wide(&self, net: Option<WideNet>) {
         if !self.inference_enabled { return; }
         if self.uses_xr5_native_eyelids() && net.is_some() {
@@ -4813,13 +4335,10 @@ impl Pipeline {
         self.wide_recenter.store(true, Ordering::Relaxed);
     }
 
-    /// Stop all threads and the adapter.
     pub fn stop(&mut self) {
         self.take_shutdown()();
     }
 
-    /// Transfer only lifecycle ownership. Shared UI handles stay usable, but the
-    /// old pipeline cannot be restarted. Join/device waits run on the caller's worker.
     pub fn take_shutdown(&mut self) -> impl FnOnce() + Send + 'static {
         self.stop.store(true, Ordering::Relaxed);
         if let Ok(mut output) = self.raw_gaze_osc.lock() {

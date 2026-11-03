@@ -1,13 +1,3 @@
-//! Loopback-only OSC output for native, pre-avatar gaze samples.
-//!
-//! This protocol deliberately carries the two eyes independently.  It does not
-//! apply avatar gaze strength, angular clamps, yoking, or synthesize a missing
-//! eye. VR4 may opt into the avatar's legacy adaptive EMA; it runs once per native
-//! gaze callback, independently per eye. The final OSC `h` argument is a counter, not
-//! the device timestamp; both eye messages from one gaze callback share it.
-//! The opt-in XR5 research provider instead supplies freshness-checked model rays
-//! before avatar trim. Native callbacks are disconnected from this publisher in
-//! that mode. Unknown native openness remains -1; invalid rays stay invalid.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -24,13 +14,9 @@ const UNKNOWN_OPENNESS: f32 = -1.0;
 const OSC_TAGS: &str = ",fffifh";
 const MAX_PACKET_LEN: usize = 64;
 
-/// Native tracker coordinate convention to convert into the wire convention:
-/// +X right, +Y up, and -Z forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RawGazeAxes {
-    /// Tobii wearable gaze is +X left, +Y up, +Z forward.
     Tobii,
-    /// Varjo gaze (not its matrix convention) is +X right, +Y up, +Z forward.
     Varjo,
 }
 
@@ -50,11 +36,6 @@ struct CachedOpenness {
     observed_at: Instant,
 }
 
-/// Best-effort native gaze publisher with a fixed loopback destination.
-///
-/// The socket is deliberately unconnected: on Windows this prevents an ICMP
-/// "port unreachable" response from poisoning later UDP sends.  It is also
-/// nonblocking, so a missing receiver cannot stall a camera callback.
 pub struct RawGazeOsc {
     socket: UdpSocket,
     destination: SocketAddrV4,
@@ -93,16 +74,11 @@ impl RawGazeOsc {
         self
     }
 
-    /// A physical L/R routing change invalidates all values cached under
-    /// the previous eye identities. It must not reset the gaze pair counter.
     pub fn clear_eye_history(&mut self) {
         self.openness = [None, None];
         self.gaze_history = [INITIAL_GAZE; 2];
     }
 
-    /// Consume one adapter callback. Auxiliary-only callbacks refresh native
-    /// openness but produce no packets. A gaze callback always attempts both
-    /// eye datagrams, even if the first send fails.
     pub fn on_sample(&mut self, sample: GazeSample, axes: RawGazeAxes) -> io::Result<()> {
         self.on_sample_at(sample, axes, Instant::now())
     }
@@ -162,8 +138,6 @@ impl RawGazeOsc {
     }
 
     fn smooth_eye(&mut self, index: usize, mut eye: EyeSample) -> EyeSample {
-        // A loss/auxiliary packet must remain invalid and never poison history.
-        // Smooth before normalization, exactly as in the avatar post-processor.
         if self.gaze_smoothing && valid_gaze_length(&eye).is_some() {
             eye.gaze = adaptive_gaze_step(self.gaze_history[index], eye.gaze);
             self.gaze_history[index] = eye.gaze;
@@ -642,9 +616,6 @@ mod tests {
             ..GazeSample::default()
         };
 
-        // Warm up the platform socket path and drain both datagrams before the
-        // measured callback. The allocator counter is per-thread, so kernel and
-        // receiver activity cannot be attributed to the sender hot path.
         sender.on_sample(sample, RawGazeAxes::Tobii).unwrap();
         let mut packet = [0_u8; MAX_PACKET_LEN];
         receiver.recv(&mut packet).unwrap();

@@ -1,14 +1,14 @@
-/* Test-only PSVR2Toolkit-shaped CAPI. Never package this with SRanibro.
- * It generates SYNTHETIC frames/gaze, not hardware or tracking evidence.
- *
- * Build on Linux:
- *   cc -std=c11 -O2 -fPIC -shared mock_psvr2_capi.c -o /tmp/sranibro-mock-capi.so
- * Select explicitly, and opt in:
- *   SRANIBRO_PSVR2_MOCK=1 PSVR2_TOOLKIT_CAPI=/tmp/sranibro-mock-capi.so ...
- *
- * The guard deliberately prevents accidental use in a normal app session.
- * No SDK, Tobii, SteamVR, or upstream implementation is embedded here.
- */
+
+
+
+
+
+
+
+
+
+
+
 #define _POSIX_C_SOURCE 200809L
 #include <stdbool.h>
 #include <stddef.h>

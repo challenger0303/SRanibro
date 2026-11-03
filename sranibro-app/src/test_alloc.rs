@@ -1,4 +1,3 @@
-//! Test-only per-thread allocation counter.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -59,8 +58,6 @@ impl Drop for DisableOnDrop {
 }
 
 pub(crate) fn count_current_thread_allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    // Initialize both TLS cells before enabling the counter, so their initialization can
-    // never be mistaken for an allocation performed by the measured closure.
     ENABLED.with(|enabled| {
         assert!(
             !enabled.get(),

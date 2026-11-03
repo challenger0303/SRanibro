@@ -1,4 +1,4 @@
-"""Explicit isolated research runtime. Existing app and FrozenModel stay unchanged."""
+""
 from pathlib import Path
 import hashlib,importlib.util,json,threading,time,sys
 ROOT=Path(__file__).resolve().parent;GOAL=ROOT.parent

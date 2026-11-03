@@ -1,4 +1,3 @@
-//! Explicit boundary for the non-public direct EyeChip access implementation.
 pub(crate) fn direct_access_available() -> bool { false }
 pub(crate) fn unavailable() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Unsupported,

@@ -1,9 +1,3 @@
-//! Explicit per-eye open/closed endpoint fitting.
-//!
-//! The pose instruction is the label. EyeNet is replayed only to measure the raw
-//! coordinate produced for that labelled pose; its output never chooses or changes
-//! a label. Train blocks propose endpoints and untouched holdout blocks decide
-//! whether each eye may be applied.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -25,13 +19,6 @@ const HOLDOUT_MIN: usize = 15;
 const MIN_CLOSE_SPAN: f32 = 0.05;
 const MIN_FIT_BLOCKS: usize = 2;
 const MIN_VALIDATION_BLOCKS: usize = 1;
-// The master recorder holds fit poses for 3.6 s and validation poses for 2.6 s.
-// Score the final stable second exactly as the UI promises. The former 3.0/2.0
-// cutoffs left only 0.6 s (about 12--14 frames at 20 Hz) while requiring 15,
-// causing otherwise perfect captures to fail on an impossible quota.
-/// Score the settled tail relative to each block's actual last captured timestamp.
-/// Capture producers may use different countdown/settle layouts, so an absolute
-/// "seconds since phase start" threshold is not a portable protocol boundary.
 const STATIC_TAIL_S: f32 = 1.25;
 
 #[derive(Debug)]
@@ -256,8 +243,6 @@ pub struct EndpointApply {
 #[derive(Debug)]
 pub struct EndpointApplyRequest {
     pub eyes: [Option<EndpointApply>; 2],
-    /// Per-eye removal of an existing explicit fit. Reset takes precedence over
-    /// `eyes` and restarts adaptive endpoint learning from stock bounds.
     pub reset_to_adaptive: [bool; 2],
 }
 
@@ -340,8 +325,6 @@ impl EndpointFitter {
             .spawn(move || {
                 #[cfg(windows)]
                 unsafe {
-                    // Model replay is background calibration work; keep the live
-                    // camera, inference, output, and compositor threads responsive.
                     let thread = windows_sys::Win32::System::Threading::GetCurrentThread();
                     let _ = windows_sys::Win32::System::Threading::SetThreadPriority(
                         thread,
@@ -1021,8 +1004,6 @@ mod tests {
             geometry_sample(SampleKind::GazeSweep, 3, 9.0),
             geometry_sample(SampleKind::Closed, 4, f32::NAN),
         ];
-        // Fit tail starts at 2.75; validation tail starts at 0.95. The two
-        // protocols can therefore have different absolute phase durations.
         assert_eq!(scored_endpoint_indices(&samples), vec![2, 3, 6, 7]);
     }
 

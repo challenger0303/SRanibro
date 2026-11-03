@@ -1,23 +1,11 @@
-//! Configuration + asset validation (`sranibro.toml`).
-//!
-//! Reviewable source builds contain no proprietary payload. Users point them at
-//! their SRanipal install and Tobii runtime. Official private builds may provide a
-//! materialized Tobii runtime through [`crate::bundled_tobii`]; the DLL bytes and
-//! materializer are intentionally absent from the published source. This module
-//! and validates the referenced paths *gracefully*: a missing asset is reported
-//! (with the feature it gates) rather than crashing, so the UI can show exactly
-//! what to add — the opposite of VRCFT's "it just doesn't work" opacity.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// ML weights location inside a SRanipal install directory.
 pub const MODEL_REL: &str = "model/EyePrediction/00-0000.params_opencl.params";
 
-/// Windows installs vary in capitalization. Resolve those known model components
-/// on case-sensitive filesystems as well, without recursively searching the disk.
 pub fn model_path_in(root: &Path) -> PathBuf {
     let direct = root.join(MODEL_REL);
     if direct.is_file() || !cfg!(target_os = "linux") {
@@ -50,15 +38,10 @@ pub fn model_path_in(root: &Path) -> PathBuf {
     path
 }
 
-/// True for the separately distributed beta that is intentionally limited to
-/// the read-only PSVR2Toolkit acquisition path.
 pub const PSVR2_ONLY_BUILD: bool = cfg!(feature = "psvr2-only");
 
-/// True for the separately built Dream Air / XR5 variant. The implementation is
-/// preserved for later work but is intentionally not part of the normal build.
 pub const XR5_ONLY_BUILD: bool = cfg!(feature = "xr5-only");
 
-/// Keep single-HMD variants isolated from a user's normal multi-HMD settings.
 pub const fn config_file_name() -> &'static str {
     if PSVR2_ONLY_BUILD {
         "sranibro-psvr2.toml"
@@ -71,37 +54,21 @@ pub const fn config_file_name() -> &'static str {
     }
 }
 
-/// Trim a config string option; an empty/whitespace value (a cleared UI field) counts
-/// as unset. Shared by the asset-path resolvers.
 fn nonempty(o: &Option<String>) -> Option<String> {
     o.as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// Directory that holds `sranibro.toml` + calibration, resolved INDEPENDENTLY of the
-/// current working directory (which is `System32`/home when launched from a shortcut,
-/// not the exe folder — the #1 distribution bug). Portable mode wins: if a
-/// `sranibro.toml` already sits next to the exe, use that folder; otherwise the
-/// per-user `%APPDATA%\SRanibro` (always writable, even under Program Files / non-admin).
-///
-/// Resolved ONCE and cached: every call within a process returns the SAME dir, so the
-/// UI's saves, calibration, and logs can't drift to a different folder if files
-/// appear/disappear during the run.
 pub fn base_dir() -> PathBuf {
     static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     CACHE.get_or_init(resolve_base_dir).clone()
 }
 
-/// True if `dir` exists (created if needed) AND is actually WRITABLE — a real probe,
-/// because an existing dir (e.g. a read-only Program Files install) passes
-/// `create_dir_all` yet rejects writes.
 fn dir_writable(dir: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    // Per-process probe name (avoids colliding with a concurrent instance), and write a
-    // real byte so a full-disk/quota condition is actually detected.
     let probe = dir.join(format!(".sranibro_wtest_{}", std::process::id()));
     let ok = std::fs::write(&probe, b"x").is_ok();
     let _ = std::fs::remove_file(&probe);
@@ -109,8 +76,6 @@ fn dir_writable(dir: &Path) -> bool {
 }
 
 fn resolve_base_dir() -> PathBuf {
-    // Portable: a config sitting next to the exe wins — but only if that dir is
-    // actually writable (else a read-only Program Files install would break saves).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             if dir.join(config_file_name()).is_file() && dir_writable(dir) {
@@ -118,8 +83,6 @@ fn resolve_base_dir() -> PathBuf {
             }
         }
     }
-    // Per-user, always-writable (even under Program Files / non-admin): roaming/local
-    // app-data, then TEMP — each accepted only if a write probe succeeds.
     #[cfg(target_os = "linux")]
     {
         for base in linux_config_candidates(
@@ -145,8 +108,6 @@ fn resolve_base_dir() -> PathBuf {
     if dir_writable(&tmp) {
         return tmp;
     }
-    // Final fallback: the exe dir if writable, else the ABSOLUTE current dir (resolved
-    // now and cached, so it can't change meaning if CWD later moves).
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
@@ -160,7 +121,6 @@ fn resolve_base_dir() -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn linux_config_candidates(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
-    // The XDG specification requires absolute paths; ignore empty/relative values.
     xdg.filter(|path| path.is_absolute())
         .into_iter()
         .chain(
@@ -170,22 +130,14 @@ fn linux_config_candidates(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Vec<P
         .collect()
 }
 
-/// Resolved path to `sranibro.toml` (see [`base_dir`]).
 pub fn config_path() -> PathBuf {
     base_dir().join(config_file_name())
 }
 
-/// Legacy pre-0.1.5 calibration path. New runtime code must use
-/// [`calib_path_for`] so learned camera-specific bounds cannot cross HMDs.
 pub fn calib_path() -> PathBuf {
     base_dir().join("sranibro_calib.toml")
 }
 
-/// Resolved path to the persisted eyelid calibration for one canonical HMD.
-///
-/// The old single file mixed XR5 crop/model statistics with VR4, StarVR, and Varjo.
-/// Do not auto-import that ambiguous file: every HMD safely learns a fresh calibration
-/// once, then keeps its own baseline, blink depth, and mid-close anchor thereafter.
 pub fn calib_path_for(device: &str) -> PathBuf {
     let canonical = canonical_device_key(device);
     let safe: String = canonical
@@ -215,62 +167,30 @@ pub struct Config {
     pub hmd: Hmd,
     pub output: Output,
     pub ui: Ui,
-    /// Persisted post-processing tuning (the calibration sliders).
     pub tuning: crate::core::eye_state::Tuning,
-    /// Runtime-only barrier: never overwrite a config that could not be read or
-    /// preserved. A successful reload creates a fresh Config and clears it.
     #[serde(skip)]
     save_blocked_reason: Option<String>,
 }
 
-/// User-supplied asset paths. All optional — absent means "not configured yet".
-/// Nothing here ships with SRanibro; the user points us at assets they own (e.g.
-/// from the separate Discord asset pack), and can edit every path live in the UI.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Assets {
-    /// Direct path to the EyePrediction weights file (the eye-tracking "recognition"
-    /// model). Takes precedence over `sranipal_dir` — lets the user ship just the
-    /// one `.params` file instead of a whole SRanipal install.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ml_model: Option<String>,
-    /// SRanipal install dir; ML weights are read from `<dir>/MODEL_REL` (used only
-    /// when `ml_model` is unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sranipal_dir: Option<String>,
-    /// Varjo SDK client DLL (`VarjoLib.dll`), for `device = "varjo"` (native eye
-    /// cameras). Optional: if unset, it is auto-detected from a Varjo Base install
-    /// (see [`Config::varjo_lib_path`]). NOT bundled with SRanibro — it ships with
-    /// Varjo Base. Without it (and without Varjo Base), use `device = "varjo_mjpeg"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub varjo_lib: Option<String>,
-    /// Optional eyebrow model: a `BROWNET1` weights file baked from the user's own
-    /// calibrated TinyBrowNet (see tools/bake_brow_weights.py). Per-user/per-HMD, NOT
-    /// bundled. When set, SRanibro infers brow expression from eye-shape and emits the
-    /// FT-v2 Brow* OSC params. Absent = no brow output (eye tracking unaffected).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brow_model: Option<String>,
-    /// Optional Dream Air/XR5 image-based EyeWide model. The model is trained from
-    /// guided, user-labelled eye-camera frames and never uses SRanipal's EyeWide as
-    /// its teacher. Missing = keep the legacy SRanipal-derived EyeWide path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wide_model: Option<String>,
-    /// Python interpreter (a user-supplied venv with torch) used to run the OFFLINE
-    /// eyebrow training + bake subprocess (B-2). NOT bundled — SRanibro never ships a
-    /// Python runtime; the user points us at e.g. `<vr_eyebrow>/venv_cpu/Scripts/python.exe`.
-    /// Absent = the "Train & bake" action is disabled (capture still works).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub python_exe: Option<String>,
-    /// The user's `vr_eyebrow` project directory — the folder holding `train.py`,
-    /// `dataset.py`, and `model.py`. Training runs with this as the working dir (train.py
-    /// imports dataset/model by name). NOT bundled. Absent = "Train & bake" disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vr_eyebrow_dir: Option<String>,
 }
 
-/// Standard install locations of `VarjoLib.dll` inside a Varjo Base install, probed
-/// (in order) when `[assets].varjo_lib` is unset. The DLL ships with Varjo Base, so a
-/// Varjo user already has it — we never bundle it.
 fn varjo_lib_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut push = |base: PathBuf| {
@@ -288,16 +208,12 @@ fn varjo_lib_candidates() -> Vec<PathBuf> {
             }
         }
     }
-    // Literal fallback for the common default if the env vars are missing.
     out.push(PathBuf::from(
         r"C:\Program Files\Varjo\varjo-compositor\VarjoLib.dll",
     ));
     out
 }
 
-/// Default eyebrow models distributed beside the application. `eyebrow.bin` is the
-/// public package name; the legacy `brow.bin` spellings remain accepted so older ZIPs
-/// and developer layouts continue to work.
 fn bundled_brow_model_path_in(exe_dir: &Path) -> Option<PathBuf> {
     [
         exe_dir.join("eyebrow.bin"),
@@ -316,51 +232,29 @@ fn bundled_brow_model_path() -> Option<PathBuf> {
         .and_then(|dir| bundled_brow_model_path_in(&dir))
 }
 
-/// Per-device eye-image / gaze orientation. The eye cameras and gaze handedness are
-/// wired differently on each supported HMD, so this is stored *per device* (see
-/// [`Hmd::mappings`]) and applied automatically when the device is selected — e.g. the
-/// Pimax / Tobii stream-engine path needs the gaze X flipped, the Varjo path does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EyeMapping {
-    /// Swap the complete left/right eye streams for units wired the other way
-    /// round: images, eyelid/pupil/origin data, and per-eye gaze channels.
     pub swap_eyes: bool,
-    /// Horizontally mirror each eye image (mirrored optics).
     pub flip_image: bool,
-    /// Legacy compatibility for the short-lived split gaze-routing setting.
-    /// `mapping_for` folds `Some(true)` into `swap_eyes` and clears this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap_gaze_eyes: Option<bool>,
-    /// Negate gaze X (left/right). Mirrored on the Tobii stream-engine / pimax path,
-    /// not on Varjo — flip if the avatar looks the opposite way left/right.
     pub flip_gaze_x: bool,
-    /// Mirror ONE eye's image into the ML only (experiment to steady L/R handedness).
     pub ml_mirror_l: bool,
     pub ml_mirror_r: bool,
 }
 
-/// Per-eye gaze trim applied after the HMD's native calibration. This is deliberately
-/// a small Pimax finishing correction: Pimax/Tobii calibration still establishes the
-/// real optical model, while these values remove the remaining centre/vergence and
-/// range mismatch without touching eye-camera ML or eyelid processing.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GazeCorrection {
     pub enabled: bool,
-    /// Per-eye angular centre trim in degrees, `[left, right]`.
     pub offset_x_deg: [f32; 2],
     pub offset_y_deg: [f32; 2],
-    /// Per-eye angular range multiplier, `[left, right]`.
     pub scale_x: [f32; 2],
     pub scale_y: [f32; 2],
-    /// Total opposite horizontal separation in degrees. Half is applied to each eye.
     pub vergence_deg: f32,
 }
 
-/// Per-headset result of the guided Dream Air / XR5 onboarding flow.  The
-/// schema version lets future builds reject or migrate measurements instead of
-/// silently treating an old profile as current.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DreamAirProfile {
@@ -407,41 +301,21 @@ impl Default for GazeCorrection {
     }
 }
 
-/// Per-HMD controls for the final eyelid response.
-///
-/// The normal path stores a reversible, baseline-relative visual range. Recorded
-/// endpoints remain available as a compatibility/research path when `manual_range`
-/// is disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EyelidResponseProfile {
     pub schema_version: u32,
-    /// Use direct, baseline-relative 100% and 0% points instead of recorded endpoints.
-    /// This offset follows a recentered/session-corrected relaxed-open baseline, so a
-    /// small wearing-position shift does not leave the avatar partly closed at rest.
     pub manual_range: bool,
-    /// Raw-model distance below the relaxed-open baseline that maps to 100% open.
     pub open_point_offset: [f32; 2],
-    /// Raw-model distance below the calibrated relaxed-open baseline that maps to 0%.
-    /// Session-only wearing-position recovery deliberately does not move this point.
     pub closed_point_depth: [f32; 2],
-    /// Input EyeWide level that begins producing avatar EyeWide.
     pub wide_start: [f32; 2],
-    /// Input EyeWide level that maps to 100% avatar EyeWide.
     pub wide_full: [f32; 2],
-    /// Input EyeSquint level that begins producing avatar EyeSquint.
     pub squeeze_start: [f32; 2],
-    /// Input EyeSquint level that maps to 100% avatar EyeSquint.
     pub squeeze_full: [f32; 2],
-    /// Multiplier applied to each eye's calibrated open-to-closed depth.
     pub close_depth_scale: [f32; 2],
-    /// Desired output at the calibrated response midpoint, per eye.
     pub curve_mid_output: [f32; 2],
-    /// Minimum time used to slew from open to fully closed. Zero is legacy instant close.
     pub blink_close_ms: f32,
-    /// Openness below which a pending native-disable blink may snap fully closed.
     pub snap_gate_open: f32,
-    /// Allow a session-only baseline offset to follow a stable bilateral HMD reseat.
     pub auto_reseat: bool,
 }
 
@@ -450,12 +324,8 @@ impl Default for EyelidResponseProfile {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             manual_range: true,
-            // These match the proven local VR4 setup while remaining relative to each
-            // eye's live relaxed-open baseline. The visual editor makes both explicit.
             open_point_offset: [0.03; 2],
             closed_point_depth: [0.40; 2],
-            // Identity ranges preserve the established Wide/Squeeze response until the
-            // user moves a visual handle.
             wide_start: [0.0; 2],
             wide_full: [1.0; 2],
             squeeze_start: [0.0; 2],
@@ -490,11 +360,6 @@ impl EyelidResponseProfile {
     pub const SNAP_GATE_OPEN_MIN: f32 = 0.15;
     pub const SNAP_GATE_OPEN_MAX: f32 = 1.0;
 
-    /// Return a current, finite, range-bounded profile safe for the runtime.
-    ///
-    /// A schema mismatch resets the whole profile because a future schema may assign
-    /// different meanings to these fields. Non-finite current-schema values fall back
-    /// individually, while finite out-of-range values are clamped.
     pub fn sanitized(mut self) -> Self {
         if self.schema_version != Self::SCHEMA_VERSION {
             return Self::default();
@@ -530,9 +395,6 @@ impl EyelidResponseProfile {
                     Self::EXPRESSION_FULL_MIN,
                     Self::EXPRESSION_FULL_MAX,
                 );
-                // The 100% handle is the user's intended saturation point. If a
-                // malformed/hand-edited file crosses the handles, retain that point
-                // and pull START back far enough to restore a usable range.
                 *start = (*start).min(*full - Self::MIN_EXPRESSION_RANGE);
             }
             self.close_depth_scale[eye] = sanitize_profile_scalar(
@@ -618,9 +480,6 @@ fn sanitize_profile_scalar(value: f32, default: f32, min: f32, max: f32) -> f32 
     }
 }
 
-/// Stable key used by all per-device settings. Adapter names use hyphens while the UI
-/// uses underscores, and `auto` resolves to an adapter only after device sniffing. Keep
-/// those spellings from silently creating separate calibration buckets.
 pub fn canonical_device_key(device: &str) -> String {
     match device.trim().to_lowercase().replace(' ', "_").as_str() {
         "pimax-xr5" | "pimax_xr5" | "xr5" | "dream-air" | "dream_air" | "dreamair" => {
@@ -639,9 +498,6 @@ pub fn canonical_device_key(device: &str) -> String {
     }
 }
 
-/// True for native Pimax/Tobii paths whose gaze can use SRanibro's final centre,
-/// range, and vergence trim. The correction remains stored per device so VR4 and XR5
-/// never inherit one another's optical adjustment.
 pub fn supports_gaze_correction(device: &str) -> bool {
     matches!(
         canonical_device_key(device).as_str(),
@@ -649,8 +505,6 @@ pub fn supports_gaze_correction(device: &str) -> bool {
     )
 }
 
-/// Production-safe automatic photometric fitting currently targets frontal Hotmirror
-/// inputs. XR5 continues to use its separate geometry research path.
 pub fn supports_photometric_fit(device: &str) -> bool {
     matches!(
         canonical_device_key(device).as_str(),
@@ -658,8 +512,6 @@ pub fn supports_photometric_fit(device: &str) -> bool {
     )
 }
 
-/// Resolve the per-device key after an adapter has been constructed. Explicit device
-/// selections keep their transport distinction; only `auto` follows the sniffed adapter.
 pub fn running_device_key(configured: &str, adapter_name: &str) -> String {
     if canonical_device_key(configured) == "auto" {
         canonical_device_key(adapter_name)
@@ -679,8 +531,6 @@ fn device_entry<'a, T>(map: &'a BTreeMap<String, T>, device: &str) -> Option<&'a
     })
 }
 
-/// Remove every spelling of one per-device entry, including aliases written by
-/// older releases (for example `xr5` before the canonical `pimax_xr5` key).
 fn remove_device_entry<T>(map: &mut BTreeMap<String, T>, device: &str) -> bool {
     let key = canonical_device_key(device);
     let before = map.len();
@@ -688,9 +538,6 @@ fn remove_device_entry<T>(map: &mut BTreeMap<String, T>, device: &str) -> bool {
     map.len() != before
 }
 
-/// Built-in mapping for one device. Complete eye-stream swapping is a per-unit
-/// hardware variant and therefore defaults off; horizontal gaze handedness is a
-/// driver-path property.
 pub fn default_eye_mapping(device: &str) -> EyeMapping {
     let key = canonical_device_key(device);
     let is_varjo = matches!(key.as_str(), "varjo" | "varjo_mjpeg");
@@ -707,8 +554,6 @@ fn normalize_eye_mapping(mut mapping: EyeMapping) -> EyeMapping {
     mapping
 }
 
-/// Fixed Dream Air/XR5 reconstruction found by evaluating the original SRanipal EyeNet
-/// on labeled 200x200 XR5 captures. Other HMDs retain the byte-identical identity path.
 pub fn default_ml_geometry(device: &str) -> [crate::core::types::MlGeometry; 2] {
     use crate::core::types::MlGeometry;
     if canonical_device_key(device) != "pimax_xr5" {
@@ -729,18 +574,12 @@ pub fn default_ml_geometry(device: &str) -> [crate::core::types::MlGeometry; 2] 
             crop_bottom: 0.15,
             scale_y: 1.20,
             rotate_deg: 30.0,
-            // Dream Air/XR5 cameras face in opposite anatomical directions. The
-            // SRanipal EyeNet expects a shared handedness, so the right mirror is part
-            // of the same preset as its crop/rotation, not a separable mapping default.
             mirror_h: Some(true),
             ..MlGeometry::default()
         },
     ]
 }
 
-/// Source of EyeWide. `Sranipal` is the compatibility default. `Auto` uses the
-/// custom model only on XR5 when it loaded and is producing fresh finite values;
-/// `Custom` is strict and refuses to start without a valid XR5 model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WideSource {
@@ -762,10 +601,6 @@ impl WideSource {
     }
 }
 
-/// Native gaze direction source used by Dream Air / XR5. `PerEye` preserves the
-/// existing behaviour. `Combined` uses the EyeChip's own fused column-5 vector for
-/// both output eyes; it is deliberately opt-in because it trades dynamic vergence
-/// for a steadier signal and takes effect only when the device stream is restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GazeSource {
@@ -783,9 +618,6 @@ impl GazeSource {
     }
 }
 
-/// Crystal / Crystal Super's independent per-eye TTP provider. The UI's 40/30
-/// degree names describe the observed radial ranges, not a software gain/clamp.
-/// This is separate from XR5's per-eye/combined choice. Fixed per connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Vr4GazeSource {
@@ -813,31 +645,14 @@ impl Vr4GazeSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hmd {
-    /// "auto" (sniff EyeChip serial → VR4/XR5) | "pimax_vr4" | "pimax_xr5" |
-    /// "pimax_dll" | "starvr" | "varjo" | "psvr2" | …
     pub device: String,
-    /// `device = "varjo_mjpeg"`: the "Varjo Eye Streamer" MJPEG-over-HTTP endpoints for the
-    /// left/right eye cameras. (`device = "varjo"` uses the native VarjoLib SDK instead.)
     pub varjo_left_url: String,
     pub varjo_right_url: String,
-    /// Preferred XR5 EyeWide provider. This preference is retained while another HMD is
-    /// selected, but [`Config::wide_source_for`] forces every non-XR5 runtime to SRanipal.
     pub wide_source: WideSource,
-    /// Internal StarVR transport choice. `false` keeps the Tobii broker running;
-    /// `true` frees the EyeChip and connects through the stream-engine DLL directly.
-    /// SRanibro probes the other route after a connection failure and persists the
-    /// route that succeeds. This is intentionally not exposed as another UI toggle.
     pub starvr_direct: bool,
-    /// Only the direct Pimax VR4 adapter consumes this setting. Both avatar gaze
-    /// and the dedicated native Gaze OSC tap follow this provider after reload.
     pub vr4_gaze_source: Vr4GazeSource,
-    /// Use the existing adaptive gaze EMA for both VR4 avatar gaze and Gaze OSC.
-    /// Other headsets retain their existing output policies.
     pub vr4_gaze_smoothing: bool,
 
-    // --- Legacy single-mapping fields (pre per-device map). Still read from old configs
-    // and migrated into `mappings` on load (see `migrate_legacy_mapping`); never written
-    // back, so a re-saved config carries only the per-device map.
     #[serde(default, skip_serializing)]
     pub swap_eyes: bool,
     #[serde(default, skip_serializing)]
@@ -849,95 +664,54 @@ pub struct Hmd {
     #[serde(default, skip_serializing)]
     pub ml_mirror_r: bool,
 
-    /// Per-device eye mapping (swap / flip / gaze / ml-mirror), keyed by the `device`
-    /// string. Switching devices swaps in that device's mapping; missing entries fall
-    /// back to [`default_eye_mapping`]. Editing the mapping in Settings writes the entry
-    /// for the *running* device, so each HMD remembers its own orientation. Declared LAST
-    /// so TOML emits all the scalar `[hmd]` keys before this `[hmd.mappings.*]` sub-table.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub mappings: BTreeMap<String, EyeMapping>,
 
-    /// Per-device ML-input geometry (crop / stretch / rotation of the image fed to the
-    /// eye model), keyed by the `device` string. A missing entry uses the built-in HMD
-    /// preset (identity except for Dream Air/XR5). Edited live in the Calibration tab;
-    /// declared LAST so TOML emits the scalar `[hmd]` keys and `[hmd.mappings.*]` before
-    /// `[hmd.geometry.*]`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub geometry: BTreeMap<String, crate::core::types::MlGeometry>,
 
-    /// Per-device RIGHT-eye ML-input geometry. `geometry` holds the LEFT eye and
-    /// doubles as the legacy shared value: configs saved before per-eye tuning
-    /// have only `geometry`, which then applies to both eyes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub geometry_r: BTreeMap<String, crate::core::types::MlGeometry>,
 
-    /// Per-device specular-dot suppression for the ML input (bright IR / glasses
-    /// reflection removal). A missing entry = default (enabled). Declared last.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub despeckle: BTreeMap<String, crate::core::types::DespeckleParams>,
 
-    /// Per-device fixed manual brightness for the ML input. Legacy adaptive fields remain
-    /// deserializable but are cleared by `brightness_for` / `set_brightness`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub brightness: BTreeMap<String, crate::core::types::BrightnessNorm>,
 
-    /// Per-device illumination flatten (close-up shadow removal) for the ML input.
-    /// Missing entry = default (disabled).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub flatten: BTreeMap<String, crate::core::types::FlattenParams>,
 
-    /// Fixed post-adaptive photometric correction selected by a labelled recording fit.
-    /// Stored per HMD so different cameras/users never share affine or illumination fields.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub photometric_correction: BTreeMap<String, crate::core::types::PhotometricCorrection>,
 
-    /// Per-device native-gaze finishing correction. The product UI currently exposes
-    /// this only for Dream Air/XR5, but keeping the key explicit prevents it leaking to
-    /// another HMD when the user switches devices.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub gaze_correction: BTreeMap<String, GazeCorrection>,
 
-    /// Holdout-validated, gaze-dependent correction of the eyelid model's raw openness.
-    /// This is deliberately separate from `gaze_correction`: it never changes the gaze
-    /// sent to an avatar and is valid for any HMD that supplies native gaze plus images.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gaze_eyelid_profiles: BTreeMap<String, crate::core::types::GazeEyelidProfile>,
 
-    /// Per-eye held-wink response, separate from bilateral open/closed endpoints.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub wink_profiles: BTreeMap<String, crate::core::types::WinkProfile>,
 
-    /// Confirmed bilateral natural-blink bottom visibility, per HMD.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub blink_timing_profiles: BTreeMap<String, crate::core::types::BlinkTimingProfile>,
 
-    /// Reversible final-response controls, stored per HMD so endpoint depth, response
-    /// curve, close timing, and session-only reseat behavior never cross devices.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub eyelid_response_profiles: BTreeMap<String, EyelidResponseProfile>,
 
-    /// Per-HMD compatibility route for asymmetric legacy EyeNet heads. Missing entries
-    /// default to enabled; an explicit `false` restores the original right head.
-    /// When enabled, the physical RIGHT eye is mirrored into the model's LEFT input
-    /// channel and its openness/squeeze are read from the LEFT output head. The normal
-    /// left eye, gaze, camera identity, Wide, and brow paths remain unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub right_eye_left_head: BTreeMap<String, bool>,
 
-    /// Dream Air / XR5 gaze provider, stored per device so an experimental combined
-    /// mode can never leak into VR4, StarVR, or Varjo. Missing = today's per-eye path.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gaze_source: BTreeMap<String, GazeSource>,
 
-    /// Explicit research gaze provider for XR5 only; no effect on other HMDs.
     pub xr5_model_gaze: bool,
-    /// Experimental stationary native anchor; never enabled by migration.
     pub xr5_gaze_hybrid: bool,
     pub xr5_gaze_package: PathBuf,
     pub xr5_model_gaze_correction: GazeCorrection,
     pub xr5_hybrid_gaze_correction: GazeCorrection,
 
-    /// Guided calibration results keyed by the canonical HMD/device name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dream_air_profiles: BTreeMap<String, DreamAirProfile>,
 }
@@ -945,8 +719,6 @@ pub struct Hmd {
 impl Default for Hmd {
     fn default() -> Self {
         Self {
-            // "auto": sniff the EyeChip serial to pick VR4 vs XR5 (Pimax-only). A fresh
-            // user gets auto-detection; explicit values still override.
             device: "auto".into(),
             varjo_left_url: "http://localhost:8080".into(),
             varjo_right_url: "http://localhost:8081".into(),
@@ -988,27 +760,15 @@ impl Default for Hmd {
 pub struct Output {
     pub brokeneye: bool,
     pub brokeneye_port: u16,
-    /// Live VRCFT-module openness moving-average window. 0/1 = pass-through.
     pub vrcft_filter_samples: u8,
-    /// Reproduce native SRanipal's eye-expression-to-brow mapping inside the bundled
-    /// eye-only VRCFT module. Sent live over the local TCP stream.
     pub vrcft_sranipal_brow_link: bool,
     pub osc: bool,
-    /// VRChat's built-in eye tracking OSC, independent of avatar-specific parameters.
-    /// It supports gaze and a shared blink value, not independent winks or Wide.
     pub vrchat_eye_osc: bool,
-    /// Send only the eight FT/v2 eyebrow parameters directly to VRChat OSC.
-    /// This is independent from `osc`, which sends the complete eye/gaze set;
-    /// it lets VRCFT remain the eye source while SRanibro supplies eyebrows.
     pub eyebrow_osc: bool,
     pub osc_host: String,
     pub osc_port: u16,
-    /// Independent, unscaled gaze feed for local capture/overlay tools.
-    /// VR4 follows its selected provider and optional gaze EMA.
-    /// Never sent to the avatar OSC destination; always IPv4 loopback.
     pub raw_gaze_osc: bool,
     pub raw_gaze_osc_port: u16,
-    /// Optional loopback-only HTTP/MJPEG eye-camera preview.
     pub eye_image_http: bool,
     pub eye_image_host: String,
     pub eye_image_port: u16,
@@ -1038,35 +798,16 @@ impl Default for Output {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ui {
-    /// Camera/gaze acquisition and image streaming continue when local ML is off.
     pub inference_enabled: bool,
     pub steamvr_overlay: bool,
-    /// Dashboard-only live eye-camera preview. This is off by default because
-    /// converting and uploading two live textures can contend with a VR compositor.
-    /// Camera acquisition, inference, recordings, and HTTP image output are unaffected.
     pub eye_camera_preview: bool,
-    /// Distinct prepare/start/holdout/complete/error sounds for every
-    /// calibration/diagnostic recording workflow.
     pub recording_audio_cues: bool,
-    /// Match only explicitly confirmed eye-image appearances and recall their
-    /// open/closed/Wide references. Disabling keeps saved profiles on disk but
-    /// releases any active correction immediately.
     pub wearing_memory_enabled: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub wearing_memory_devices: BTreeMap<String, bool>,
-    /// Global EyeWide output master. This is intentionally not per-HMD: EyeWide is an
-    /// avatar/output preference, so switching headsets must not silently re-enable it.
-    /// Inference and diagnostics remain live while output is disabled.
     pub eye_wide_enabled: bool,
-    /// Master switch for eyebrow inference/output. The model stays loaded while this is
-    /// off so tracking can be resumed instantly without reconnecting the HMD.
     pub eyebrow_enabled: bool,
-    /// Shared SRanipal/native-XR5 execution preference. GPU failure falls back to CPU.
-    /// Legacy `Auto` settings now resolve to GPU-first in the live pipeline.
     pub eyelid_inference_backend: EyelidInferenceBackend,
-    /// Editor-only L/R linking choice per HMD. This is not part of a recalled
-    /// response profile: loading a Wearing Memory must not change editing mode.
-    /// Missing entries retain the legacy initial inference from equal endpoints.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub eyelid_response_links: BTreeMap<String, bool>,
 }
@@ -1115,15 +856,12 @@ impl Default for Ui {
     }
 }
 
-/// One validated asset and what it gates.
 #[derive(Debug, Clone)]
 pub struct AssetStatus {
     pub label: &'static str,
     pub path: Option<PathBuf>,
     pub present: bool,
-    /// Whether the engine cannot run its core (ML) without this.
     pub required: bool,
-    /// Human-readable note: what works / breaks depending on presence.
     pub gates: String,
 }
 
@@ -1147,9 +885,6 @@ impl Config {
         self.ui.eyelid_response_links.insert(key, linked);
     }
 
-    /// Load from a TOML file. A missing file yields defaults. A malformed file is
-    /// moved aside before defaults are returned, so a later UI save can never
-    /// destroy the user's only copy. If preservation fails, saves are blocked.
     pub fn load(path: &Path) -> (Config, Option<String>) {
         let (mut cfg, warning) = match std::fs::read_to_string(path) {
             Ok(text) => match toml::from_str::<Config>(&text) {
@@ -1203,9 +938,6 @@ impl Config {
         (cfg, warning)
     }
 
-    /// Enforce invariants that distinguish a separately distributed build from
-    /// preferences stored on disk. This is deliberately applied after loading and
-    /// before saving so a copied normal config cannot escape its build's path.
     fn enforce_build_variant(&mut self) {
         if PSVR2_ONLY_BUILD {
             self.hmd.device = "psvr2".to_string();
@@ -1215,30 +947,20 @@ impl Config {
         }
     }
 
-    /// Resolved eye mapping for `device`: the user's saved per-device entry, else the
-    /// built-in [`default_eye_mapping`] preset (Pimax flips gaze X, Varjo does not).
     pub fn mapping_for(&self, device: &str) -> EyeMapping {
         let preset = default_eye_mapping(device);
         let mapping = device_entry(&self.hmd.mappings, device)
             .copied()
             .unwrap_or(preset);
-        // The split gaze-only switch existed briefly in an unreleased build. A
-        // true value meant the user had identified a swapped unit, so promote it
-        // to the coherent whole-stream switch. Never preserve a half-swapped state.
         normalize_eye_mapping(mapping)
     }
 
-    /// Store the eye mapping for `device` (called when the user edits the toggles for the
-    /// currently-running device, so each HMD remembers its own orientation).
     pub fn set_mapping(&mut self, device: &str, m: EyeMapping) {
         self.hmd
             .mappings
             .insert(canonical_device_key(device), normalize_eye_mapping(m));
     }
 
-    /// Effective EyeWide provider for the running HMD. The saved selector is an XR5
-    /// preference, never a global override: VR4, StarVR, Varjo, and VPE always keep the
-    /// established SRanipal-derived Wide path even when XR5 was last set to Custom/Auto.
     pub fn wide_source_for(&self, device: &str) -> WideSource {
         if canonical_device_key(device) == "pimax_xr5" {
             self.hmd.wide_source
@@ -1247,10 +969,6 @@ impl Config {
         }
     }
 
-    /// Resolved PER-EYE ML-input geometry for `device` as `[left, right]`: the saved
-    /// entries, else the built-in device preset. The right eye falls back to the LEFT
-    /// entry so configs saved before per-eye tuning keep applying their single geometry
-    /// to both eyes.
     pub fn geometry_for(&self, device: &str) -> [crate::core::types::MlGeometry; 2] {
         let preset = default_ml_geometry(device);
         let saved_l = device_entry(&self.hmd.geometry, device).copied();
@@ -1258,8 +976,6 @@ impl Config {
         let mut r = device_entry(&self.hmd.geometry_r, device)
             .copied()
             .unwrap_or_else(|| if saved_l.is_some() { l } else { preset[1] });
-        // Old geometry tables predate `mirror_h`; inherit the per-device preset instead
-        // of treating serde's missing field as an explicit `false` override.
         if l.mirror_h.is_none() {
             l.mirror_h = preset[0].mirror_h;
         }
@@ -1269,42 +985,32 @@ impl Config {
         [l, r]
     }
 
-    /// Store the per-eye ML-input geometry `[left, right]` for `device` (edited live
-    /// in the gear modal, so each HMD remembers its own crop/stretch/angle per eye).
     pub fn set_geometry(&mut self, device: &str, g: [crate::core::types::MlGeometry; 2]) {
         let key = canonical_device_key(device);
         self.hmd.geometry.insert(key.clone(), g[0]);
         self.hmd.geometry_r.insert(key, g[1]);
     }
 
-    /// Whether this HMD has saved geometry instead of using its built-in preset.
     pub fn has_geometry_override(&self, device: &str) -> bool {
         device_entry(&self.hmd.geometry, device).is_some()
             || device_entry(&self.hmd.geometry_r, device).is_some()
     }
 
-    /// Remove saved geometry for one HMD. The next resolved value is the built-in
-    /// preset (the validated XR5 preset, or identity on frontal cameras).
     pub fn clear_geometry(&mut self, device: &str) -> bool {
         remove_device_entry(&mut self.hmd.geometry, device)
             | remove_device_entry(&mut self.hmd.geometry_r, device)
     }
 
-    /// Resolved specular-dot suppression for `device` (saved per-device entry, else the
-    /// default = enabled). Applied to the eye frames before the ML.
     pub fn despeckle_for(&self, device: &str) -> crate::core::types::DespeckleParams {
         device_entry(&self.hmd.despeckle, device)
             .copied()
             .unwrap_or_default()
     }
 
-    /// Store the specular-dot suppression params for `device`.
     pub fn set_despeckle(&mut self, device: &str, d: crate::core::types::DespeckleParams) {
         self.hmd.despeckle.insert(canonical_device_key(device), d);
     }
 
-    /// Resolved fixed manual brightness for `device`. Legacy adaptive fields remain
-    /// readable for config compatibility, but are always disabled before reaching runtime.
     pub fn brightness_for(&self, device: &str) -> crate::core::types::BrightnessNorm {
         let mut brightness = device_entry(&self.hmd.brightness, device)
             .copied()
@@ -1315,8 +1021,6 @@ impl Config {
         brightness
     }
 
-    /// Store fixed manual brightness. Clear old adaptive state so saved configs also state
-    /// exactly what the current application does.
     pub fn set_brightness(&mut self, device: &str, mut b: crate::core::types::BrightnessNorm) {
         b.enabled = false;
         b.auto_learn = false;
@@ -1324,14 +1028,12 @@ impl Config {
         self.hmd.brightness.insert(canonical_device_key(device), b);
     }
 
-    /// Resolved illumination-flatten params for `device` (saved entry, else default = off).
     pub fn flatten_for(&self, device: &str) -> crate::core::types::FlattenParams {
         device_entry(&self.hmd.flatten, device)
             .copied()
             .unwrap_or_default()
     }
 
-    /// Store the illumination-flatten params for `device`.
     pub fn set_flatten(&mut self, device: &str, f: crate::core::types::FlattenParams) {
         self.hmd.flatten.insert(canonical_device_key(device), f);
     }
@@ -1363,14 +1065,12 @@ impl Config {
         remove_device_entry(&mut self.hmd.photometric_correction, device)
     }
 
-    /// Resolved native-gaze finishing correction for `device`.
     pub fn gaze_correction_for(&self, device: &str) -> GazeCorrection {
         device_entry(&self.hmd.gaze_correction, device)
             .copied()
             .unwrap_or_default()
     }
 
-    /// Store the native-gaze finishing correction for `device`.
     pub fn set_gaze_correction(&mut self, device: &str, correction: GazeCorrection) {
         self.hmd
             .gaze_correction
@@ -1432,8 +1132,6 @@ impl Config {
             .insert(canonical_device_key(device), profile);
     }
 
-    /// Remove only the fitted blink timing while preserving an explicit master
-    /// disable. A missing entry resolves to the built-in enabled 42 ms policy.
     pub fn clear_blink_timing_calibration(
         &mut self,
         device: &str,
@@ -1450,9 +1148,6 @@ impl Config {
         profile
     }
 
-    /// Resolved final eyelid-response controls for `device`.
-    /// Directly loaded values are sanitized here so hand-edited configs are safe;
-    /// an incompatible schema falls back to the legacy-preserving default.
     pub fn eyelid_response_profile_for(&self, device: &str) -> EyelidResponseProfile {
         device_entry(&self.hmd.eyelid_response_profiles, device)
             .copied()
@@ -1460,14 +1155,10 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Whether any saved spelling of this HMD has a response profile.
-    /// Schema-incompatible entries still count so an older build never overwrites a
-    /// future profile while migrating the legacy global `tuning.blink_close_ms` value.
     pub fn has_eyelid_response_profile(&self, device: &str) -> bool {
         device_entry(&self.hmd.eyelid_response_profiles, device).is_some()
     }
 
-    /// Store finite, bounded response controls under the canonical HMD key.
     pub fn set_eyelid_response_profile(&mut self, device: &str, profile: EyelidResponseProfile) {
         let key = canonical_device_key(device);
         remove_device_entry(&mut self.hmd.eyelid_response_profiles, &key);
@@ -1476,13 +1167,10 @@ impl Config {
             .insert(key, profile.sanitized());
     }
 
-    /// Remove every legacy/canonical spelling of one HMD's response profile.
     pub fn clear_eyelid_response_profile(&mut self, device: &str) -> bool {
         remove_device_entry(&mut self.hmd.eyelid_response_profiles, device)
     }
 
-    /// Reset one headset's eyelid response and dependent fitted corrections.
-    /// Images, gaze calibration, models, other HMDs and saved wearing states stay intact.
     pub fn reset_eyelid_calibration_for(&mut self, device: &str) {
         self.set_eyelid_response_profile(device, EyelidResponseProfile::default());
         self.clear_gaze_eyelid_profile(device);
@@ -1490,8 +1178,6 @@ impl Config {
         remove_device_entry(&mut self.hmd.blink_timing_profiles, device);
     }
 
-    /// Whether the physical right eye uses the mirrored LEFT EyeNet head for this HMD.
-    /// Missing entries use the validated default (enabled).
     pub fn right_eye_left_head_for(&self, device: &str) -> bool {
         device_entry(&self.hmd.right_eye_left_head, device)
             .copied()
@@ -1504,8 +1190,6 @@ impl Config {
         self.hmd.right_eye_left_head.insert(key, enabled);
     }
 
-    /// Resolved native gaze provider for `device`. Missing entries are intentionally
-    /// per-eye so existing configs remain byte-for-byte compatible at runtime.
     pub fn gaze_source_for(&self, device: &str) -> GazeSource {
         device_entry(&self.hmd.gaze_source, device)
             .copied()
@@ -1518,8 +1202,6 @@ impl Config {
             .insert(canonical_device_key(device), source);
     }
 
-    /// Guided Dream Air profile for a device, if that device has completed the
-    /// onboarding flow with a compatible schema.
     pub fn dream_air_profile_for(&self, device: &str) -> Option<&DreamAirProfile> {
         device_entry(&self.hmd.dream_air_profiles, device)
             .filter(|profile| profile.schema_version == 1)
@@ -1531,9 +1213,6 @@ impl Config {
             .insert(canonical_device_key(device), profile);
     }
 
-    /// Move settings saved by older builds under the literal `auto` bucket to the HMD
-    /// selected by the current serial sniff. A device-specific entry already present at
-    /// the destination wins. Returns true when any stale `auto` entry was consumed.
     pub fn migrate_auto_device_settings(&mut self, resolved_device: &str) -> bool {
         let target = canonical_device_key(resolved_device);
         if target == "auto" {
@@ -1546,9 +1225,6 @@ impl Config {
                 .filter(|key| canonical_device_key(key) == "auto")
                 .cloned()
                 .collect();
-            // A destination saved by an older build may itself use an alias such as
-            // `xr5`. Treat it as authoritative instead of creating a conflicting
-            // canonical entry whose value would depend on the caller's spelling.
             let mut target_exists = map.keys().any(|key| canonical_device_key(key) == target);
             let mut changed = false;
             for key in stale {
@@ -1583,10 +1259,6 @@ impl Config {
         changed
     }
 
-    /// One-time migration from the old single global mapping (`[hmd].flip_gaze_x` etc.)
-    /// to the per-device map: if no per-device entries exist yet and the legacy fields
-    /// were customized, seed the active device's entry from them. An all-default legacy
-    /// block (or a fresh template) is left empty so `mapping_for` uses the built-in preset.
     fn migrate_legacy_mapping(&mut self) {
         if !self.hmd.mappings.is_empty() {
             return;
@@ -1605,8 +1277,6 @@ impl Config {
         }
     }
 
-    /// Resolved ML weights path: a direct `ml_model` file if set, else
-    /// `<sranipal_dir>/MODEL_REL`. Empty strings (cleared UI fields) count as unset.
     pub fn ml_params_path(&self) -> Option<PathBuf> {
         let nonempty = |o: &Option<String>| {
             o.as_ref()
@@ -1619,7 +1289,6 @@ impl Config {
         nonempty(&self.assets.sranipal_dir).map(|d| model_path_in(Path::new(&d)))
     }
 
-    /// Runtime materialized internally by an official build.
     pub fn tobii_runtime_path(&self) -> Option<PathBuf> {
         if PSVR2_ONLY_BUILD {
             None
@@ -1628,9 +1297,6 @@ impl Config {
         }
     }
 
-    /// StarVR needs a runtime that has been validated for both image and wearable
-    /// subscriptions. Official builds can provide it independently of the general
-    /// Pimax authorization/runtime payload; source builds contain neither.
     pub fn starvr_runtime_path(&self) -> Option<PathBuf> {
         if PSVR2_ONLY_BUILD {
             None
@@ -1639,9 +1305,6 @@ impl Config {
         }
     }
 
-    /// Resolved `VarjoLib.dll` path for the native Varjo path (`device = "varjo"`):
-    /// an explicit `[assets].varjo_lib` if set, else the first auto-detected Varjo
-    /// Base copy (see [`varjo_lib_candidates`]). `None` if neither is present.
     pub fn varjo_lib_path(&self) -> Option<PathBuf> {
         let nonempty = |o: &Option<String>| {
             o.as_ref()
@@ -1654,10 +1317,6 @@ impl Config {
         varjo_lib_candidates().into_iter().find(|p| p.is_file())
     }
 
-    /// Resolved eyebrow model path. An explicit `[assets].brow_model` override wins;
-    /// otherwise an `eyebrow.bin`/legacy `brow.bin` shipped beside the executable is
-    /// discovered automatically. Keeping the package path implicit means moving an
-    /// extracted ZIP does not leave a stale absolute path in the user's config.
     pub fn brow_model_path(&self) -> Option<PathBuf> {
         let explicit = self
             .assets
@@ -1669,26 +1328,18 @@ impl Config {
         explicit.or_else(bundled_brow_model_path)
     }
 
-    /// Resolved custom Dream Air/XR5 EyeWide model path, if configured.
     pub fn wide_model_path(&self) -> Option<PathBuf> {
         nonempty(&self.assets.wide_model).map(PathBuf::from)
     }
 
-    /// Resolved Python interpreter path for the offline eyebrow trainer
-    /// (`[assets].python_exe`), if set + non-empty. This is the user's venv-with-torch.
     pub fn python_exe_path(&self) -> Option<PathBuf> {
         nonempty(&self.assets.python_exe).map(PathBuf::from)
     }
 
-    /// Resolved `vr_eyebrow` project dir (`[assets].vr_eyebrow_dir`), if set + non-empty.
-    /// Holds `train.py` / `dataset.py` / `model.py`; used as the trainer's working dir.
     pub fn vr_eyebrow_dir_path(&self) -> Option<PathBuf> {
         nonempty(&self.assets.vr_eyebrow_dir).map(PathBuf::from)
     }
 
-    /// Serialize and write the config to `path` (used by the UI's live editor).
-    /// Comments are not preserved (TOML serialize drops them); the file becomes a
-    /// plain key/value document after the first save.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(reason) = &self.save_blocked_reason {
             return Err(std::io::Error::new(
@@ -1711,8 +1362,6 @@ impl Config {
         write_atomic(path, text.as_bytes())
     }
 
-    /// Validate the user-configurable model assets. Device runtimes are discovered
-    /// automatically and are therefore not represented as user configuration.
     pub fn check_assets(&self) -> Vec<AssetStatus> {
         let exists = |p: &Option<PathBuf>| p.as_ref().map(|p| p.is_file()).unwrap_or(false);
         #[cfg(all(target_os = "linux", feature = "xr5-only", feature = "external-eyelid-model"))]
@@ -1741,7 +1390,6 @@ impl Config {
         }]
     }
 
-    /// Assets that are required-but-missing (the startup blockers to surface).
     pub fn missing_required(&self) -> Vec<AssetStatus> {
         self.check_assets()
             .into_iter()
@@ -1749,16 +1397,10 @@ impl Config {
             .collect()
     }
 
-    /// Write a commented starter config if none exists yet (first-run UX).
     pub fn write_template_if_absent(path: &Path) -> std::io::Result<bool> {
         if path.exists() {
             return Ok(false);
         }
-        // v0.1.8 unifies the formerly separate PSVR2 beta with the normal
-        // multi-HMD executable. If this PC only has the isolated PSVR2 settings,
-        // promote a validated copy into the normal config once. Never overwrite an
-        // existing normal config and never delete the source file, so rollback to
-        // the old dedicated beta remains safe.
         if !PSVR2_ONLY_BUILD && !XR5_ONLY_BUILD {
             let psvr2_path = path.with_file_name("sranibro-psvr2.toml");
             if psvr2_path.is_file() {
@@ -1951,12 +1593,10 @@ fn create_state_backup_at(base: &Path, label: &str) -> std::io::Result<PathBuf> 
     Ok(dir)
 }
 
-/// Snapshot the configuration and every per-HMD calibration before applying a profile.
 pub fn create_state_backup(label: &str) -> std::io::Result<PathBuf> {
     create_state_backup_at(&base_dir(), label)
 }
 
-/// Most recently named backup directory, if any.
 pub fn latest_state_backup() -> Option<PathBuf> {
     let mut entries: Vec<_> = std::fs::read_dir(base_dir().join("backups"))
         .ok()?
@@ -1967,8 +1607,6 @@ pub fn latest_state_backup() -> Option<PathBuf> {
     entries.last().map(|entry| entry.path())
 }
 
-/// Restore every state file present in a prior snapshot. Missing files are left unchanged
-/// so backups made before per-HMD calibration existed remain usable.
 pub fn restore_state_backup(dir: &Path) -> std::io::Result<()> {
     let base = base_dir();
     for (name, source) in state_files(dir)? {
@@ -1982,11 +1620,8 @@ pub fn restore_state_backup(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Commented first-run template. Hand-authored (toml serialize drops comments).
 #[cfg(all(target_os = "linux", feature = "xr5-only"))]
-pub const TEMPLATE: &str = r#"# SRanibro XR5 Linux configuration.
-# Native USB capture; the distributed XR5 model runs locally on CPU.
-[hmd]
+pub const TEMPLATE: &str = r#"[hmd]
 device = "auto"
 
 [xr5_research]
@@ -2011,29 +1646,18 @@ eye_image_http = false
 "#;
 
 #[cfg(all(target_os = "linux", not(feature = "xr5-only")))]
-pub const TEMPLATE: &str = r#"# SRanibro Linux / PSVR2 configuration.
-# Requires SteamVR + Ignition + PSVR2Toolkit configured on this PC.
-# SRanipal is not executed: only its EyePrediction model file is read.
-[assets]
-# Choose the copied model in Settings or set either path below (absolute paths):
-# ml_model = "/home/yourname/SRanipal/model/EyePrediction/00-0000.params_opencl.params"
-# sranipal_dir = "/home/yourname/SRanipal"
-# brow_model = "/home/yourname/eyebrow.bin"
-# python_exe = "/home/yourname/vr_eyebrow/.venv/bin/python"
-# vr_eyebrow_dir = "/home/yourname/vr_eyebrow"
+pub const TEMPLATE: &str = r#"[assets]
 
 [hmd]
-device = "auto" # Linux: auto selects PSVR2; other HMDs are not supported yet.
+device = "auto"
 
 [output]
-# Native VRChat OSC works without a VRCFT module. Shared blink, no independent winks.
 vrchat_eye_osc = true
 osc_host = "127.0.0.1"
 osc_port = 9000
-# Optional TCP stream for compatible clients; module compatibility must be checked.
 brokeneye = true
 brokeneye_port = 5555
-osc = false # Avatar-specific /avatar/parameters/Eye* (requires compatible avatar)
+osc = false
 eyebrow_osc = false
 eye_image_http = false
 eye_image_host = "127.0.0.1"
@@ -2044,87 +1668,37 @@ eye_camera_preview = false
 "#;
 
 #[cfg(not(target_os = "linux"))]
-pub const TEMPLATE: &str = r#"# SRanibro configuration.
-# Device connection support is discovered automatically. The paths below are only
-# for optional models and training tools.
-
+pub const TEMPLATE: &str = r#"
 [assets]
-# Direct path to the EyePrediction weights file (the eye-tracking "recognition"
-# model). If set, this is used as-is — ship just this one file (e.g. from the
-# Discord asset pack) instead of a whole SRanipal install. Takes precedence over
-# sranipal_dir. All asset paths are also editable live in the Settings tab.
-# ml_model = "C:\\sranibro-assets\\00-0000.params_opencl.params"
 
-# Your SRanipal install directory. Used only when ml_model is unset; weights read
-# from <sranipal_dir>/model/EyePrediction/00-0000.params_opencl.params
-# sranipal_dir = "C:\\Program Files\\VIVE\\SRanipalRuntime"
 
-# Eyebrow (B-2) train-and-bake inputs — used ONLY by the "Train & bake" button on the
-# Eyebrow-calibration tab. NOT bundled: point at a Python venv that has torch, and at
-# your local vr_eyebrow project (the folder with train.py / dataset.py / model.py).
-# python_exe = "C:\\vr_eyebrow\\venv_cpu\\Scripts\\python.exe"
-# vr_eyebrow_dir = "C:\\vr_eyebrow"
 
-# Optional Dream Air/XR5 image-based EyeWide model. This is produced from the
-# guided Wide dataset and is never bundled with SRanibro.
-# wide_model = "C:\\sranibro-assets\\wide.bin"
 
 [hmd]
-# device = which HMD acquisition adapter to use. Selecting an unavailable one fails
-# with a clear message instead of silently falling back to a different headset.
-device = "auto"          # auto | pimax_vr4 | pimax_xr5 | varjo | varjo_mjpeg | starvr | psvr2
-                         # auto = sniff the EyeChip serial and pick Pimax VR4 (frontal)
-                         #        vs XR5 (angled) automatically (falls back to VR4 if no
-                         #        Pimax eyechip is present). Pimax-only — StarVR/Varjo/VPE
-                         #        still need their explicit device= value below.
-                         # pimax_vr4 = WinUSB-direct, frontal ML.
-                         # pimax_xr5 = WinUSB-direct, angled ML (crop + flip).
-                         # varjo = native Varjo Base SDK eye cameras.
-                         # varjo_mjpeg = Varjo Eye Streamer (MJPEG); run it + "Start Server".
-                         # starvr = Tobii stream engine.
-                         # psvr2 = installed PSVR2Toolkit CAPI (start SteamVR first).
-wide_source = "sranipal" # sranipal | auto | custom (custom is Dream Air/XR5 only)
+device = "auto"
+wide_source = "sranipal"
 
-# Eye mapping is stored PER DEVICE. `swap_eyes` exchanges the complete L/R eye
-# streams for the minority of units whose camera labels are reversed. It defaults
-# off for every HMD. Gaze-X handedness follows the driver preset (Pimax/Tobii on,
-# Varjo off) and is normally changed only from Advanced orientation. For example:
-#   [hmd.mappings.pimax_vr4]
-#   swap_eyes = true
-#   flip_gaze_x = true
 
-# Dream Air / XR5 only: post-calibration gaze finishing correction. Normally edited
-# live from Calibration -> XR5 Gaze correction, not by hand.
-#   [hmd.gaze_correction.pimax_xr5]
-#   enabled = true
-#   offset_x_deg = [0.0, 0.0]
-#   offset_y_deg = [0.0, 0.0]
-#   scale_x = [1.0, 1.0]
-#   scale_y = [1.0, 1.0]
-#   vergence_deg = 0.0
-# Optional XR5 EyeChip gaze provider (default is per-eye). The UI writes:
-#   [hmd.gaze_source]
-#   pimax_xr5 = "combined" # per_eye | combined
 
 [output]
-brokeneye = true         # VRCFT-compatible TCP sink (BrokenEye protocol, port 5555)
+brokeneye = true
 brokeneye_port = 5555
-vrcft_filter_samples = 10 # VRCFT openness moving average; 0/1 = off, live-adjustable
-vrcft_sranipal_brow_link = false # EyeWide/EyeSquint -> brows in bundled VRCFT module
-osc = false              # set true to ALSO send VRChat OSC direct (/avatar/parameters/Eye*)
-eyebrow_osc = false      # eyebrow-only OSC (FT/v2 Brow*); use with VRCFT eye tracking
+vrcft_filter_samples = 10
+vrcft_sranipal_brow_link = false
+osc = false
+eyebrow_osc = false
 osc_host = "127.0.0.1"
 osc_port = 9000
-eye_image_http = false   # local browser/MJPEG preview; Apply & reload after changing
-eye_image_host = "127.0.0.1" # loopback addresses only (127.0.0.1 or ::1)
+eye_image_http = false
+eye_image_host = "127.0.0.1"
 eye_image_port = 5556
 
 [ui]
-steamvr_overlay = true   # wide-angle head-locked target for XR5 research recording
-eye_camera_preview = false # dashboard eye images only; tracking/recording stay full-rate
-recording_audio_cues = true # recording prepare/start/holdout/complete/error sounds
-wearing_memory_enabled = true # recall explicitly confirmed wearing-position profiles
-eye_wide_enabled = true  # global EyeWide output master; inference remains live when off
+steamvr_overlay = true
+eye_camera_preview = false
+recording_audio_cues = true
+wearing_memory_enabled = true
+eye_wide_enabled = true
 "#;
 
 #[cfg(test)]
@@ -2401,8 +1975,6 @@ mod tests {
 
     #[test]
     fn missing_assets_reported_not_panicked() {
-        // Device runtimes are automatic; only the user-supplied eye model is
-        // represented as a missing configurable asset.
         let mut c = Config::default();
         #[cfg(all(target_os = "linux", feature = "xr5-only", feature = "external-eyelid-model"))]
         { c.xr5_research.enabled = false; c.xr5_research.avatar = false; }
@@ -2464,7 +2036,6 @@ mod tests {
             "old dedicated config remains as rollback"
         );
 
-        // A later launch must preserve edits made to the unified config.
         let mut edited = migrated;
         edited.output.osc_port = 9020;
         edited.save(&normal).unwrap();
@@ -2540,15 +2111,11 @@ mod tests {
     #[test]
     fn varjo_lib_path_prefers_explicit() {
         let mut c = Config::default();
-        // An explicit path always wins over auto-detect.
         c.assets.varjo_lib = Some("D:\\pack\\VarjoLib.dll".into());
         assert_eq!(
             c.varjo_lib_path(),
             Some(std::path::PathBuf::from("D:\\pack\\VarjoLib.dll"))
         );
-        // Empty string is treated as unset (falls through to auto-detect, which may or
-        // may not find a Varjo Base install on this machine — so only assert it's not
-        // the empty string echoed back).
         c.assets.varjo_lib = Some("   ".into());
         assert_ne!(c.varjo_lib_path(), Some(std::path::PathBuf::from("")));
     }
@@ -2570,7 +2137,6 @@ mod tests {
             std::path::PathBuf::from("D:\\pack\\weights.params"),
             "direct ml_model wins over sranipal_dir"
         );
-        // An empty ml_model (cleared UI field) falls back to sranipal_dir.
         c.assets.ml_model = Some("   ".into());
         let p = c.ml_params_path().unwrap();
         assert!(p.ends_with("00-0000.params_opencl.params"));
@@ -2578,8 +2144,6 @@ mod tests {
 
     #[test]
     fn default_eye_mapping_presets() {
-        // Pimax / Tobii path is gaze-mirrored; Varjo is not. Whole-stream L/R
-        // swapping is a per-unit hardware trait and therefore always defaults off.
         assert!(default_eye_mapping("auto").flip_gaze_x);
         assert!(default_eye_mapping("pimax_vr4").flip_gaze_x);
         assert!(default_eye_mapping("pimax_xr5").flip_gaze_x);
@@ -3208,7 +2772,6 @@ holdout_after = 0.03
                 ..Default::default()
             },
         );
-        // A real device-specific value wins over the stale shared bucket.
         c.hmd.brightness.insert(
             "auto".into(),
             crate::core::types::BrightnessNorm {
@@ -3261,8 +2824,6 @@ holdout_after = 0.03
         assert!(v.swap_eyes && !v.flip_gaze_x);
         assert_eq!(v.swap_gaze_eyes, None);
 
-        // A config saved by the short-lived split UI is collapsed to one coherent
-        // whole-stream swap. The legacy field never survives resolution.
         c.set_mapping(
             "pimax_vr4",
             EyeMapping {

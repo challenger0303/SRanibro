@@ -1,9 +1,3 @@
-//! Device acquisition: the HMD-specific seam (the only place HMDs differ).
-//!
-//! Status: the pure TTP protocol ([`ttp`]) and the VR4 data layout ([`vr4`]) are
-//! ported and unit-tested offline. The WinUSB + named-pipe + libloading glue that
-//! drives real hardware is the next step (it cannot be verified without a
-//! physical VR4: the platform service must be stopped and the patched DLL present).
 
 pub(crate) mod runtime_access;
 pub mod gaze;
@@ -28,19 +22,14 @@ pub mod usb;
 pub mod varjo_adapter;
 #[cfg(any(windows, all(target_os = "linux", feature = "xr5-only")))]
 pub mod vr4_adapter;
-// Native Varjo SDK path RE-ENABLED 2026-06-29: the crash-dump analysis cleared it (the
-// MEMORY_MANAGEMENT BSODs were attributed to RAM/an ImDisk RAM disk, no Varjo driver in the
-// faulting stack). `varjo_mjpeg` stays as the safe fallback.
 #[cfg(windows)]
 pub mod varjo_native_adapter;
 #[cfg(windows)]
 pub mod varjo_sdk;
 #[cfg(windows)]
 pub mod vpe_adapter;
-/// `vpewake` — VPE eyechip wake via the Windows HID API (the 0BB4:0309 HidUsb interface).
 #[cfg(windows)]
 pub mod vpe_hid;
-/// `vpetest`/`vpescan` diagnostics — validate the native VPE eyechip wake (USB keepalive).
 #[cfg(windows)]
 pub mod vpe_probe;
 #[cfg(any(all(windows, any(feature = "xr5-only", feature = "external-eyelid-model")), all(target_os = "linux", feature = "xr5-only")))]
@@ -50,9 +39,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::types::{DeviceProfile, Eye, GazeSample};
 
-/// Classify the Pimax/StarVR EyeChip serial without opening the device. StarVR
-/// serials use the `VRS` family; treating them as the old VR4 fallback makes the
-/// WinUSB adapter try to open a service-owned EyeChip and fail with access denied.
 pub fn auto_device_key_from_serial(serial: Option<&str>) -> &'static str {
     match serial.map(str::trim).filter(|serial| !serial.is_empty()) {
         Some(serial) if serial.to_ascii_uppercase().starts_with("XR5") => "pimax_xr5",
@@ -61,61 +47,31 @@ pub fn auto_device_key_from_serial(serial: Option<&str>) -> &'static str {
     }
 }
 
-/// The normal Hotmirror build still recognizes XR5 serials so it can refuse the
-/// route explicitly instead of accidentally treating an angled XR5 as a VR4.
 pub const XR5_PAUSED_MESSAGE: &str =
     "Dream Air / XR5 support is separated from the normal build and is currently paused";
 
-/// Called by an adapter for each decoded camera frame: `(eye, width, height, bytes)`
-/// where `bytes` is `width*height` grayscale, row-major. Dimensions travel WITH the
-/// frame so the resolution varies per HMD (VR4/StarVR 200x200, Varjo higher) without
-/// any hardcoding downstream.
 pub type FrameFn = Box<dyn FnMut(Eye, u32, u32, &[u8]) + Send>;
-/// Called by an adapter for each gaze/advanced-data sample (raw gaze sign).
 pub type GazeFn = Box<dyn FnMut(GazeSample) + Send>;
 
-/// The acquisition seam: produce (frame, gaze); everything downstream
-/// (ML -> SRanipalState -> outputs) is HMD-agnostic.
-// Adapters own configuration and worker handles; native sessions remain on their
-// acquisition workers. Send permits shutdown/reload ownership off the UI thread.
 pub trait HmdAdapter: Send {
     fn name(&self) -> &'static str;
     fn profile(&self) -> &DeviceProfile;
-    /// Begin streaming; the adapter invokes the callbacks from its own threads.
     fn start(&mut self, on_frame: FrameFn, on_gaze: GazeFn) -> std::io::Result<()>;
-    /// Install before `start` when an adapter can publish independent native
-    /// eyes before an optional combined-gaze selection. `true` means this hook
-    /// owns the raw stream; `false` means callers use the ordinary gaze callback.
-    /// Auxiliary samples may accompany gaze and retain their reported flags.
     fn set_raw_gaze_callback(&mut self, _callback: GazeFn) -> bool {
         false
     }
-    /// Original wearable origin/validity evidence, separate from selected gaze.
     fn set_native_evidence_callback(&mut self, _callback: GazeFn) -> bool {
         false
     }
     fn stop(&mut self);
-    /// Whether this adapter needs the Tobii Platform Runtime stopped (the "CUSTOM"
-    /// pre-flight) so it can claim the EyeChip directly. True for the DLL-free WinUSB
-    /// path AND for the direct stream-engine path (`pimax_dll`), which both talk to a
-    /// device the running Tobii runtime is holding. A real StarVR / service-routed
-    /// path leaves it false so the service isn't stopped out from under it. Default:
-    /// false.
     fn needs_eyechip_handoff(&self) -> bool {
         false
     }
-    /// Live human-readable device status (for the UI's diagnostic line). Adapters
-    /// that track state override this; the default is a static placeholder.
     fn status_arc(&self) -> Arc<Mutex<String>> {
         Arc::new(Mutex::new("n/a".into()))
     }
 }
 
-/// Construct the adapter for the configured `[hmd].device`. Everything
-/// downstream (ML -> SRanipalState -> sinks) is identical across adapters; only
-/// this acquisition seam differs. Unimplemented devices return a clear error
-/// instead of silently falling back to VR4 — so the config never lies about what
-/// actually runs.
 #[cfg(all(
     any(windows, target_os = "linux"),
     feature = "psvr2-only",
@@ -125,8 +81,6 @@ pub fn make_adapter(_cfg: &crate::config::Config) -> std::io::Result<Box<dyn Hmd
     Ok(Box::new(psvr2_adapter::Psvr2Adapter::new()))
 }
 
-/// Native Linux acquisition currently supports PSVR2 through the user's
-/// installed PSVR2Toolkit/Ignition CAPI, without opening any Windows/Tobii DLL.
 #[cfg(all(
     target_os = "linux",
     not(any(feature = "psvr2-only", feature = "xr5-only"))
@@ -166,13 +120,6 @@ pub fn make_adapter(cfg: &crate::config::Config) -> std::io::Result<Box<dyn HmdA
     use std::io::{Error, ErrorKind};
     let device = crate::config::canonical_device_key(&cfg.hmd.device);
     match device.as_str() {
-        // `auto`: sniff the EyeChip serial (CM enumeration only, no device open) and
-        // route VR4 vs XR5 — the ONLY difference is the ML preprocessing (VR4 frontal
-        // vs XR5 angled); acquisition is byte-identical. Serial prefix `XR5` → XR5
-        // (angled); anything else (e.g. `VRU02-…`) → the gated VR4 path (frontal).
-        // If no Pimax EyeChip is found yet, default to VR4 (harmless — it just won't
-        // connect until one appears). This sniffing is Pimax-only; StarVR/Varjo/VPE
-        // keep their own explicit `device=` values below.
         "auto" => match usb::peek_serial() {
             Some(s) if auto_device_key_from_serial(Some(&s)) == "pimax_xr5" => {
                 #[cfg(feature = "external-eyelid-model")]
@@ -200,28 +147,17 @@ pub fn make_adapter(cfg: &crate::config::Config) -> std::io::Result<Box<dyn HmdA
                     .with_gaze_source(cfg.hmd.vr4_gaze_source)))
             }
         },
-        // `pimax_vr4`: DLL-free WinUSB acquisition, GATED on the user-supplied common
-        // Tobii DLL (loaded as the connection authorization; data via WinUSB). Manual
-        // override of the VR4 (frontal) path (`auto` picks this from the serial).
         "pimax_vr4" => {
             let dll = cfg.tobii_runtime_path().map(|p| p.to_string_lossy().into_owned());
             Ok(Box::new(vr4_adapter::Vr4Adapter::new_gated(dll)
                 .with_gaze_source(cfg.hmd.vr4_gaze_source)))
         }
-        // `pimax_dll`: drive the Pimax EyeChip THROUGH the Tobii stream-engine DLL
-        // (same generic adapter as StarVR — the DLL is the actual data path, not just
-        // a gate). Use this once verified to stream on the Pimax hardware.
         "pimax_dll" => Ok(Box::new(
-            // handoff=true: the patched stream engine accesses the Pimax EyeChip
-            // directly, so the Tobii Platform Runtime must be stopped first.
             starvr_adapter::StarVrAdapter::with_profile(
                 cfg, "Pimax (Tobii stream engine)", Eye::Left, true,
             ),
         )),
         "starvr" => Ok(Box::new(starvr_adapter::StarVrAdapter::new(cfg))),
-        // `varjo`: native VarjoLib SDK eye cameras (re-enabled — the BSODs were RAM/RAM-disk,
-        // not this). Gated on a VarjoLib.dll (auto-detected from Varjo Base, or
-        // [assets].varjo_lib). Errors to `varjo_mjpeg` if the DLL is missing.
         "varjo" => match cfg.varjo_lib_path() {
             Some(p) => Ok(Box::new(varjo_native_adapter::VarjoNativeAdapter::new(
                 p.to_string_lossy().into_owned(),
@@ -232,16 +168,8 @@ pub fn make_adapter(cfg: &crate::config::Config) -> std::io::Result<Box<dyn HmdA
                  device=\"varjo_mjpeg\" (Varjo Eye Streamer)",
             )),
         },
-        // `varjo_mjpeg`: the zero-SDK fallback — consume the Varjo Eye Streamer's MJPEG feed.
         "varjo_mjpeg" => Ok(Box::new(varjo_adapter::VarjoAdapter::new(cfg))),
-        // `psvr2`: consume the read-only native gaze + paired eye-camera preview
-        // exposed by the user's installed PSVR2Toolkit SteamVR driver.
         "psvr2" => Ok(Box::new(psvr2_adapter::Psvr2Adapter::new())),
-        // `xr5`: DLL-free WinUSB + native TTP, built on the VR4 adapter (same IS4
-        // EyeChip, same GUID; only the "xr5" angled-optics ML route differs). NOT a
-        // stream-engine DLL call — the DLL is only the distribution gate. If XR5 auth
-        // differs on hardware, the documented fallback is a named-pipe + DLL relay
-        // (see xr5_adapter.rs). Needs the Tobii Platform Runtime stopped (handoff).
         #[cfg(feature = "external-eyelid-model")]
         "pimax_xr5" => Ok(Box::new(xr5_adapter::Xr5Adapter::new(cfg))),
         #[cfg(not(feature = "external-eyelid-model"))]

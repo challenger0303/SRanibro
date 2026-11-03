@@ -1,9 +1,3 @@
-//! Isolated owner of the installed PSVR2Toolkit CAPI.
-//!
-//! Native initialization, mutex waits and destruction may block or crash. They
-//! never execute in the UI/tracking process. A bounded pipe reader keeps only
-//! the latest camera/gaze frame, while control events are preserved or fail
-//! explicitly on overflow. A process-wide lease prevents overlapping sessions.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -41,14 +35,12 @@ pub(crate) enum StreamKind {
 
 #[derive(Debug)]
 pub(crate) enum WorkerEvent {
-    /// Emitted before discovery and again with the selected path before init.
     Loading {
         path: String,
     },
     Initialized {
         path: String,
     },
-    /// A heartbeat, including when the state has not changed.
     Driver(bool),
     Gaze(GazeStatus),
     Image(EyeImageFrame),
@@ -80,8 +72,6 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        // Preserve the occupied gate permanently if OS cleanup could not be
-        // established. Repeated retries must not accumulate helper processes.
         if !QUARANTINED.load(Ordering::Acquire) {
             OCCUPIED.store(false, Ordering::Release);
         }
@@ -140,8 +130,6 @@ impl Process {
         self.stopping.store(true, Ordering::Release);
         let mut slot = self.child.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(child) = slot.as_mut() {
-            // Exit may race the kill. An already-exited process is safe to reap;
-            // do not permanently quarantine a healthy host for that OS error.
             if !matches!(child.try_wait(), Ok(Some(_)))
                 && child.kill().is_err()
                 && !matches!(child.try_wait(), Ok(Some(_)))
@@ -150,8 +138,6 @@ impl Process {
             }
         }
     }
-    // Only the one pipe reader calls this. Its process/lease remains owned if
-    // the OS cannot reap, rather than blocking any caller or launching another.
     fn reap_on_reader(&self) {
         self.terminate();
         let child = self.child.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -176,9 +162,6 @@ impl Process {
     fn finish_reader(&self) {
         self.reader_done.store(true, Ordering::Release);
         if self.reaped.load(Ordering::Acquire) {
-            // A bounded caller may already have returned while OS cleanup or
-            // reader scheduling was delayed. Only this confirmed completion
-            // releases its lease; a timeout alone never permits another child.
             self.lease.lock().unwrap_or_else(|p| p.into_inner()).take();
         }
     }
@@ -286,7 +269,7 @@ impl WorkerClient {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            command.creation_flags(0x0800_0000);
         }
         let mut child = command.spawn()?;
         #[cfg(windows)]
@@ -301,8 +284,6 @@ impl WorkerClient {
             cleanup_unstarted(&mut child);
             return Err(io::Error::other("PSVR2 helper pipes unavailable"));
         };
-        // The child waits for this handshake before loading any native library.
-        // It is smaller than an empty anonymous pipe's capacity and sent once.
         if let Err(error) = input
             .write_all(MAGIC)
             .and_then(|_| input.write_all(&std::process::id().to_le_bytes()))
@@ -400,7 +381,6 @@ impl WorkerClient {
         let deadline = Instant::now() + STOP_BUDGET;
         self.process.stopping.store(true, Ordering::Release);
         if let Some(mut input) = self.input.take() {
-            // One byte after the handshake, never an unbounded input backlog.
             let _ = input.write_all(b"X");
         }
         let graceful = Instant::now() + GRACE_BUDGET;
@@ -415,9 +395,6 @@ impl WorkerClient {
             && self.reader.as_ref().is_none_or(JoinHandle::is_finished))
         {
             if Instant::now() >= deadline {
-                // Keep ownership in the background reader. Slow scheduling is
-                // not a permanent native failure: manual reconnect is allowed
-                // only after it confirms exit and releases the occupied lease.
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "PSVR2 helper cleanup is still pending after 500 ms; reconnect remains blocked until cleanup finishes. Restart SRanibro if it does not finish"));
             }
             thread::sleep(Duration::from_millis(2));
@@ -456,8 +433,6 @@ fn cleanup_unstarted(child: &mut Child) {
     }
 }
 
-/// Opt in only from an executable that calls `worker_entrypoint` before normal
-/// argument parsing, logger setup, configuration loading, and UI initialization.
 pub fn enable_worker_host() {
     if let Ok(path) = std::env::current_exe() {
         let _ = HOST.set(path);
@@ -560,8 +535,6 @@ fn run_worker() -> io::Result<()> {
     let mut heartbeat = Instant::now();
     while !stop.load(Ordering::Acquire) {
         if Instant::now() >= heartbeat {
-            // Supported Toolkit releases export this. Absence is a protocol
-            // capability error, not evidence that a driver is active.
             let Some(active) = capi.driver_active() else {
                 write_event(
                     &mut output,
@@ -611,8 +584,6 @@ fn run_worker() -> io::Result<()> {
             thread::sleep(Duration::from_millis(1));
         }
     }
-    // Native deinit may hang here. The parent still owns the 500 ms kill/reap
-    // deadline; the entire native heap/mappings vanish with this process.
     drop(capi);
     Ok(())
 }
@@ -885,8 +856,6 @@ mod tests {
     use super::*;
     #[test]
     fn delayed_reader_completion_retains_lease_without_permanent_quarantine() {
-        // Model an exited child whose pipe reader has not been scheduled yet.
-        // No runtime or headset is loaded by this lifecycle test.
         let lease = Lease::acquire().unwrap();
         #[cfg(windows)]
         let job = unsafe {
@@ -930,8 +899,6 @@ mod tests {
             assert!(Instant::now() < until);
             thread::sleep(Duration::from_millis(2));
         }
-        // Completion allows a new session even while the old client is still
-        // alive. Dropping that old client must not release the new owner's gate.
         let next = Lease::acquire().unwrap();
         drop(client);
         assert!(OCCUPIED.load(Ordering::Acquire));

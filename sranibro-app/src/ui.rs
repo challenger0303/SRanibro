@@ -1,9 +1,3 @@
-//! In-process egui dashboard — Fluent-dark, design-token driven, animated.
-//!
-//! Reads [`Telemetry`] from the running [`Pipeline`] directly (no HTTP). The
-//! signal rail is the headline: VRCFT's #1 pain point is opacity, so SRanibro
-//! always shows where data is flowing — here as a live animated pipeline plus a
-//! one-line diagnostic banner with the fix. Built entirely from `theme` tokens.
 
 use std::collections::VecDeque;
 use std::f32::consts::{PI, TAU};
@@ -67,11 +61,6 @@ use crate::wink_fit::{
     Fitter as WinkFitter, Status as WinkFitStatus,
 };
 
-// The app deliberately keeps its dark borderless chrome. On Windows the blank
-// title-bar rectangle is nevertheless exposed as a genuine non-client caption
-// through WM_NCHITTEST. This is materially different from asking winit to begin
-// a drag after egui's movement threshold: Windows owns the anchor from the first
-// button-down, including physical/logical conversion across mixed-DPI monitors.
 #[cfg(windows)]
 static NATIVE_DRAG_HWND: AtomicIsize = AtomicIsize::new(0);
 #[cfg(windows)]
@@ -118,7 +107,6 @@ unsafe extern "system" fn sranibro_window_proc(
             if base != HTCLIENT as isize {
                 return base;
             }
-            // WM_NCHITTEST coordinates are signed physical screen pixels.
             let mut point = POINT {
                 x: (lparam as u16 as i16) as i32,
                 y: ((lparam >> 16) as u16 as i16) as i32,
@@ -259,13 +247,7 @@ fn device_option_label(device: &str) -> &str {
     }
 }
 
-// A visible wgpu swapchain competes with the VR compositor even when average GPU
-// usage looks small. Normal tracking telemetry is intentionally presentation-light;
-// acquisition, inference and output keep their native clocks on worker threads.
 const TRACKING_UI_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
-// A visible preview is an explicit opt-in diagnostic, so present every new camera
-// frame instead of imposing the normal low-rate dashboard cadence. Hidden previews
-// still do no frame clones or texture uploads.
 const LIVE_EYE_TEXTURE_INTERVAL: Duration = Duration::from_micros(8_333);
 
 fn vr_eye_pose(action: Option<GazeResidualAction>, slow_openness: Option<u8>) -> VrEyePose {
@@ -321,7 +303,6 @@ enum Page {
     Settings,
 }
 
-/// Navigation only: drafts and live values stay in their existing owners.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum SettingsTab {
     #[default]
@@ -353,8 +334,6 @@ fn settings_tabs(ui: &mut egui::Ui, selected: &mut SettingsTab) {
 }
 
 fn settings_row<R>(ui: &mut egui::Ui, name: &str, controls: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    // Match label columns across cards without letting a long control stretch
-    // every preceding row, as an unconstrained grid would.
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(
             vec2(145.0 * S, 26.0 * S),
@@ -369,8 +348,6 @@ fn settings_row<R>(ui: &mut egui::Ui, name: &str, controls: impl FnOnce(&mut egu
     .inner
 }
 
-/// The window / taskbar icon, baked as raw RGBA (256×256) next to the .ico so no PNG
-/// decoder is needed at runtime. Matches the exe's embedded icon.
 fn app_icon() -> egui::IconData {
     const RGBA: &[u8] = include_bytes!("../assets/sranibro_rgba.bin");
     egui::IconData {
@@ -388,8 +365,6 @@ enum UiRenderer {
 }
 
 impl UiRenderer {
-    // Keep this independent of the process environment so regression tests never
-    // need to mutate a global variable while other tests are starting a UI.
     fn from_override(value: Option<&str>) -> Result<Self, ()> {
         match value.map(str::trim) {
             None | Some("") => Ok(Self::Glow),
@@ -402,9 +377,6 @@ impl UiRenderer {
 }
 
 fn native_options() -> eframe::NativeOptions {
-    // A process-start diagnostic override, not a live setting. There is deliberately
-    // no automatic renderer restart: it could reconnect tracking after a runtime
-    // surface failure and repeatedly initialize the same failing driver.
     let override_value = std::env::var("SRANIBRO_UI_RENDERER").ok();
     let renderer = UiRenderer::from_override(override_value.as_deref()).unwrap_or_else(|()| {
         eprintln!("[ui:renderer] unknown SRANIBRO_UI_RENDERER; using OpenGL (expected glow, dx12 or vulkan)");
@@ -420,13 +392,8 @@ fn native_options() -> eframe::NativeOptions {
 
 fn native_options_for_renderer(renderer: UiRenderer) -> eframe::NativeOptions {
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    // CursorMoved can arrive much faster than the monitor refresh rate. Use an
-    // unambiguous blocking VSync mode and allow at most one queued frame, so an
-    // interactive widget cannot build a long GPU presentation backlog.
     wgpu_options.present_mode = wgpu::PresentMode::Fifo;
     wgpu_options.desired_maximum_frame_latency = Some(1);
-    // Explicit diagnostic selections must not silently choose another backend.
-    // The wgpu configuration is unused by the normal OpenGL renderer.
     wgpu_options.supported_backends = match renderer {
         UiRenderer::Glow => wgpu::Backends::PRIMARY,
         UiRenderer::Dx12 => wgpu::Backends::DX12,
@@ -434,23 +401,12 @@ fn native_options_for_renderer(renderer: UiRenderer) -> eframe::NativeOptions {
     };
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // Fixed, non-resizable: sized to hold the capped content column
-            // (NAV_W + margins + MAX_W) with a small balanced margin.
             .with_inner_size([WIN_W, WIN_H])
-            // Fixed: the layout is fixed-metric and positions some elements from the
-            // absolute window height (e.g. the nav LED), so a resizable window would
-            // misplace them. True responsive layout is a separate refactor.
             .with_resizable(false)
             .with_maximize_button(false)
-            // The native Windows title bar does not follow the app's dark theme.
-            // Keep the window borderless and provide drag/minimize/close controls
-            // in SRanibro's own top bar instead.
             .with_decorations(false)
             .with_icon(app_icon())
             .with_title(APP_WINDOW_TITLE),
-        // wgpu 22 treats a lost presentation device as a fatal error. Use the
-        // independent OpenGL presentation path by default; EyeNet compute retains
-        // its own execution policy and never borrows the UI graphics context.
         renderer: match renderer {
             UiRenderer::Glow => eframe::Renderer::Glow,
             UiRenderer::Dx12 | UiRenderer::Vulkan => eframe::Renderer::Wgpu,
@@ -474,14 +430,9 @@ fn renderer_gpu_context(
     } else if cc.gl.is_some() {
         eprintln!("[ui:gpu] OpenGL compatibility renderer; independent EyeNet compute");
     }
-    // Neither UI renderer supplies a compute device. Sharing the presentation
-    // queue serializes EyeNet readbacks behind preview frames and couples failures.
     None
 }
 
-/// Compatibility entry point for callers that already constructed a pipeline.
-/// New product startup uses [`run_ui_from_config`] so the renderer can be configured
-/// before the tracking engine starts, without reconnecting the eye tracker afterward.
 pub fn run_ui(
     pipeline: Pipeline,
     be_status: Option<Arc<BrokenEyeStatus>>,
@@ -504,8 +455,6 @@ pub fn run_ui(
     )
 }
 
-/// Product GUI startup. The compatibility renderer is initialized first, then the
-/// tracking engine starts with its independent EyeNet execution policy.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn run_ui_from_config(config: Config) -> eframe::Result<()> {
     eframe::run_native(
@@ -532,22 +481,15 @@ pub fn run_ui_from_config(config: Config) -> eframe::Result<()> {
     )
 }
 
-/// Editable copies of the asset paths + device, bound to the Settings text fields.
-/// Empty string == "not set"; applied back into [`Config`] on reload.
 #[derive(Clone)]
 struct SettingsEdit {
     sranipal_dir: String,
-    /// Optional eyebrow model (BROWNET1 file baked from the user's calibrated model).
     brow_model: String,
-    /// Optional task-tagged XR5 image-based EyeWide model.
     wide_model: String,
     wide_source: WideSource,
-    /// XR5-only EyeChip gaze provider. Source changes are applied with an engine
-    /// reload so per-eye and combined vectors can never flap within one session.
     gaze_source: GazeSource,
     vr4_gaze_source: Vr4GazeSource,
     vr4_gaze_smoothing: bool,
-    /// B-2 train inputs: the venv-with-torch python + the user's vr_eyebrow project dir.
     python_exe: String,
     vr_eyebrow_dir: String,
     device: String,
@@ -629,9 +571,6 @@ enum GazeRangeAxis {
     Vertical,
 }
 
-/// Percent values currently stored for each eye on one gaze axis.  Keep this
-/// separate from the slider value so an old asymmetric/per-eye calibration is
-/// never presented as if both eyes had the averaged setting.
 fn gaze_range_percent(correction: &GazeCorrection, axis: GazeRangeAxis) -> [f32; 2] {
     let scale = match axis {
         GazeRangeAxis::Horizontal => correction.scale_x,
@@ -645,9 +584,6 @@ fn shared_gaze_range_slider_value(correction: &GazeCorrection, axis: GazeRangeAx
     ((per_eye[0] + per_eye[1]) * 0.5).clamp(25.0, 250.0)
 }
 
-/// Set a deliberately shared avatar movement range.  Moving the simple control
-/// means “use this for both eyes”; advanced per-eye centre, the other axis, and
-/// vergence remain untouched.
 fn set_shared_gaze_range_percent(
     correction: &mut GazeCorrection,
     axis: GazeRangeAxis,
@@ -669,10 +605,6 @@ fn supports_frontal_photometric_correction(device: &str) -> bool {
     crate::config::supports_photometric_fit(device)
 }
 
-/// Long guided recordings exist to rescue the non-frontal XR5 image path. A
-/// frontal SRanipal-compatible HMD is tuned directly from its live eye image and
-/// response rails, so presenting the recording menu there adds work without a
-/// useful first-line benefit.
 fn shows_advanced_recording_calibration(device: &str) -> bool {
     crate::config::canonical_device_key(device) == "pimax_xr5"
 }
@@ -750,8 +682,6 @@ fn calibration_entry_footer(ui: &mut egui::Ui, meta: &str, value: &str, hover: &
     start_clicked
 }
 
-/// Consistent, scannable entry used by Full setup and Single check. Technical
-/// contract detail remains available as a hover instead of filling the page.
 fn calibration_session_entry(
     ui: &mut egui::Ui,
     step: Option<usize>,
@@ -940,8 +870,6 @@ fn eyelid_speed_controls(ui: &mut egui::Ui, tuning: &mut crate::core::eye_state:
     changed
 }
 
-/// Project-Babble-style raw-model rail. The live signal moves between two draggable
-/// endpoint handles; persisted values remain relative to the relaxed-open baseline.
 struct WideRailEdit<'a> {
     input: f32,
     output: f32,
@@ -969,10 +897,6 @@ fn openness_marker_value(raw_openness: f32, wide_entry: Option<f32>) -> f32 {
     wide_entry.map_or(raw_openness, |entry| raw_openness.min(entry))
 }
 
-/// ch1 openness and ch2 Wide are different model heads, so their raw 0..1 values
-/// are not a shared physical coordinate. Preserve the familiar combined rail while
-/// guaranteeing its semantic ordering: the red no-Wide band ends just beyond the
-/// normal-open handle and the Wide lane retains enough visible travel.
 fn wide_display_bounds(open_ref: f32, raw_entry: f32, raw_full: f32) -> (f32, f32) {
     let entry = raw_entry.max(open_ref + 0.015).clamp(0.0, 0.985);
     let full = raw_full.max(entry + 0.05).clamp(entry + 0.001, 1.0);
@@ -1020,15 +944,9 @@ fn eyelid_threshold_rail(
     let baseline = diag.effective_baseline;
     let open_ref = diag.effective_open_ref;
     let closed_ref = diag.effective_closed_ref;
-    // ch1 openness and ch2 EyeWide share one physical response axis, but retain
-    // separate live markers: green is confined to the normal range and orange owns
-    // the Wide range. Custom XR5 Wide remains on its own score rail.
     let combined_wide = wide.is_some();
     let height = if combined_wide { 74.0 * S } else { 52.0 * S };
     let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    // Keep endpoint chevrons and their 30 px grab targets inside each eye column.
-    // Without this inset, LEFT 1.0 and RIGHT 0.0 meet at the column boundary and
-    // egui clips the half of each handle that extends into the neighbouring column.
     let edge_inset = 16.0 * S;
     let openness_top = if combined_wide { 38.0 * S } else { 19.0 * S };
     let rail = Rect::from_min_max(
@@ -1041,15 +959,12 @@ fn eyelid_threshold_rail(
     let to_x = |value: f32| rail.left() + rail.width() * value.clamp(0.0, 1.0);
     let open_x = to_x(open_ref);
     let closed_x = to_x(closed_ref);
-    // Once raw openness crosses into the ch2 Wide range, the normal-openness marker
-    // stops at the boundary. Only the orange Wide marker is allowed to move beyond it.
     let wide_display_entry = wide
         .as_ref()
         .map(|wide| wide_display_bounds(open_ref, wide.entry_ref, wide.full_ref).0);
     let openness_marker = openness_marker_value(diag.raw_openness, wide_display_entry);
     let raw_x = to_x(openness_marker);
 
-    // Keep the marker precise but make the invisible grab target generous.
     let handle_size = if combined_wide {
         vec2(30.0 * S, 24.0 * S)
     } else {
@@ -1203,9 +1118,6 @@ fn eyelid_threshold_rail(
             FontId::monospace(9.0 * S),
             wide_live_color,
         );
-        // The red lane is intentionally unavailable: SRanipal Wide cannot begin
-        // below its raw-openness entry point. It makes the normal-open/Wide
-        // boundary visible without placing another handle on top of Openness.
         painter.rect_filled(
             Rect::from_min_max(wide_band.left_top(), pos2(entry_x, wide_band.bottom())),
             wide_band.height() * 0.5,
@@ -1349,7 +1261,6 @@ fn expression_threshold_rail(
     start: &mut f32,
     full: &mut f32,
 ) -> (bool, bool) {
-    // Live IN/OUT and the rail are separate; endpoint values are printed below.
     let height = 68.0 * S;
     let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let edge_inset = 16.0 * S;
@@ -1357,9 +1268,6 @@ fn expression_threshold_rail(
         pos2(outer.left() + edge_inset, outer.top() + 34.0 * S),
         pos2(outer.right() - edge_inset, outer.top() + 46.0 * S),
     );
-    // Squeeze usually occupies only the bottom of the model's 0..1 output. A
-    // square-root display axis expands that useful region without changing the
-    // stored threshold or the value sent to the avatar.
     let to_x = |value: f32| rail.left() + rail.width() * expression_axis_position(kind, value);
     let start_x = to_x(*start);
     let full_x = to_x(*full);
@@ -1490,7 +1398,6 @@ fn saved_wearing_states<R>(
     contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::collapsing_header::CollapsingResponse<R> {
     egui::CollapsingHeader::new(format!("Saved states ({count})"))
-        // Do not reset the user's open/closed choice when a state is saved/deleted.
         .id_salt("wearing_memory_saved_states")
         .default_open(false)
         .show(ui, contents)
@@ -2106,8 +2013,6 @@ struct GazeResidualExportResult {
     result: Result<(), String>,
 }
 
-/// Only the Windows EyeChip transport can discover its hardware serial. Other
-/// platforms keep the existing unknown-unit identity instead of inventing one.
 fn available_eyechip_serial() -> Option<String> {
     #[cfg(windows)]
     {
@@ -2148,9 +2053,6 @@ fn wear_memory_context(config: &Config, pipeline: &Pipeline) -> WearMemoryContex
 }
 
 fn wear_memory_fingerprint(config: &Config, pipeline: &Pipeline) -> u64 {
-    // Calibration values are meaningful only under the exact image/model domain
-    // that produced them. Raw-image matching itself survives lighting changes, but
-    // a changed filter, geometry, mapping or model must start a separate memory.
     let material = format!(
         "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
         config.mapping_for(&pipeline.device_key),
@@ -2202,8 +2104,6 @@ impl CalibrationCapturePurpose {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalibrationDetail {
-    // The old record-once transaction remains compiled so an in-flight analysis
-    // can still finish safely, but the simplified UI no longer starts one.
     #[allow(dead_code)]
     InitialSetup,
     PythonEyelidDataset,
@@ -2238,8 +2138,6 @@ struct UnifiedCalibrationRun {
     preprocessing: UnifiedPreprocessing,
     evidence: Option<SharedEvidence>,
     snapshot: Option<GazeResidualSnapshot>,
-    /// Endpoint inputs that were live when recording started. Unlike `endpoints`,
-    /// this never changes when a candidate is staged.
     frozen_endpoints: Option<crate::core::eye_state::CalibStore>,
     endpoints: Option<crate::core::eye_state::CalibStore>,
     endpoint_apply: Option<crate::endpoint_fit::EndpointApplyRequest>,
@@ -2315,9 +2213,6 @@ struct RecordingCueState {
     diagnostic: bool,
 }
 
-/// Live editor for the per-HMD eyelid response. Slider changes reach the
-/// pipeline immediately; `dirty` delays the small config-file write until the
-/// current pointer gesture has ended.
 struct EyelidResponsePreview {
     edit: EyelidResponseProfile,
     link_eyes: bool,
@@ -2382,16 +2277,10 @@ struct App {
     gpu_context: Option<crate::ml::eyelid_model::EyelidGpuContext>,
     tele: Arc<Telemetry>,
     config: Config,
-    /// Live-editable asset/device fields (Settings tab).
     edit: SettingsEdit,
-    /// Last "Apply & reload" result message (text, color).
     reload_msg: Option<(String, Color32)>,
     reload_job: Option<std::thread::JoinHandle<std::io::Result<crate::engine::Engine>>>,
-    /// Paint-only snapshot, captured once when reload begins. No live widgets or
-    /// camera texture uploads run behind the progress overlay.
     reload_backdrop: Vec<egui::epaint::ClippedShape>,
-    /// On-demand SRanipal discovery runs off the UI thread because a bounded
-    /// Downloads/Desktop fallback may take several seconds on a large profile.
     sranipal_discovery_job: Option<mpsc::Receiver<Option<crate::sranipal_discovery::Found>>>,
     page: Page,
     settings_tab: SettingsTab,
@@ -2400,135 +2289,69 @@ struct App {
     last_t: Instant,
     tex_l: Option<egui::TextureHandle>,
     tex_r: Option<egui::TextureHandle>,
-    /// Eye textures are the expensive part of a dashboard repaint (grayscale -> RGBA
-    /// conversion plus a GPU upload). Input events may make egui repaint faster than
-    /// `request_repaint_after`, so throttle the uploads independently of repaint rate.
     last_eye_texture_upload: Instant,
-    /// Exact source generations represented by the current dashboard textures.
-    /// Input/hover repaints must not upload the same camera payload again.
     last_eye_texture_generation: [u64; 2],
-    /// Preview textures for the Calibration tab's ML-input geometry card (the processed
-    /// 100x100 the eye model actually sees, per eye).
     tex_ml_l: Option<egui::TextureHandle>,
     tex_ml_r: Option<egui::TextureHandle>,
-    /// Textures for the ML occlusion-heatmap overlay (eye + colormap), per eye.
     tex_heat_l: Option<egui::TextureHandle>,
     tex_heat_r: Option<egui::TextureHandle>,
-    /// Colormap full-scale for the heatmap (|openness delta| that maps to full colour).
     heat_vmax: f32,
-    /// Scale each computed map to its robust p98 response while still showing the absolute
-    /// p98/peak values, so focused regions stay visible without hiding weak maps.
     heat_auto_scale: bool,
-    // diagnostic event log (stage up/down, tracking toggles)
     start: Instant,
-    /// Last eframe callback. A long gap while a calibration is active means the
-    /// Windows compositor/event loop owned the UI (for example native window drag),
-    /// not that the wearer completed an invisible prompt.
     last_ui_update: Instant,
-    /// Camera generations seen by the previous UI callback. Diagnostic stall logs use
-    /// this to distinguish a blocked presentation thread from a stopped tracker.
     last_ui_frame_generations: [u64; 2],
-    /// Tracks the minimized transition so the last hidden camera generations are
-    /// discarded exactly once before any paused calibration resumes.
     ui_was_minimized: bool,
-    /// Start time of a Windows-owned title-bar drag. While set, capture clocks are
-    /// paused and expensive camera texture uploads are suppressed.
     window_drag_started_at: Option<Instant>,
     window_drag_start_generations: [u64; 2],
     window_drag_update_count: u64,
     window_drag_max_ui_gap: Duration,
     prev_ok: Option<[bool; 6]>,
     prev_paused: bool,
-    /// (wall-clock "HH:MM:SS" stamp, message, color).
     events: Vec<(String, String, Color32)>,
-    /// Pipeline node whose detail card is open (click to toggle).
     sel_node: Option<usize>,
-    /// Whether the top PIPELINE card is expanded. Default collapsed — the header
-    /// (name + "n/6 nodes ok") is the at-a-glance summary; the flow diagram is opt-in.
     pipeline_open: bool,
-    /// The ML-input geometry editor modal (opened by the gear on the eye-cameras card).
     show_geom_modal: bool,
-    /// Dream Air/XR5 native-gaze finishing correction modal.
     show_gaze_modal: bool,
-    /// Explicit good-state capture for appearance-conditioned wearing recovery.
     show_wear_memory_modal: bool,
-    /// Live-preview transaction owned by the Open / closed detail modal.
-    /// `None` elsewhere so an abandoned edit cannot leak into another workflow.
     eyelid_response_preview: Option<EyelidResponsePreview>,
-    /// Emit-thread acknowledgment: never report baseline persistence before it succeeds.
     eyelid_reset_result: Option<mpsc::Receiver<Result<(), String>>>,
-    /// One-second straight-ahead capture used by the gaze Center action.
     gaze_center_capture: Option<GazeCenterCapture>,
     gaze_center_msg: Option<(String, Color32)>,
-    /// Calibration-modal-only source edit. Discarded on close so it cannot be
-    /// committed later by an unrelated Settings reload.
     gaze_source_modal_edit: Option<GazeSource>,
     dream_air_msg: Option<(String, Color32)>,
     recording_audio: RecordingAudio,
     recording_cues: RecordingCueState,
-    /// In-memory, labelled stereo capture used only by the XR5 geometry search.
     geometry_capture: GeometryCapture,
-    /// Background pure-Rust candidate search + untouched-holdout validation.
     geometry_fitter: GeometryFitter,
-    /// Fixed-geometry brightness/contrast/illumination search for frontal eye cameras.
     photometric_fitter: PhotometricFitter,
-    /// All-HMD explicit relaxed-open / gentle-close endpoint analysis.
     endpoint_fitter: EndpointFitter,
-    /// All-HMD nine-direction relaxed-eyelid compensation analysis.
     gaze_eyelid_fitter: GazeEyelidFitter,
-    /// All-HMD per-eye held-wink response analysis.
     wink_fitter: WinkFitter,
-    /// All-HMD natural-blink visible-bottom timing analysis.
     blink_timing_fitter: BlinkTimingFitter,
-    /// Immutable user-confirmed wearing-position reference and live physical reseat
-    /// guidance. This never writes tracking calibration or adaptive baselines.
     reseat_assist: WearingPositionAssist,
-    /// Explicitly taught appearance -> calibration associations. Matching is
-    /// passive; only the explicit good-state confirmation may create memory.
     wear_memory: WearMemory,
-    /// True while the user is deliberately tuning a new wearing state. Automatic
-    /// matching resumes only after that complete state is explicitly confirmed.
     wear_memory_matching_suspended: bool,
     wear_response_before_edit: Option<EyelidResponseProfile>,
     wear_baseline_before_edit: Option<[f32; 2]>,
     wear_thumbnails: Vec<(u64, [egui::TextureHandle; 2])>,
-    /// In-progress endpoint checks are deliberately separate from persisted memory:
-    /// Recenter and slider edits prepare a candidate but never teach it themselves.
     wear_memory_draft: WearingMemoryDraft,
     wear_closed_capture: Option<ClosedPointCapture>,
     confirm_remove_reseat_reference: bool,
-    /// The workflow currently owning `geometry_capture`.
     calibration_capture_purpose: Option<CalibrationCapturePurpose>,
-    /// Compact navigation for Full / symptom-guided / individual calibration.
     calibration_view: CalibrationView,
-    /// Dedicated foreground guide/progress window opened from the compact list.
     calibration_detail_window: Option<CalibrationDetail>,
-    /// Two-step guard for removing an applied calibration. Upstream removals can
-    /// invalidate dependent eyelid fits, so their exact cascade is shown before
-    /// the user confirms the write.
     pending_calibration_removal: Option<SessionKind>,
-    /// Record-once workflow. Raw frames are immutable and reused by each fitter.
     unified_calibration: Option<UnifiedCalibrationRun>,
-    /// Geometry active at capture start. The search is always centred on this fallback.
     geometry_capture_baseline: Option<[crate::core::types::MlGeometry; 2]>,
-    /// Photometric filters are snapshotted with the baseline so edits made after capture
-    /// cannot mismatch the stored per-frame brightness affine during replay.
     geometry_capture_filters: Option<(
         crate::core::types::DespeckleParams,
         crate::core::types::FlattenParams,
     )>,
-    /// Fitted correction active at photometric-capture start. It remains the exact
-    /// fallback and must not change until the recording has been scored.
     photometric_capture_baseline: Option<crate::core::types::PhotometricCorrection>,
-    /// Automatic feedback-archive state for the current completed capture. An attempt is
-    /// made exactly once on completion; a failed attempt leaves the dataset in memory and
-    /// exposes a retry action instead of silently letting fit/audit consume the only copy.
     geometry_recording_export_attempted: bool,
     geometry_recording_path: Option<PathBuf>,
     geometry_recording_export_job: Option<mpsc::Receiver<GeometryExportResult>>,
     geometry_recording_export_thread: Option<std::thread::JoinHandle<()>>,
-    /// Independent nine-point research capture. It never feeds Safe Geometry Fit and is
-    /// saved only as evidence for offline landmark/residual analysis.
     gaze_residual_capture: GazeResidualCapture,
     gaze_residual_export_attempted: bool,
     gaze_residual_recording_path: Option<PathBuf>,
@@ -2536,61 +2359,27 @@ struct App {
     gaze_residual_export_job: Option<mpsc::Receiver<GazeResidualExportResult>>,
     gaze_residual_export_thread: Option<std::thread::JoinHandle<()>>,
     gaze_residual_window_elevated: bool,
-    /// Optional head-locked wide-angle target. OpenVR is initialized lazily on
-    /// its own thread and the desktop target remains the unconditional fallback.
     vr_research_overlay: VrResearchOverlay,
-    /// Unsaved geometry restored when the user exits candidate preview.
     geometry_preview_restore: Option<[crate::core::types::MlGeometry; 2]>,
-    /// Previous persisted geometry retained for one-click rollback after Apply.
     geometry_rollback: Option<[crate::core::types::MlGeometry; 2]>,
-    /// Previous persisted fitted correction retained for one-click rollback.
     photometric_rollback: Option<crate::core::types::PhotometricCorrection>,
-    /// Explicit acknowledgement required before persisting a candidate that failed
-    /// untouched-holdout validation. Reset whenever a new capture or fit begins.
     geometry_unvalidated_ack: bool,
-    /// Which tab of the ML-input modal is active: 0 = Image (crop/stretch/rotate), 1 = Filter.
     geom_tab: u8,
-    /// Which eye the Image-tab sliders target: 0 = both, 1 = left, 2 = right. The
-    /// sliders re-read the selected eye's live values every frame, so switching
-    /// snaps them to that eye's numbers.
     geom_eye: u8,
-    /// Dashboard eye-cameras source: false = raw cameras, true = the exact image
-    /// sent to the eye net (un-mirrored).
     net_view: bool,
-    /// BrokenEye (VRCFT) server status, shown in the OUTPUT node detail.
     be: Option<Arc<BrokenEyeStatus>>,
-    /// One-shot guard for the fit-to-monitor scale (applied once when monitor size is
-    /// known; set every frame would oscillate ppp — the documented flicker bug).
     fit_done: bool,
-    /// Pointer position inside the custom title bar at drag start. Moving the
-    /// undecorated window ourselves avoids Windows' modal WM_ENTERSIZEMOVE loop,
-    /// which can suspend eframe redraws until another native input event arrives.
-    /// Eyebrow-calibration data-collection controller (B-1 capture tab). Writes RAW eye
-    /// frames + labels.csv under base_dir()/brow_data for offline training (B-2).
     brow: BrowCalib,
-    /// Last c_frame_l/r counters seen by the brow-capture tab, so it saves exactly one frame
-    /// per NEW device frame during a capture phase (not per repaint).
     brow_last_frames: [u64; 2],
-    /// B-2: the offline train->bake subprocess runner (drives the user's PyTorch venv).
     trainer: BrowTrainer,
-    /// True once we've consumed a `Done` from `trainer` and hot-loaded the model, so we
-    /// don't re-load it every frame while the status stays `Done`.
     train_applied: bool,
-    /// In-app pure-Rust head-fit runner: re-fits only the output head onto the captured
-    /// brow_data, reusing an existing brow.bin as a frozen backbone (no Python). The lighter,
-    /// recommended alternative to the full external `trainer`.
     fitter: BrowFitter,
-    /// One-shot guard mirroring `train_applied` for the in-app fit's hot-load.
     fit_applied: bool,
-    /// Dream Air/XR5 EyeWide capture controller. Each run creates an independent
-    /// session so fitting can hold out a whole reseat/session for validation.
     wide: WideCalib,
     wide_last_frames: [u64; 2],
     wide_fitter: WideFitter,
     wide_fit_applied: bool,
     confirm_delete_wide: bool,
-    /// The process's captured stdout/stderr ring buffer (see `logcap`), rendered by the
-    /// Console tab so runtime logs are visible without launching from a terminal.
     log: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -2604,8 +2393,6 @@ impl App {
         >,
     ) -> Self {
         let tele = pipeline.tele.clone();
-        // Anchored path (not CWD), and SURFACE malformed or automatically repaired
-        // configuration instead of silently resetting it.
         let config_path = crate::config::config_path();
         let (mut config, mut cfg_warn) = Config::load(&config_path);
         if crate::config::canonical_device_key(&pipeline.device_key) == "pimax_xr5"
@@ -2638,8 +2425,6 @@ impl App {
         } else {
             match std::env::args().nth(2).as_deref() {
                 Some("calibration") => Page::Calibration,
-                // Keep the old command-line routes working after eyebrow calibration
-                // moved into the shared XR5 calibration page.
                 Some("brow") | Some("browcalib") => Page::Calibration,
                 Some("console") => Page::Console,
                 Some("settings") => Page::Settings,
@@ -2766,28 +2551,16 @@ impl App {
         }
     }
 
-    /// One-shot fit-to-monitor: if the fixed design window (WIN_W x WIN_H points) is
-    /// bigger than the monitor (small/high-DPI laptops), shrink BOTH the window and the
-    /// UI uniformly via a single zoom_factor so nothing clips off-screen. The layout
-    /// stays in its WIN_W x WIN_H POINT space (zoom only changes points->pixels), so
-    /// fixed-position elements like the nav LED at content_h() stay correct. Applied
-    /// once (the guard) — setting zoom every frame oscillates ppp (the flicker bug).
     fn fit_to_monitor(&mut self, ctx: &egui::Context) {
         if self.fit_done {
             return;
         }
         let mon = ctx.input(|i| i.viewport().monitor_size);
-        let Some(mon) = mon else { return }; // not known yet — retry next frame
+        let Some(mon) = mon else { return };
         if mon.x < 1.0 || mon.y < 1.0 {
             return;
         }
         self.fit_done = true;
-        // Percentage margins (not a hardcoded 64) leave room for window decorations +
-        // the taskbar; shrink only (never enlarge past design). A low floor is allowed
-        // so a very small screen still fits (readability suffers but nothing clips).
-        // 0.85 vertical clears the taskbar (~40-48px) + title bar even on a 720-logical
-        // -tall screen; 0.96 horizontal covers side decorations. monitor_size is full
-        // (egui exposes no work area), so be conservative. Shrink-only via the 1.0 cap.
         let fit = (mon.x * 0.96 / WIN_W)
             .min(mon.y * 0.85 / WIN_H)
             .clamp(0.4, 1.0);
@@ -2809,7 +2582,6 @@ impl App {
         self.tele.ml_loaded && self.rates[3] > 1.0
     }
 
-    /// Current per-stage health (same logic as the signal rail).
     fn stage_oks(&self) -> [bool; 6] {
         let cam = self.rates[0] > 1.0 && self.rates[1] > 1.0;
         let gaze = self.rates[2] > 1.0;
@@ -2819,9 +2591,7 @@ impl App {
         [cam || gaze, cam, gaze, ml, core, core && tracking]
     }
 
-    /// Log stage transitions + tracking toggles to the event strip.
     fn detect_events(&mut self) {
-        // Let rates settle before logging, so startup isn't noisy.
         if self.start.elapsed().as_secs_f32() < 1.5 {
             return;
         }
@@ -3125,8 +2895,6 @@ impl App {
         self.reseat_assist.suspend_for(gap, generation);
         self.wide.suspend_for(gap);
         self.brow.suspend_for(gap);
-        // Wide/Brow own only phase state; their generation cursors live in App.
-        // Drop every frame produced while the prompt could not be presented.
         self.wide_last_frames = generation;
         self.brow_last_frames = generation;
         if let Some(capture) = self.gaze_center_capture.as_mut() {
@@ -3188,8 +2956,6 @@ impl App {
             capture.resume(now, gaze_timestamp);
         }
 
-        // Pause/resume owns the capture clocks, so do not let the generic UI-gap
-        // compensator charge the same native move interval a second time.
         self.last_ui_update = now;
         ctx.request_repaint();
     }
@@ -3203,9 +2969,6 @@ impl Drop for App {
             }
         }
         self.pipeline.stop();
-        // A completed biometric capture is more valuable than a fast shutdown. The
-        // worker owns the only frame buffers while saving, so wait for its atomic
-        // publish/cleanup instead of detaching it and leaving a partial archive.
         if let Some(worker) = self.gaze_residual_export_thread.take() {
             let _ = worker.join();
         }
@@ -3264,19 +3027,9 @@ impl eframe::App for App {
             }));
             self.gaze_residual_window_elevated = residual_running;
         }
-        // eframe/wgpu skips presenting while a Windows viewport is minimized. Building the
-        // complete dashboard anyway (especially `TextureHandle::set` for the live eye
-        // cameras) leaves texture/paint deltas queued behind the unavailable surface. They
-        // are not reclaimed on restore and Private Bytes can grow by hundreds of MiB per
-        // minute. Keep the non-render tracking/capture controllers alive, but emit an empty
-        // UI frame until Windows restores the surface.
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if minimized {
             self.ui_was_minimized = true;
-            // A visible head-locked SteamVR target remains valid while the desktop is
-            // minimized. Without it, freeze the protocol: a hidden desktop point cannot
-            // carry a valid commanded gaze label. The early return still avoids all egui
-            // texture uploads, preserving the minimized-memory fix.
             if self.config.ui.steamvr_overlay && self.vr_research_overlay.is_visible() {
                 self.gaze_residual_capture.resume();
             } else {
@@ -3336,22 +3089,7 @@ impl eframe::App for App {
             self.brow.resume();
         }
 
-        // NOTE: we deliberately do NOT touch zoom_factor / pixels_per_point here.
-        // Deriving zoom from native_pixels_per_point() each frame oscillates,
-        // because egui feeds the *effective* ppp back through that call — the
-        // result flickers between scales. We let egui keep its stable native ppp
-        // and size everything from fixed point dimensions in `theme`.
-        // ML/eye/brow inference run on their own threads. Windows owns title-bar
-        // movement, so the compositor can present it at the monitor's native cadence.
-        // A visible live-eye preview opts the dashboard into the cameras' 120 Hz
-        // cadence; hidden preview keeps this presentation-light tracking cadence.
-        // Calibration consumes bounded source-frame history, so this repaint cadence
-        // never defines its sample rate.
         let redraw_interval = if self.window_drag_started_at.is_some() {
-            // DWM moves the last presented surface while its native caption loop owns
-            // the mouse. Do not submit another FIFO frame every 8 ms: those presents
-            // blocked winit's move messages behind VSync and made the window trail the
-            // cursor. A release/move event requests the one repaint needed afterwards.
             Duration::from_millis(250)
         } else if self.wide.is_running()
             || self.geometry_capture.is_running()
@@ -3393,14 +3131,10 @@ impl eframe::App for App {
                 Page::Console => self.console(ui),
                 Page::Settings => self.settings(ui),
             });
-        // Guided calibration details are foreground navigation; nested image/gaze
-        // editors are rendered after it so they remain the topmost modal.
         self.calibration_detail_modal(ctx);
         if self.show_wear_memory_modal {
             self.wearing_memory_modal(ctx);
         }
-        // This editor is reachable from Dashboard's camera gear and from the
-        // Calibration page's VR4/Varjo photometric card.
         if self.show_geom_modal {
             let frames = self.tele.stereo_frames();
             self.geom_modal(ctx, &frames);
@@ -3410,8 +3144,6 @@ impl eframe::App for App {
         }
         self.gaze_residual_capture_overlay(ctx);
         if self.reload_job.is_some() {
-            // Keep a single snapshot of the just-rendered page. Draining a clone
-            // leaves this frame untouched and preserves all modal/layer ordering.
             let (layers, transforms) = ctx.memory(|memory| {
                 (
                     memory.layer_ids().collect::<Vec<_>>(),
@@ -3503,8 +3235,6 @@ impl App {
         })
     }
 
-    /// The UI repaint clock is not a measurement clock. Sample the guided flow
-    /// only when `c_ml` changes, then hand its completed report to the review UI.
     #[cfg(any())]
     fn update_dream_air_state(&mut self) {
         if self.pipeline.device_key != "pimax_xr5" {
@@ -3538,9 +3268,6 @@ impl App {
         }
     }
 
-    /// Drive the shared geometry/photometric evidence capture from real camera
-    /// generations. The capture clock is capped at 20 Hz, so UI repaint bursts cannot
-    /// duplicate a frame and an unfocused UI still records enough blink timing detail.
     fn update_geometry_capture(&mut self) {
         self.poll_geometry_recording_export();
         if self.geometry_capture.is_running() && !self.geometry_capture_state_unchanged() {
@@ -3621,9 +3348,6 @@ impl App {
         }
     }
 
-    /// Drive the independent landmark/residual capture.  It shares only the live raw
-    /// camera source with Safe Geometry Fit; its protocol, dataset, and export lifecycle
-    /// are separate so running it cannot change fit evidence or live geometry.
     fn update_gaze_residual_capture(&mut self) {
         self.poll_gaze_residual_export();
         let unified_inputs_unchanged = self.unified_calibration.as_ref().is_none_or(|run| {
@@ -3711,9 +3435,6 @@ impl App {
         }
     }
 
-    /// Mirror the independent research protocol into a large, head-locked SteamVR
-    /// canvas. `VrResearchOverlay` de-duplicates identical frames, so calling this
-    /// from every UI update does not upload textures at the dashboard redraw rate.
     fn sync_gaze_residual_vr_overlay(&mut self) {
         let enabled = self.config.ui.steamvr_overlay;
         let reseat_frame = self.reseat_assist.is_active().then(|| {
@@ -3992,8 +3713,6 @@ impl App {
 
     fn update_reseat_assist(&mut self) {
         let geometry = self.config.geometry_for(&self.pipeline.device_key);
-        // The running headset cannot change without rebuilding `App`; keep the
-        // pseudonymous unit id captured at startup instead of probing USB every repaint.
         let context = ReseatReferenceContext::new(
             &self.pipeline.device_key,
             self.reseat_assist.context().unit_id.clone(),
@@ -4016,8 +3735,6 @@ impl App {
             .tele
             .calibration_frames_after(self.reseat_assist.last_generation());
         if history.is_empty() {
-            // Preserve the no-EyeNet fallback. Normal eyelid-capable builds use the
-            // coherent 60 Hz history above.
             let native = self.tele.fresh_capture_sample();
             let gaze = [native.left, native.right].map(|eye| {
                 (eye.gaze_reported
@@ -4035,8 +3752,6 @@ impl App {
             for sample in history {
                 let native = sample.gaze;
                 let gaze = [native.left, native.right].map(|eye| {
-                    // Pupil position also moves with the HMD. Eye-relative gaze is
-                    // the only native signal safe enough to gate a reseat estimate.
                     (eye.gaze_reported
                         && eye.gaze_valid
                         && eye.gaze.iter().all(|value| value.is_finite()))
@@ -4287,8 +4002,6 @@ impl App {
             .spawn(move || {
                 #[cfg(windows)]
                 unsafe {
-                    // PNG encoding is bulk background work; keep camera/inference and
-                    // the desktop compositor ahead of it under CPU contention.
                     let thread = windows_sys::Win32::System::Threading::GetCurrentThread();
                     let _ = windows_sys::Win32::System::Threading::SetThreadPriority(
                         thread,
@@ -4296,8 +4009,6 @@ impl App {
                     );
                 }
                 let Ok(work) = work_rx.recv() else { return };
-                // Keep `work` outside the unwind boundary so even an encoder panic
-                // returns the only in-memory biometric dataset to the UI for Retry.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::geometry_calib::export_dataset_recording(
                         &work.partial_path,
@@ -5206,9 +4917,6 @@ impl App {
             if let Some(run) = self.unified_calibration.as_mut() {
                 run.stage = UnifiedStage::FinalReview;
             }
-            // Every candidate has been copied into the small staged result. Raw
-            // biometric frames are no longer needed for Apply/Keep, so do not retain
-            // the large shared capture while the review window is left open.
             self.release_unified_replay_evidence();
         }
     }
@@ -5508,9 +5216,6 @@ impl App {
                 == snapshot.eyelid_model_bytes
     }
 
-    /// The instructed point is part of the evidence, so it must remain visible even if
-    /// the user changes pages or collapses the research card. The OS window is raised to
-    /// AlwaysOnTop for the same interval by `update`.
     fn gaze_residual_capture_overlay(&mut self, ctx: &egui::Context) {
         let status = self.gaze_residual_capture.status();
         if !matches!(
@@ -6299,9 +6004,6 @@ impl App {
         self.geometry_recording_path = None;
     }
 
-    /// Move the current completed capture into a below-normal-priority ZIP worker. The
-    /// result always carries the dataset back to the UI; even a successful export restores
-    /// it because fit/audit still needs the exact frames written to disk.
     fn export_geometry_recording(&mut self) -> bool {
         if self.geometry_recording_export_job.is_some() {
             return true;
@@ -6383,8 +6085,6 @@ impl App {
             .spawn(move || {
                 #[cfg(windows)]
                 unsafe {
-                    // PNG/ZIP encoding is bulk work. Keep live camera, inference and
-                    // desktop-compositor threads ahead of it under CPU contention.
                     let thread = windows_sys::Win32::System::Threading::GetCurrentThread();
                     let _ = windows_sys::Win32::System::Threading::SetThreadPriority(
                         thread,
@@ -6392,8 +6092,6 @@ impl App {
                     );
                 }
                 let Ok(work) = work_rx.recv() else { return };
-                // Keep `work` outside the unwind boundary so an encoder panic still
-                // returns ownership of the only in-memory capture to the UI.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::geometry_calib::export_dataset_recording(
                         &work.partial_path,
@@ -6488,8 +6186,6 @@ impl App {
             let _ = worker.join();
         }
 
-        // Restore before publishing either outcome. Fit/audit and Retry must see the
-        // exact dataset that the worker encoded, never an empty placeholder.
         self.geometry_capture
             .restore_export_dataset(outcome.dataset);
         match outcome.result {
@@ -6514,9 +6210,6 @@ impl App {
         }
     }
 
-    /// A problem/session Start button owns the complete recording-to-review flow.
-    /// ZIP durability is the boundary: analysis never consumes in-memory biometric
-    /// evidence until the automatic export has completed successfully.
     fn start_saved_calibration_analysis(&mut self) {
         let Some(purpose) = self.calibration_capture_purpose else {
             return;
@@ -6544,8 +6237,6 @@ impl App {
             ));
             return false;
         }
-        // A newly queued async save is not durable until poll publishes its atomic
-        // rename, so the caller must wait for the next completed UI poll.
         self.export_geometry_recording();
         false
     }
@@ -7151,8 +6842,6 @@ impl App {
             .unwrap_or([false; 2])
     }
 
-    /// Explain the exact per-HMD change before showing the destructive confirmation.
-    /// Only downstream results which actually exist are named.
     fn calibration_removal_preview(&self, kind: SessionKind) -> Option<String> {
         let device = &self.pipeline.device_key;
         let endpoints = self.explicit_endpoint_locks();
@@ -7283,9 +6972,6 @@ impl App {
             });
     }
 
-    /// Remove one persisted result and every result whose coordinate system it
-    /// invalidates. UI capture/fit starts and this method run on the same egui
-    /// thread, so the busy check and state transition cannot race each other.
     fn remove_calibration_result(&mut self, kind: SessionKind) {
         if self.calibration_result_change_busy() {
             self.dream_air_msg = Some((
@@ -7650,9 +7336,6 @@ impl App {
         ));
     }
 
-    /// The timing feature's master switch is deliberately separate from removing
-    /// fitted timing. Disabling it preserves the fitted milliseconds so enabling
-    /// it again is reversible; removing calibration preserves this switch.
     fn set_blink_timing_enabled(&mut self, enabled: bool) {
         let device = self.pipeline.device_key.clone();
         let mut profile = self.config.blink_timing_profile_for(&device);
@@ -8003,8 +7686,6 @@ impl App {
         }
     }
 
-    /// Drain the coherent ML-source history. UI repaint rate is presentation-only:
-    /// a 24 Hz desktop can still consume every eligible camera-clocked Wide frame.
     fn update_wide_capture(&mut self) {
         if self.pipeline.device_key != "pimax_xr5" {
             return;
@@ -8028,8 +7709,6 @@ impl App {
         self.wide.tick_at(Instant::now());
     }
 
-    /// Eyebrow datasets are count-driven, but their source is still the bounded
-    /// camera history so collection continues at the device rate on low-Hz desktops.
     fn update_brow_capture(&mut self) {
         if !self.brow.is_running() {
             self.brow_last_frames = self.tele.frame_generations();
@@ -8246,9 +7925,6 @@ impl App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    // Establish the control-row height before laying out the shorter
-                    // wordmark labels. egui cannot move earlier widgets when a taller
-                    // widget is added later, which left the text slightly top-aligned.
                     ui.allocate_space(vec2(0.0, 22.0 * S));
                     ui.label(
                         egui::RichText::new("SRani")
@@ -8272,8 +7948,6 @@ impl App {
                             .color(TEXT3),
                     );
 
-                    // Allocate only the middle blank area for native window dragging.
-                    // The two control rectangles remain independent click targets.
                     let controls_width = 70.0 * S;
                     let drag_width = (ui.available_width() - controls_width).max(24.0 * S);
                     let drag_sense = if cfg!(windows) {
@@ -8301,10 +7975,6 @@ impl App {
                             NAV_BG
                         };
                         ui.painter().rect_filled(rect, 4.0 * S, fill);
-                        // Font glyphs such as × and − sit above the typographic
-                        // line-box centre, so CENTER_CENTER still looks too high.
-                        // Draw the chrome as geometry to keep its visual centre
-                        // exact across fonts, DPI scales and fallback renderers.
                         let centre = ui.painter().round_pos_to_pixels(rect.center());
                         let radius = 4.5 * S;
                         let stroke = Stroke::new(1.5 * S, TEXT1);
@@ -8362,13 +8032,9 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(9.0 * S, 10.0 * S)),
             )
             .show(ctx, |ui| {
-                // Bottom "system live" dot: paint at the true client bottom
-                // (egui's available_height over-reports the surface here).
                 let cx = ui.max_rect().center().x;
                 let bottom = content_h();
                 let dot = pos2(cx, bottom - 13.0 * S);
-                // Shape-coded (not color-only): filled green = live, hollow ring = idle
-                // — the old LED_OFF fill was ~1.7:1 and read as "no dot at all".
                 if live {
                     ui.painter().circle_filled(dot, 4.0 * S, OK);
                 } else {
@@ -8376,9 +8042,6 @@ impl App {
                         .circle_stroke(dot, 4.0 * S, Stroke::new(1.5 * S, TEXT3));
                 }
 
-                // Keep Reload in its own fixed bottom slot, above the live-status light.
-                // It does not participate in the vertical tab layout and therefore cannot
-                // overlap a page icon or a collapsible-card click target.
                 let reload_rect =
                     Rect::from_center_size(pos2(cx, bottom - 47.0 * S), vec2(30.0 * S, 30.0 * S));
                 let reload_response =
@@ -8429,7 +8092,6 @@ impl App {
         let (rect, resp) = ui.allocate_exact_size(vec2(30.0 * S, 30.0 * S), Sense::click());
         let t = ui.ctx().animate_bool(Id::new(("nav", idx)), selected);
         let hover = if resp.hovered() { 0.4 } else { 0.0 };
-        // Active slot: SURFACE fill + 1px BORDER (mockup). No left accent bar.
         let fill = lerp_color(NAV_BG, SURFACE, (t + hover * (1.0 - t)).min(1.0));
         ui.painter().rect_filled(rect, 8.0 * S, fill);
         if t > 0.02 {
@@ -8446,7 +8108,6 @@ impl App {
         }
     }
 
-    // ----------------------------------------------------------------- pages
 
     fn dashboard(&mut self, ui: &mut egui::Ui) {
         #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
@@ -8460,8 +8121,6 @@ impl App {
         if raw_only { self.net_view=false; }
         let (gutter, cw) = stage_metrics(ui.ctx());
         let results = *self.tele.results.lock().unwrap();
-        // Raw model outputs (per eye: [presence, openness, _, squeeze, _]) + raw brow, for the
-        // thin raw bars under each ML-parameters gauge.
         let (ml5, comparison) = self.tele.eyelid_model_snapshot();
         let brow_raw = *self.tele.brow_raw.lock().unwrap();
         let wide_display = dashboard_wide_display(
@@ -8473,9 +8132,6 @@ impl App {
             *self.tele.wide_raw.lock().unwrap(),
         );
         let pupil = *self.tele.pupil.lock().unwrap();
-        // The live camera preview is presentation-only and defaults off. Do not even
-        // clone the Arc-backed raw frames or the processed NET Vecs while hidden.
-        // Acquisition, inference, recordings, and HTTP output remain native-rate.
         let mut eye_camera_preview = self.config.ui.eye_camera_preview;
         let eye_camera_preview_before = eye_camera_preview;
         let frames = if eye_camera_preview {
@@ -8489,9 +8145,6 @@ impl App {
                 generation:f.generation,width:200,height:200,pixels:f.pixels,
             }))
         } else { frames };
-        // Input/hover events can repaint independently of the scheduled UI cadence.
-        // Upload only a genuinely newer camera pair, at the visible preview's 120 Hz
-        // ceiling. Hiding preview removes both the frame clone and texture upload.
         let eye_generations = std::array::from_fn(|eye| {
             frames[eye]
                 .as_ref()
@@ -8511,7 +8164,6 @@ impl App {
         }
         let ctx = ui.ctx().clone();
         let drop = self.drop_pct();
-        // Live rates + nominal dims for the per-HMD labels (resolution/fps vary by HMD).
         let cam_rates = [self.rates[0], self.rates[1]];
         let ml_rate = self.rates[3];
         let (eye_w, eye_h) = (self.tele.eye_w, self.tele.eye_h);
@@ -8523,14 +8175,8 @@ impl App {
                 self.console_pipeline(ui, cw);
                 ui.add_space(SP3);
 
-                // Two side-by-side cards of EQUAL width (1:1) so the eye images
-                // get as much room as the parameters. egui's `Frame` over-reports
-                // available width inside a horizontal row, so we pin each card into
-                // an explicit fixed-width rect rather than trusting the row.
                 let cams_w = (cw - SP3) / 2.0;
                 let ml_w = cw - cams_w - SP3;
-                // Optional eyebrow stereo sync is a live output preference. Each eye
-                // still runs its own model/post-process; only the emitted pair is averaged.
                 let mut brow_lr_sync = self.pipeline.tuning.lock().unwrap().brow_lr_sync;
                 let brow_lr_sync_before = brow_lr_sync;
                 let (tex_l, tex_r) = (&mut self.tex_l, &mut self.tex_r);
@@ -8540,10 +8186,6 @@ impl App {
                     [None, None]
                 };
                 let net_view = &mut self.net_view;
-                // Render the (taller) eye card at its natural height, then force the
-                // ML card to MATCH it within the same frame — so bottoms align like
-                // the mockup's `align-items: stretch`, with NO cross-frame feedback
-                // (a max()-cache loop here compounds tiny overflow and runs away).
                 let start = ui.cursor().min;
                 let cams = ui.allocate_new_ui(
                     egui::UiBuilder::new().max_rect(Rect::from_min_size(start, vec2(cams_w, 1.0))),
@@ -8572,8 +8214,6 @@ impl App {
                 if eye_camera_preview != eye_camera_preview_before {
                     self.config.ui.eye_camera_preview = eye_camera_preview;
                     if !eye_camera_preview {
-                        // Release the GPU textures immediately. Re-enabling starts from
-                        // the newest source generation instead of showing a stale eye.
                         self.tex_l = None;
                         self.tex_r = None;
                         self.last_eye_texture_generation = [0; 2];
@@ -8646,9 +8286,6 @@ impl App {
                             .sranipal_brow_link
                             .store(brow_legacy, Ordering::Relaxed);
                     }
-                    // The dashboard source selector is deliberately exclusive: Legacy
-                    // lets the VRCFT module derive brows from Wide/Squint; Estimate uses
-                    // the independently trained eyebrow model instead.
                     self.pipeline
                         .eyebrow_enabled
                         .store(estimate_enabled, Ordering::Relaxed);
@@ -8677,12 +8314,10 @@ impl App {
                     }
                 }
                 let row_h = h_eye.max(mlr.response.rect.height());
-                // Reset the cursor below the taller card so the log doesn't overlap.
                 ui.allocate_rect(Rect::from_min_size(start, vec2(cw, row_h)), Sense::hover());
 
                 ui.add_space(SP3);
                 self.terminal_log(ui, cw);
-                // ML-input geometry modal (opened by the eye-cameras gear) — overlays all.
             });
         });
     }
@@ -8695,13 +8330,12 @@ impl App {
         let tracking = !self.pipeline.paused.load(Ordering::Relaxed);
         let names = ["DEVICE", "CAMERA", "GAZE", "ML", "CORE", "OUTPUT"];
         let oks = [cam || gaze, cam, gaze, ml, core, core && tracking];
-        // DEVICE sub-label reflects the active transport, not a hardcoded "USB".
         let dev_sub = match self.pipeline.device_key.as_str() {
-            "varjo" | "varjo_native" => "SDK",        // native VarjoLib
-            "varjo_mjpeg" | "varjo_stream" => "HTTP", // Eye Streamer MJPEG
+            "varjo" | "varjo_native" => "SDK",
+            "varjo_mjpeg" | "varjo_stream" => "HTTP",
             "psvr2" => "CAPI",
             "starvr" | "starvr_one" | "pimax_dll" | "pimax_vr4_dll" | "pimax_stream" => "TSE",
-            _ => "USB", // auto / pimax_vr4 = WinUSB
+            _ => "USB",
         };
         let model_sub = {
             #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
@@ -8738,15 +8372,12 @@ impl App {
 
         card().show(ui, |ui| {
             ui.set_width(inner);
-            // Header: chevron + "PIPELINE" left, "n/6 nodes ok" pinned right. Clicking
-            // the header toggles the flow diagram; default collapsed, so the header alone
-            // (name + n/6 nodes ok) is the at-a-glance summary and the diagram is opt-in.
             let hdr = ui.horizontal(|ui| {
                 let chev = if self.pipeline_open {
                     "\u{25be}"
                 } else {
                     "\u{25b8}"
-                }; // ▾ open / ▸ collapsed
+                };
                 ui.label(
                     egui::RichText::new(chev)
                         .monospace()
@@ -8777,13 +8408,9 @@ impl App {
                 self.pipeline_open = !self.pipeline_open;
             }
             if !self.pipeline_open {
-                return; // collapsed — header only
+                return;
             }
             ui.add_space(8.0 * S);
-            // Branched flow: DEVICE fans out to (CAMERA -> ML) and (GAZE direct);
-            // both merge at CORE -> OUTPUT. ML runs on the camera images, gaze
-            // comes straight off the device — they're PARALLEL inputs to CORE,
-            // not a single chain.
             let nh = 44.0 * S;
             let rg = 10.0 * S;
             let cg = 28.0 * S;
@@ -8803,7 +8430,6 @@ impl App {
             let r_core = nrect(colx(3), mid_cy);
             let r_out = nrect(colx(4), mid_cy);
 
-            // Connectors first (so the opaque nodes paint over the joins).
             let painter = ui.painter().clone();
             let lc = |a: bool, b: bool| if a && b { OK } else { DECO };
             let seg = |a: Pos2, b: Pos2, c: Color32| {
@@ -8848,17 +8474,12 @@ impl App {
                 lc(oks[4], oks[5]),
             );
 
-            // Per-node detail rows (device name, stream ids, output state, …) now
-            // live here instead of the top bar — click a node to open its card.
             let details = self.node_details();
             let rects = [r_dev, r_cam, r_gaze, r_ml, r_core, r_out];
 
             for (i, &r) in rects.iter().enumerate() {
                 let is_out = i == 5;
                 let is_first_broken = Some(i) == first_broken;
-                // Healthy nodes get a faint chip (NODE_BG, no border) so they read as
-                // grouped without the boxed-tile-grid look; the FIRST broken stage gets
-                // a real container (darker fill + amber border) to pull attention.
                 let fill = if is_first_broken { INNER } else { NODE_BG };
                 let border = if is_first_broken {
                     WARN
@@ -8897,7 +8518,6 @@ impl App {
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                // Accent border on hover or when this node's card is open.
                 if resp.hovered() || self.sel_node == Some(i) {
                     ui.painter()
                         .rect_stroke(r, R_INNER, Stroke::new(1.5 * S, ACCENT));
@@ -8911,14 +8531,11 @@ impl App {
                 }
             }
 
-            // Open detail card (own dark frame so values are readable).
             if let Some(i) = self.sel_node {
                 let area = egui::Area::new(Id::new("nodedetail"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(rects[i].left_bottom() + vec2(0.0, 8.0 * S))
                     .show(ui.ctx(), |ui| {
-                        // Distinct floating look: darker than the SURFACE cards it
-                        // overlays, accent border, drop shadow.
                         egui::Frame::default()
                             .fill(INNER)
                             .stroke(Stroke::new(1.5, ACCENT))
@@ -8932,7 +8549,6 @@ impl App {
                             })
                             .show(ui, |ui| node_detail_card(ui, names[i], oks[i], &details[i]));
                     });
-                // Dismiss when clicking outside the card and the nodes.
                 if ui.input(|inp| inp.pointer.any_pressed()) {
                     if let Some(pos) = ui.ctx().pointer_interact_pos() {
                         let on_node = rects.iter().any(|r| r.contains(pos));
@@ -8945,7 +8561,6 @@ impl App {
         });
     }
 
-    /// Per-pipeline-node detail rows (label, value), surfaced on hover.
     fn node_details(&self) -> [Vec<(&'static str, String)>; 6] {
         let r = self.rates;
         let rate = |x: f32| {
@@ -8966,8 +8581,6 @@ impl App {
                 "—".to_string()
             }
         };
-        // Live eye-camera dims (first present frame), else the device profile's nominal —
-        // so the CAMERA node shows the ACTIVE HMD's resolution, not a hardcoded 200×200.
         let (dw, dh) = {
             let f = self.tele.frames.lock().unwrap();
             f.iter()
@@ -9015,7 +8628,6 @@ impl App {
                     ("rate", if mlon { rate(r[3]) } else { "off".into() }),
                     ("outputs", "openness · wide · squeeze".into()),
                 ];
-                // Eyebrow CNN (optional) — show its live signed output per eye.
                 if self.tele.brow_loaded.load(Ordering::Relaxed) {
                     let res = *self.tele.results.lock().unwrap();
                     ml.push(("brow net", "TinyBrowNet (eye-shape)".to_string()));
@@ -9110,9 +8722,6 @@ impl App {
     }
 
     fn terminal_log(&self, ui: &mut egui::Ui, cw: f32) {
-        // A FAULT SUMMARY (first broken stage + plain cause + direct action) over the
-        // real EVENT HISTORY (the transitions collected in detect_events). Previously
-        // this rendered only current-state rows and the history was never shown.
         let oks = self.stage_oks();
         let names = ["Device", "Camera", "Gaze", "ML", "Core", "Output"];
         let first_broken = oks.iter().position(|o| !*o);
@@ -9120,14 +8729,9 @@ impl App {
         let paused = self.pipeline.paused.load(Ordering::Relaxed);
         let drop = self.drop_pct();
 
-        // Plain-language cause + the exact next action for the first broken stage.
         let (sum_col, sum_tag, sum_msg) = if let Some(i) = first_broken {
             let msg = match i {
                 0 | 1 | 2 => {
-                    // Prefer the ACTIVE adapter's own status line — it's already
-                    // device-specific and actionable (e.g. Varjo: "put the headset on";
-                    // Pimax/StarVR: "DLL load failed"). Only fall back to a generic,
-                    // device-aware hint when the status carries no information.
                     let st = self
                         .pipeline
                         .device_status
@@ -9174,7 +8778,6 @@ impl App {
                     }
                 }
             };
-            // Amber (not red) when the only "fault" is the user turning tracking off.
             (if i == 5 && paused { WARN } else { ERR }, "[!!]", msg)
         } else {
             (
@@ -9195,7 +8798,6 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(cw - 24.0 * S);
                 ui.spacing_mut().item_spacing.y = 3.0 * S;
-                // Fault summary (prominent), then a hairline, then the event history.
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0 * S;
                     ui.label(
@@ -9225,9 +8827,6 @@ impl App {
                         "no transitions yet — stage up/down and tracking toggles log here",
                     );
                 } else {
-                    // Full chronological history in a bounded, scrollable box (newest at
-                    // the bottom) so it never overflows the dashboard and older events stay
-                    // reachable. Stamp = wall-clock HH:MM:SS captured when the event fired.
                     egui::ScrollArea::vertical()
                         .max_height(96.0 * S)
                         .auto_shrink([false, true])
@@ -9241,20 +8840,14 @@ impl App {
             });
     }
 
-    /// Real dropped-frame ratio over the last window (emit cycles that overran the
-    /// 120Hz period). 0.0 when the pipeline keeps up.
     fn drop_pct(&self) -> f32 {
         let dropped = self.tele.c_drop.load(Ordering::Relaxed);
         let total = self.tele.c_emit.load(Ordering::Relaxed).max(1);
         (dropped as f32 / total as f32) * 100.0
     }
 
-    /// The Console tab: a live dump of the process's own stdout/stderr (`[xr5]`, `[vr4]`,
-    /// `[ml]`, `[brokeneye]`, …), captured by `logcap` and rendered here so runtime logs
-    /// are visible without a terminal. Monospace, auto-scrolls to the newest line.
     fn console(&mut self, ui: &mut egui::Ui) {
         let (gutter, cw) = stage_metrics(ui.ctx());
-        // Snapshot the last ~1000 lines under the lock, then release it before painting.
         let (lines, total): (Vec<String>, usize) = {
             let q = self.log.lock().unwrap();
             let total = q.len();
@@ -9271,7 +8864,6 @@ impl App {
                         ui.label(h3("Console"));
                         ui.add_space(SP2);
                         ui.label(label(&format!("{total} lines")));
-                        // Right-aligned Clear button empties the ring buffer.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let clear = egui::Button::new(
                                 egui::RichText::new("Clear")
@@ -9289,8 +8881,6 @@ impl App {
                         });
                     });
                     ui.add_space(SP2);
-                    // Monospace, auto-following log surface. Fixed height so the card fits
-                    // the fixed window; the ScrollArea scrolls within it.
                     egui::Frame::default()
                         .fill(INNER)
                         .stroke(Stroke::new(1.0, BORDER))
@@ -10028,7 +9618,6 @@ impl App {
             );
         }
 
-        // Superseded by the all-HMD Gaze-direction eyelid correction card.
         if false {
             ui.add_space(SP2);
             egui::CollapsingHeader::new(h3("Landmark / residual research recording"))
@@ -10906,14 +10495,10 @@ impl App {
             eprintln!("[wear-memory] recording not started: {blocker}");
             return;
         }
-        // A new memory always records the user's uncorrected, explicitly tuned
-        // state. Never learn the result of another recalled memory.
         self.wear_memory_matching_suspended = true;
         self.pipeline.clear_wearing_calibration_target_immediately();
         self.wear_memory.cancel_active();
         self.wear_memory.begin_capture(reason, Instant::now());
-        // The caller must not announce success when a readiness check returned
-        // early. Keep the preparation message/tone beside the actual transition.
         self.wear_memory_draft.message = Some((
             "Open both eyes, relax and look straight ahead. Recording the neutral appearance for about 1.5 seconds.".into(),
             ACCENT,
@@ -11089,8 +10674,6 @@ impl App {
         else {
             return;
         };
-        // Derive the currently effective baseline from the displayed open point.
-        // This remains correct while a remembered appearance offset is fading.
         let effective_baseline = live[eye].effective_open_ref + edit.open_point_offset[eye];
         let raw_depth = effective_baseline - median;
         let minimum = (edit.open_point_offset[eye] + EyelidResponseProfile::MIN_MANUAL_RANGE)
@@ -11113,8 +10696,6 @@ impl App {
         if let Some(preview) = self.eyelid_response_preview.as_mut() {
             preview.edit = edit;
             preview.set_link_preference(false);
-            // A per-eye capture is explicitly unlinked even if the old inferred
-            // preference was already false and had never been saved.
             preview.link_dirty = true;
             preview.dirty = true;
             preview.message = None;
@@ -11146,9 +10727,6 @@ impl App {
                 return false;
             }
             let sample = if eye == 0 { native.left } else { native.right };
-            // Teaching requires stronger evidence than recovery. Missing native
-            // capability can use the manually verified response, but invalid
-            // reported data is not an unsupported capability.
             let fallback = (ml[eye][1].is_finite() && result.openness_valid && !result.blink)
                 .then_some(result.openness);
             if !crate::wear_memory::neutral_openness(
@@ -11174,7 +10752,6 @@ impl App {
     }
 
     fn update_wear_memory(&mut self, now: Instant) {
-        // Unit discovery can enumerate USB devices; only startup/reload does it.
         let context = WearMemoryContext::new(
             &self.pipeline.device_key,
             self.wear_memory.context().unit_id.clone(),
@@ -11278,8 +10855,6 @@ impl App {
             self.eyelid_reset_message("Finish or discard the active recording / analysis before resetting.".into(), WARN);
             return;
         }
-        // Keep an on-disk undo snapshot, but do not leave a partial in-UI Undo
-        // which could restore old endpoints over the newly learned baseline.
         if let Err(error) = crate::config::create_state_backup("before-eyelid-reset") {
             self.eyelid_reset_message(format!("Backup failed; nothing was reset: {error}"), ERR);
             return;
@@ -11287,8 +10862,6 @@ impl App {
         let device = self.pipeline.device_key.clone();
         let mut next = self.config.clone();
         next.reset_eyelid_calibration_for(&device);
-        // Keep saved good states, but do not silently recall them over Reset,
-        // including after Apply & reload or an application restart.
         next.set_wearing_memory_enabled_for(&self.pipeline.device_key, false);
         if let Err(error) = next.save(&crate::config::config_path()) {
             self.eyelid_reset_message(format!("Settings could not be saved; nothing was reset: {error}"), ERR);
@@ -11333,8 +10906,6 @@ impl App {
             ),
         };
         self.eyelid_reset_result = None;
-        // Readiness still waits for 100 actual baseline samples in the memory
-        // modal; this flag only records that a new learning session was requested.
         self.wear_memory_draft.recentered = result.is_ok();
         match result {
             Ok(()) => self.eyelid_reset_message(
@@ -11368,8 +10939,6 @@ impl App {
         match next.save(&crate::config::config_path()) {
             Ok(()) => {
                 self.config = next;
-                // A Link-only UI preference must not rewrite live endpoints or
-                // disturb an active Wearing Memory correction.
                 if profile_dirty {
                     self.set_live_eyelid_response(committed);
                 }
@@ -11390,8 +10959,6 @@ impl App {
             Err(error) => {
                 let message = format!("Applied live, but automatic save failed: {error}");
                 if let Some(preview) = self.eyelid_response_preview.as_mut() {
-                    // Keep the requested runtime value live. A subsequent edit retries
-                    // persistence without surprising the user with a visual rollback.
                     preview.dirty = false;
                     preview.link_dirty = false;
                     preview.message = Some((message.clone(), ERR));
@@ -11440,7 +11007,6 @@ impl App {
         self.calibration_detail_window = Some(detail);
     }
 
-    /// Foreground home for guided workflows and individual calibration checks.
     fn calibration_detail_modal(&mut self, ctx: &egui::Context) {
         let Some(detail) = self.calibration_detail_window else {
             return;
@@ -12946,8 +12512,6 @@ impl App {
 
         });
         if response.body_returned.is_none() {
-            // The saved references remain on disk and in Memory. Only the UI
-            // texture cache is released when the list is folded.
             self.wear_thumbnails.clear();
         }
     }
@@ -12974,9 +12538,6 @@ impl App {
         let expression_live = *self.tele.expression_live.lock().unwrap();
         let stored_edit = edit;
         let rail_live = *self.tele.eyelid_live.lock().unwrap();
-        // Render the actual coordinates applied by the emit worker. If the user
-        // drags a handle, convert those coordinates back to uncorrected offsets
-        // before releasing recovery, so the untouched eye does not jump.
         if edit.manual_range || self.pipeline.wearing_calibration_target().is_some() {
             let live = rail_live;
             edit.manual_range = true;
@@ -13519,7 +13080,6 @@ impl App {
             || edit.open_point_offset != shown_edit.open_point_offset
             || edit.closed_point_depth != shown_edit.closed_point_depth;
         if !endpoints_changed {
-            // Expression/curve edits must not persist recovered endpoint values.
             edit.manual_range = stored_edit.manual_range;
             edit.open_point_offset = stored_edit.open_point_offset;
             edit.closed_point_depth = stored_edit.closed_point_depth;
@@ -13553,10 +13113,6 @@ impl App {
             self.reset_eyelid_response_preview();
         }
 
-        // Do not rewrite the TOML at display refresh rate while a slider is moving.
-        // The runtime still receives every intermediate value above; persistence
-        // happens once when the pointer gesture ends (or immediately for keyboard
-        // and checkbox changes).
         let save_now = !ui.input(|input| input.pointer.primary_down())
             && self
                 .eyelid_response_preview
@@ -14768,8 +14324,6 @@ impl App {
             ui.add_space(SP2);
             ui.label(label("Look straight ahead with both eyes relaxed, then press Recenter."));
             ui.add_space(SP2);
-            // Primary action: accent fill + dark text so it's clearly readable (the old
-            // white-on-default-grey button was low-contrast).
             ui.horizontal(|ui| {
                 let recenter = egui::Button::new(
                     egui::RichText::new("Recenter").monospace().size(13.0 * S).strong().color(BG),
@@ -14818,8 +14372,6 @@ impl App {
                     ));
                 }
                 ui.add_space(SP2);
-                // Diagnostic recorder: while on, the emit thread writes raw +
-                // every post-processing internal to a CSV in the app dir.
                 let rec_on = self.pipeline.diag_rec.load(Ordering::Relaxed);
                 let (rec_text, rec_fill) = if rec_on {
                     ("■ STOP", egui::Color32::from_rgb(0xd9, 0x53, 0x4f))
@@ -14930,9 +14482,6 @@ impl App {
         });
         ui.add_space(SP3);
 
-        // Primary, recording-free eyelid setup. The advanced capture workflows remain
-        // available below for XR5 research and targeted diagnostics, but ordinary users
-        // can now fit the model response directly from the live threshold rail.
         self.eyelid_response_controls(ui);
         ui.add_space(SP3);
 
@@ -15030,7 +14579,6 @@ impl App {
                 ));
             }
             ui.add_space(SP2);
-            // Live A/B of the RE'd channels vs the legacy derivation.
             ch |= ui.checkbox(&mut t.native_squeeze, "Native squeeze (model ch3/ch4)").changed();
             ch |= ui.checkbox(&mut t.adaptive_kalman, "Adaptive Kalman openness").changed();
             ch |= ui
@@ -15045,13 +14593,10 @@ impl App {
                     "Use learned per-eye full-close bounds. The relaxed-open baseline is calibrated separately.",
                 )
                 .changed();
-            // Robust fallback: plain per-eye ramp only (skips the curve equalizer + fast-
-            // blink latch), like native SRanipal / BrokenEye — fixes "one eye breaks".
             ch |= ui.checkbox(&mut t.wide_requires_both, "Wide needs both eyes (symmetric)").changed();
             ch |= ui.checkbox(&mut t.gaze_yoke, "Gaze yoke (squint eye follows open eye)").changed();
             let snapshot = *t;
             drop(t);
-            // Persist tuning so it survives a restart (it's a tiny file; OK to write on change).
             if ch {
                 self.config.tuning = snapshot;
                 let _ = self.config.save(&crate::config::config_path());
@@ -15063,9 +14608,6 @@ impl App {
                 self.config.tuning = def;
                 let _ = self.config.save(&crate::config::config_path());
             }
-                // One-click eyelid feel: native-style crisp close (simple mode + reachable
-                // 0-point, no curve/latch = BrokenEye-stable, no one-eye breaks) with the
-                // teleport-snap taken down a notch (close 0.85). Keeps squeeze/wide/gaze.
                 });
         });
         });
@@ -15073,9 +14615,6 @@ impl App {
         });
     }
 
-    /// VR4 and Varjo keep their frontal geometry frozen. This workflow searches only
-    /// bounded brightness, contrast, weak flattening and low-frequency illumination
-    /// differences, then admits a candidate only after untouched holdout validation.
     fn photometric_correction_card(&mut self, ui: &mut egui::Ui, width: f32) {
         let device = self.pipeline.device_key.clone();
         let capture_status = self.geometry_capture.status();
@@ -15378,9 +14917,6 @@ impl App {
         Ok(())
     }
 
-    /// Advance the one-second straight-ahead capture using fresh, de-duplicated native
-    /// gaze frames. The source snapshot is before correction, but we apply the running
-    /// HMD handedness first so the learned offsets live in the same space as the sliders.
     fn update_gaze_center_capture(&mut self) {
         let Some(capture) = self.gaze_center_capture.as_mut() else {
             return;
@@ -15433,8 +14969,6 @@ impl App {
         }
     }
 
-    /// Returns the source to apply when the user explicitly requests a reload.
-    /// Correction sliders remain live and do not require reload.
     fn gaze_correction_body(&mut self, ui: &mut egui::Ui) -> Option<GazeSource> {
         let is_xr5 = crate::config::canonical_device_key(&self.pipeline.device_key) == "pimax_xr5";
         let model_gaze = self.pipeline.model_gaze_active();
@@ -15733,8 +15267,6 @@ impl App {
         }
     }
 
-    /// Apply only the XR5 gaze-provider choice from the Calibration modal. Preserve
-    /// unrelated half-edited Settings fields instead of silently committing them.
     fn apply_gaze_source_and_reload(&mut self, source: GazeSource) {
         let mut pending_settings = self.edit.clone();
         let mut source_only = SettingsEdit::from_cfg(&self.config);
@@ -15749,9 +15281,6 @@ impl App {
         }
     }
 
-    /// The ML-input settings body (tabbed) shown inside the gear modal: an "Image" tab
-    /// (crop / stretch / rotate) and a "Filter" tab (reflection despeckle + response
-    /// heatmap), with a shared live preview of the processed model input below.
     fn ml_geometry_body(&mut self, ui: &mut egui::Ui, frames: &[Option<EyeFrame>; 2]) {
         if self.gaze_residual_capture.is_running() {
             ui.label(
@@ -15786,15 +15315,12 @@ impl App {
         ui.separator();
         ui.add_space(SP2);
         if self.geom_tab == 0 {
-            // Image tab: geometry controls, then a preview of the warped MODEL input.
             self.geom_image_controls(ui);
             ui.add_space(SP3);
             ui.separator();
             ui.add_space(SP2);
             self.geom_preview(ui, frames, true);
         } else {
-            // Filter tab: despeckle controls, then the FILTERED-EYE preview RIGHT below it,
-            // then the response heatmap.
             self.geom_filter_controls(ui);
             ui.add_space(SP3);
             ui.separator();
@@ -15804,12 +15330,7 @@ impl App {
         }
     }
 
-    /// "Image" tab: crop / stretch / rotate the image fed to the eye model — per device,
-    /// per EYE (both / left / right target selector; the cameras can sit at different
-    /// angles per eye, so each side gets its own values).
     fn geom_image_controls(&mut self, ui: &mut egui::Ui) {
-        // Manual edits save immediately. Never let an explicitly unsaved fit preview
-        // leak into config merely because the user opens this editor and moves a slider.
         self.restore_geometry_preview(false);
         ui.label(label(
             "Crop / stretch / rotate the image fed to the eye model — tune out per-person / per-HMD variance. Reset restores this HMD's built-in preset (Dream Air/XR5 uses an angled-camera reconstruction; other HMDs use no warp).",
@@ -15837,9 +15358,6 @@ impl App {
             }
         });
         ui.add_space(SP2);
-        // Sliders bind to the SELECTED eye's live values, re-read every frame — so
-        // switching the target snaps them to that eye's numbers. "both" shows the
-        // left eye's values and writes to both eyes.
         let mut g = if self.geom_eye == 2 { gs[1] } else { gs[0] };
         let mut ch = false;
         ch |= ui
@@ -15893,9 +15411,6 @@ impl App {
                     gs[0] = g;
                     gs[0].mirror_h = mirror_state[0];
                     if self.pipeline.device_key == "pimax_xr5" {
-                        // XR5 cameras are a mirrored physical pair. "both" edits the
-                        // left shape and applies its horizontal counterpart to the right
-                        // instead of destroying the asymmetric device reconstruction.
                         let mut right = g.mirrored_x();
                         right.mirror_h = mirror_state[1];
                         gs[1] = right;
@@ -15914,7 +15429,6 @@ impl App {
         }
     }
 
-    /// "Filter" tab: specular-dot despeckle + the ML response heatmap that diagnoses it.
     fn geom_filter_controls(&mut self, ui: &mut egui::Ui) {
         let device = crate::config::canonical_device_key(&self.pipeline.device_key);
         if supports_frontal_photometric_correction(&device) {
@@ -15953,7 +15467,6 @@ impl App {
             let _ = self.config.save(&crate::config::config_path());
         }
 
-        // --- Flatten shadows (illumination) ---------------------------------------------
         ui.add_space(SP3);
         ui.separator();
         ui.add_space(SP2);
@@ -15979,7 +15492,6 @@ impl App {
             let _ = self.config.save(&crate::config::config_path());
         }
 
-        // --- Fixed manual brightness ----------------------------------------------------
         ui.add_space(SP3);
         ui.separator();
         ui.add_space(SP2);
@@ -16034,8 +15546,6 @@ impl App {
         }
     }
 
-    /// The ML response heatmap section (occlusion sensitivity), shown in the Filter tab
-    /// BELOW the filtered-eye preview.
     fn geom_heatmap(&mut self, ui: &mut egui::Ui) {
         ui.add_space(SP3);
         ui.separator();
@@ -16231,11 +15741,6 @@ impl App {
         }
     }
 
-    /// Live preview inside the modal. `warped=true` (Image tab) shows the geometry-warped
-    /// MODEL input (100x100) so crop/rotate is visible; `warped=false` (Filter tab) shows
-    /// the despeckled REAL eye at its native resolution and NATURAL orientation — L on the
-    /// left, R on the right, matching the live cameras — so you can see the reflection dots
-    /// removed. Neither applies the ML left/right mirror.
     fn geom_preview(&mut self, ui: &mut egui::Ui, frames: &[Option<EyeFrame>; 2], warped: bool) {
         ui.label(label(if warped {
             "Model input preview (crop / rotate / stretch applied):"
@@ -16246,8 +15751,6 @@ impl App {
         let g = *self.pipeline.geometry.lock().unwrap();
         let dsp = *self.pipeline.despeckle.lock().unwrap();
         let flt = *self.pipeline.flatten.lock().unwrap();
-        // Preview is intentionally best-effort and may use the newest affine with
-        // the newest camera frame. Persistent recordings use the bundled source pair.
         let aff = self.pipeline.bright_affine.lock().unwrap().affine;
         let fitted = *self.pipeline.photometric_correction.lock().unwrap();
         let side = 150.0 * S;
@@ -16262,8 +15765,6 @@ impl App {
                 };
                 if let Some(frame) = &frames[i] {
                     let (fw, fh, px) = frame.view();
-                    // Match the ML input pipeline: despeckle -> flatten -> adaptive
-                    // brightness -> fitted photometric correction -> fixed geometry.
                     let filtered =
                         crate::ml::preprocess::despeckle(px, fw as usize, fh as usize, &dsp);
                     let flat =
@@ -16277,8 +15778,6 @@ impl App {
                         &fitted,
                         i,
                     );
-                    // Build the display image: the warped model input (geometry, NO mirror),
-                    // or the despeckled + brightness-matched real eye at native res.
                     let built = if warped {
                         let prev = crate::ml::preprocess::ml_input_preview(
                             &photometric,
@@ -16346,21 +15845,15 @@ impl App {
         });
     }
 
-    /// Full-screen modal for the ML-input geometry editor (opened by the eye-cameras
-    /// gear). Dims the app behind it to focus attention (egui has no true backdrop blur)
-    /// and centers a SCROLLABLE panel so the controls never clip. Dismiss by the Close
-    /// button, a click on the dimmed area, or Esc.
     fn geom_modal(&mut self, ctx: &egui::Context, frames: &[Option<EyeFrame>; 2]) {
         let screen = ctx.screen_rect();
         let closed = egui::Area::new(egui::Id::new("geom_modal"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
-                // Dim scrim over the whole app, and swallow clicks meant for behind it.
                 ui.painter()
                     .rect_filled(screen, 0.0, Color32::from_black_alpha(195));
                 let scrim = ui.interact(screen, egui::Id::new("geom_scrim"), Sense::click());
-                // Centered panel, capped so it fits small screens; its content scrolls.
                 let pw = (screen.width() * 0.72).clamp(340.0, 660.0 * S);
                 let ph = (screen.height() * 0.88).clamp(300.0, 780.0 * S);
                 let panel = Rect::from_center_size(screen.center(), vec2(pw, ph));
@@ -16376,7 +15869,6 @@ impl App {
                         close_btn = ui.button("Close").clicked();
                     });
                 });
-                // Close on the Close button, or a click on the dimmed area OUTSIDE the panel.
                 let outside = scrim.clicked()
                     && scrim
                         .interact_pointer_pos()
@@ -16389,8 +15881,6 @@ impl App {
         }
     }
 
-    /// Eyebrow calibration card shared by every HMD. Guides the user through the vr_eyebrow capture protocol
-    /// and writes RAW eye frames + labels.csv under base_dir()/brow_data.
     fn eyebrow_calib_card(&mut self, ui: &mut egui::Ui, cw: f32) {
         let status = self.brow.status();
         let total_cap = self.brow.total_captured();
@@ -16461,7 +15951,6 @@ impl App {
                     }
                     ui.add_space(SP3);
 
-        // --- Current-phase card ------------------------------------------------------
         card().show(ui, |ui| {
             ui.set_width(cw - 2.0 * CARD_PAD);
             ui.label(h3("Record eyebrow expressions"));
@@ -16471,7 +15960,6 @@ impl App {
             ));
             ui.add_space(SP3);
 
-            // Big instruction + per-phase state, color-coded by phase kind.
             let (accent, big, sub, frac) = match status {
                 BrowStatus::Idle => (
                     TEXT2,
@@ -16502,10 +15990,8 @@ impl App {
             ui.add_space(SP2);
             ui.label(egui::RichText::new(sub).monospace().size(11.0 * S).color(TEXT2));
             ui.add_space(SP2);
-            // Per-phase progress bar (only meaningful during a capture phase).
             bar(ui, cw - 2.0 * CARD_PAD, 12.0 * S, frac, accent);
             ui.add_space(SP2);
-            // Overall progress across ALL capture phases.
             let ofrac = if total_target > 0 { total_cap as f32 / total_target as f32 } else { 0.0 };
             ui.label(egui::RichText::new(
                 format!("total {total_cap}/{total_target} frames"),
@@ -16514,7 +16000,6 @@ impl App {
             bar(ui, cw - 2.0 * CARD_PAD, 8.0 * S, ofrac, OK);
 
             ui.add_space(SP3);
-            // Buttons: Start (idle/done) | Abort (running).
             ui.horizontal(|ui| {
                 let running = self.brow.is_running();
                 let start_txt = if self.brow.is_done() { "Capture again" } else { "Start" };
@@ -16544,9 +16029,6 @@ impl App {
                         .strong()
                         .color(if running { TEXT1 } else { TEXT3 }),
                 )
-                // Never fall back to egui's default disabled-button surface: on
-                // this dark theme it can render as a white rectangle with the
-                // disabled label effectively invisible.
                 .fill(INNER)
                 .stroke(Stroke::new(1.0, if running { ERR } else { BORDER }));
                 let abort_resp = ui.add_enabled_ui(running, |ui| {
@@ -16572,11 +16054,9 @@ impl App {
 
         ui.add_space(SP3);
 
-        // --- Fit in app (pure-Rust head-fit, no Python) — the recommended lighter path ---
         self.brow_fit_ui(ui, cw);
         ui.add_space(SP3);
 
-        // --- B-2: Train & bake (full external PyTorch retrain) -----------------------
         self.brow_train_ui(ui, cw);
                 });
         });
@@ -16585,21 +16065,14 @@ impl App {
         }
     }
 
-    /// The "Fit in app (no Python)" card: re-fits the output head onto the captured brow_data
-    /// using an existing brow.bin as a FROZEN conv backbone — pure Rust, seconds. The lighter,
-    /// recommended path for a quick per-user recalibration; the full retrain lives below. On
-    /// success the produced brow.bin is hot-loaded into the LIVE pipeline (no reconnect).
     fn brow_fit_ui(&mut self, ui: &mut egui::Ui, cw: f32) {
-        // Consume a completed fit once: persist the model path + hot-swap it in.
         self.apply_fit_result_if_ready();
 
         let status = self.fitter.status();
         let running = status.is_running();
 
-        // Preconditions: a captured dataset + a base model to reuse as the frozen backbone.
         let labels = self.brow.root().join("labels.csv");
         let has_labels = labels.is_file();
-        // Base backbone = the configured model, else the Settings text field — whichever is a file.
         let backbone: Option<std::path::PathBuf> = self
             .config
             .brow_model_path()
@@ -16623,7 +16096,6 @@ impl App {
             ));
             ui.add_space(SP2);
 
-            // No base model yet? Say exactly how to get one, and render nothing else.
             let Some(backbone_bin) = backbone else {
                 ui.label(egui::RichText::new(
                     "Choose a base brow.bin in Settings → Tracking → Models.",
@@ -16660,7 +16132,6 @@ impl App {
                         }
                     }
                 }
-                // Stage / result label next to the button.
                 match &status {
                     FitStatus::Idle => {}
                     FitStatus::Running { .. } => {
@@ -16678,14 +16149,12 @@ impl App {
                 }
             });
 
-            // Precondition hint when the button is disabled (and not already running).
             if !has_labels && !running {
                 ui.add_space(SP2);
                 ui.label(egui::RichText::new("Record eyebrow expressions first.")
                     .monospace().size(10.0 * S).color(WARN));
             }
 
-            // Live log (bounded, scrollable, newest at the bottom).
             let log: &[String] = match &status {
                 FitStatus::Running { log }
                 | FitStatus::Done { log, .. }
@@ -16708,15 +16177,10 @@ impl App {
         });
     }
 
-    /// B-2: the "Train & bake" card on the Eyebrow-calibration tab. Drives the external
-    /// PyTorch trainer + bake as a subprocess (via [`BrowTrainer`]) and, on success,
-    /// hot-loads the produced brow.bin into the LIVE pipeline (no reconnect).
     fn brow_train_ui(&mut self, ui: &mut egui::Ui, cw: f32) {
-        // Consume a completed run once: persist the model path + hot-swap it in.
         self.apply_train_result_if_ready();
 
         let status = self.trainer.status();
-        // Preconditions for the button (report exactly what's missing, VRCFT-anti-opacity).
         let labels = self.brow.root().join("labels.csv");
         let has_labels = labels.is_file();
         let py = self.edit.python_exe.trim().to_string();
@@ -16748,7 +16212,6 @@ impl App {
             ));
             ui.add_space(SP2);
 
-            // The action button + a one-line state summary.
             ui.horizontal(|ui| {
                 let btn = egui::Button::new(
                     egui::RichText::new("Train & bake")
@@ -16785,7 +16248,6 @@ impl App {
                         }
                     }
                 }
-                // Stage / result label next to the button.
                 match &status {
                     TrainStatus::Idle => {}
                     TrainStatus::Running { stage, .. } => {
@@ -16815,7 +16277,6 @@ impl App {
                 }
             });
 
-            // What's missing (only when the button is disabled and not already running).
             if !missing.is_empty() && !running {
                 ui.add_space(SP2);
                 ui.label(
@@ -16826,7 +16287,6 @@ impl App {
                 );
             }
 
-            // Live streamed log (bounded, scrollable, newest at the bottom).
             let log: &[String] = match &status {
                 TrainStatus::Running { log, .. }
                 | TrainStatus::Done { log, .. }
@@ -16854,9 +16314,6 @@ impl App {
         });
     }
 
-    /// If the trainer just finished, set `brow_model` to the baked `brow.bin`, persist the
-    /// config, and hot-load it into the running pipeline (no reconnect). Guarded so it runs
-    /// exactly once per completed run.
     fn apply_train_result_if_ready(&mut self) {
         if self.train_applied {
             return;
@@ -16868,23 +16325,14 @@ impl App {
         self.hot_load_brow_model(&brow_bin);
     }
 
-    /// Persist a freshly-produced `brow.bin` as the active eyebrow model and hot-swap it into
-    /// the LIVE pipeline (no device reconnect, no port re-bind). Shared by the Train & bake and
-    /// the in-app Fit paths.
     fn hot_load_brow_model(&mut self, brow_bin: &std::path::Path) {
-        // Persist the produced model path so it survives a restart.
         let path_str = brow_bin.to_string_lossy().into_owned();
         self.config.assets.brow_model = Some(path_str.clone());
         self.edit.brow_model = path_str;
         let _ = self.config.save(&crate::config::config_path());
-        // Hot-swap the model into the LIVE pipeline: load the BrowNet and hand it to the
-        // running ML thread via the shared handle (no device reconnect, no port re-bind).
         match crate::ml::brow_net::BrowNet::load(brow_bin) {
             Ok(net) => {
                 let out_dim = net.out_dim();
-                // set_brow flips `tele.brow_loaded` on the existing telemetry Arc (the UI
-                // already reads it), so no tele/engine rebuild is needed — the dashboard's
-                // ML node starts showing live brow L/R on the next frame.
                 self.pipeline.set_brow(Some(net));
                 self.events.push((
                     now_hms(),
@@ -16899,8 +16347,6 @@ impl App {
         }
     }
 
-    /// If the in-app fit just finished, persist + hot-load the produced brow.bin. Guarded so it
-    /// runs exactly once per completed fit (mirrors [`Self::apply_train_result_if_ready`]).
     fn apply_fit_result_if_ready(&mut self) {
         if self.fit_applied {
             return;
@@ -16963,8 +16409,6 @@ impl App {
             ui.vertical(|ui| {
                 ui.set_width(cw);
 
-                // Keep the only destructive/engine-level action visible while the
-                // individual setting groups scroll underneath it.
                 card().show(ui, |ui| {
                     ui.set_width(cw - 2.0 * CARD_PAD);
                     ui.horizontal_wrapped(|ui| {
@@ -17136,7 +16580,6 @@ impl App {
                                      .add_filter("Local XR5 gaze package", &["xr5gaze"])
                                      .set_title("Choose a trusted local gaze package").pick_file() {
                                      self.config.hmd.xr5_gaze_package = path;
-                                     // Import alone does not execute the package. Explicitly select Model next.
                                      if self.config.hmd.xr5_model_gaze { *do_reload = true; }
                                  }
                              }
@@ -17630,8 +17073,6 @@ impl App {
             self.pipeline.ml_mirror_l.load(Ordering::Relaxed),
             self.pipeline.ml_mirror_r.load(Ordering::Relaxed),
         ];
-        // A mapping checkbox is another persistence path. Discard an unsaved geometry
-        // preview first, then re-apply the checkbox value that triggered this call.
         self.restore_geometry_preview(false);
         self.pipeline
             .ml_mirror_l
@@ -17639,8 +17080,6 @@ impl App {
         self.pipeline
             .ml_mirror_r
             .store(requested_mirrors[1], Ordering::Relaxed);
-        // Mirror is persisted beside crop/rotation as a tri-state so an older config's
-        // missing field inherits the XR5 preset, while a new explicit "off" remains off.
         let mut geometry = *self.pipeline.geometry.lock().unwrap();
         geometry[0].mirror_h = Some(self.pipeline.ml_mirror_l.load(Ordering::Relaxed));
         geometry[1].mirror_h = Some(self.pipeline.ml_mirror_r.load(Ordering::Relaxed));
@@ -17658,15 +17097,10 @@ impl App {
         let _ = self.config.save(&crate::config::config_path());
     }
 
-    /// Apply the edited asset paths: write sranibro.toml, tear down the running
-    /// engine (frees the EyeChip + TCP port), and rebuild it in-process from the
-    /// new config. On failure the message is shown and the user can fix + retry.
     fn apply_and_reload(&mut self) {
         #[cfg(all(feature = "external-eyelid-model", any(all(windows, not(feature = "xr5-only")), all(target_os = "linux", feature = "xr5-only"))))]
         if self.config.ui.inference_enabled && self.config.xr5_research.enabled && self.config.xr5_research.avatar
             && crate::config::running_device_key(&self.edit.device, &self.pipeline.device_key) == "pimax_xr5" {
-            // Do not tear down a working tracker when its selected model was
-            // removed/corrupted after browsing, or the app ZIP was not unpacked.
             let checked = crate::ml::external_eyelid::Package::read(
                 &crate::ml::external_eyelid::resolve(self.config.xr5_research.model_file()));
             if let Err(error) = checked {
@@ -17780,8 +17214,6 @@ impl App {
             return;
         }
 
-        // Tear down first: releases the WinUSB handle and TCP port 5555 so the
-        // rebuild can re-acquire them cleanly (the user opted into live re-init).
         let shutdown = self.pipeline.take_shutdown();
         let config = self.config.clone();
         #[cfg(any(windows, target_os = "linux"))]
@@ -17881,9 +17313,6 @@ fn accepted_eye_text(eyes: [bool; 2]) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Widgets + icons
-// ---------------------------------------------------------------------------
 
 enum SranipalPathAction {
     StartAuto,
@@ -18070,17 +17499,11 @@ fn settings_path_row(ui: &mut egui::Ui, name: &str, value: &mut String, pick_dir
     ui.add_space(4.0 * S);
 }
 
-/// (left gutter, content column width) for the central panel, in points.
-/// Derived from the configured window width and the real ppp — never from
-/// egui's `available_*`, which over-reports the surface on this display.
-/// `content_w` is the full visible width; subtract the nav rail and the
-/// central panel's own margins to get the usable column.
 fn stage_metrics(ctx: &egui::Context) -> (f32, f32) {
     let cw = content_w(ctx) - NAV_W - 2.0 * MAIN_PAD;
     (0.0, cw)
 }
 
-/// Local wall-clock "HH:MM:SS" for event timestamps (captured when the event fires).
 #[cfg(windows)]
 fn now_hms() -> String {
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -18088,7 +17511,6 @@ fn now_hms() -> String {
     unsafe { GetLocalTime(&mut st) };
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
-/// Non-Windows fallback (compile-only; the app runs on Windows) — UTC time-of-day.
 #[cfg(not(windows))]
 fn now_hms() -> String {
     let s = std::time::SystemTime::now()
@@ -18122,9 +17544,6 @@ fn log_line(ui: &mut egui::Ui, tag: &str, col: Color32, module: &str, msg: &str)
     });
 }
 
-/// Per-line tint for the Console tab: errors stand out (ERR), device-stage lines
-/// (`[xr5]`/`[vr4]`) get the ACCENT so pipeline chatter is easy to follow, everything
-/// else is the muted-but-legible TEXT2. Case-insensitive on the error keywords.
 fn log_color(line: &str) -> Color32 {
     let lo = line.to_ascii_lowercase();
     if lo.contains("error") || lo.contains("fail") || lo.contains("panic") || line.contains("!!") {
@@ -18141,16 +17560,12 @@ fn bar(ui: &mut egui::Ui, w: f32, h: f32, frac: f32, col: Color32) {
     draw_bar(ui.painter(), rect, frac, col);
 }
 
-/// Draw a horizontal fill bar into `rect` (rounded track + clipped fill). No allocation, so
-/// it can be composed (e.g. a main bar + a thin raw bar in one column).
 fn draw_bar(p: &egui::Painter, rect: Rect, frac: f32, col: Color32) {
     let rad = (rect.height() * 0.33).min(4.0 * S);
     p.rect_filled(rect, rad, INNER);
     let f = frac.clamp(0.0, 1.0);
     let fw = rect.width() * f;
     if fw > 0.5 {
-        // Left corners rounded; right edge square (like a clipped track fill),
-        // except when full where it matches the track's right radius.
         let r = if f > 0.995 { rad } else { 0.0 };
         let rounding = egui::Rounding {
             nw: rad,
@@ -18163,10 +17578,6 @@ fn draw_bar(p: &egui::Painter, rect: Rect, frac: f32, col: Color32) {
     }
 }
 
-/// A corrected bar with a THIN raw (model-output) bar just below it, in a `w x row_h` column
-/// — so you can see whether a value is shaped at the MODEL or in POST-PROCESSING. `marker`
-/// (0..1) draws a small red vertical tick on the RAW bar (used to show the learned baseline
-/// on the wide row: if it creeps up toward the raw-openness fill, the calibration is drifting).
 fn bar_with_raw(
     ui: &mut egui::Ui,
     w: f32,
@@ -18198,11 +17609,6 @@ fn bar_with_raw(
     }
 }
 
-/// Center-origin (bipolar) bar: `val` in [-1,1], 0 = center. Fills rightward for
-/// positive, leftward for negative; |val| scales the half-width. Same track
-/// background/rounding as `bar`. The inner-edge corners (at center) stay square so
-/// the fill reads as growing out from the middle line.
-/// Draw a center-origin (bipolar) fill bar into `rect`. No allocation (composable).
 fn draw_bar_bipolar(p: &egui::Painter, rect: Rect, val: f32, col: Color32) {
     let rad = (rect.height() * 0.33).min(4.0 * S);
     p.rect_filled(rect, rad, INNER);
@@ -18235,7 +17641,6 @@ fn draw_bar_bipolar(p: &egui::Painter, rect: Rect, val: f32, col: Color32) {
     }
 }
 
-/// Bipolar corrected bar + a thin bipolar raw bar below it (see `bar_with_raw`).
 fn bar_bipolar_with_raw(
     ui: &mut egui::Ui,
     w: f32,
@@ -18256,7 +17661,6 @@ fn bar_bipolar_with_raw(
     draw_bar_bipolar(p, rawr, raw.clamp(-1.0, 1.0), lerp_color(fill, INNER, 0.5));
 }
 
-/// 3-tier value color (mockup): exactly-0 dim, small-but-present mid, larger accent.
 fn grad_col(v: f32) -> Color32 {
     if v < 0.005 {
         TEXT3
@@ -18267,8 +17671,6 @@ fn grad_col(v: f32) -> Color32 {
     }
 }
 
-/// One ML table row: 64*S label | bar | 38*S value | bar | 38*S value, gap 6*S.
-/// `row_h`/`bar_h` let rows grow to fill a stretched card.
 #[allow(clippy::too_many_arguments)]
 fn ml_row(
     ui: &mut egui::Ui,
@@ -18317,8 +17719,6 @@ fn ml_row(
     });
 }
 
-/// Like `ml_row` but the L/R column bars are center-origin/bipolar (`bar_bipolar`):
-/// `l`/`r` in [-1,1], 0 = center, positive extends RIGHT, negative extends LEFT.
 #[allow(clippy::too_many_arguments)]
 fn ml_row_bipolar(
     ui: &mut egui::Ui,
@@ -18365,8 +17765,6 @@ fn ml_row_bipolar(
     });
 }
 
-/// Hover card for a pipeline node: title + label/value rows. Uses a fixed label
-/// column (NOT right_to_left, which over-reports width in a tooltip and clips).
 fn node_detail_card(ui: &mut egui::Ui, title: &str, ok: bool, rows: &[(&'static str, String)]) {
     ui.spacing_mut().item_spacing.y = 3.0 * S;
     ui.horizontal(|ui| {
@@ -18402,8 +17800,6 @@ fn node_detail_card(ui: &mut egui::Ui, title: &str, ok: bool, rows: &[(&'static 
     }
 }
 
-/// Paint one pipeline node into an exact rect (icon over name over dot+value).
-/// Used by the branched pipeline, which positions nodes with explicit geometry.
 #[allow(clippy::too_many_arguments)]
 fn pipeline_node(
     ui: &egui::Ui,
@@ -18418,9 +17814,6 @@ fn pipeline_node(
     border: Color32,
 ) {
     let p = ui.painter();
-    // `fill` masks the connectors that pass under the node; SURFACE == the card, so a
-    // healthy node reads as floating icon+label (no boxed tile). A transparent border
-    // is skipped — only the first-broken stage gets a visible container.
     p.rect_filled(rect, R_INNER, fill);
     if border != Color32::TRANSPARENT {
         p.rect_stroke(rect, R_INNER, Stroke::new(1.0, border));
@@ -18454,9 +17847,6 @@ fn pipeline_node(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Composite one heatmap pixel: the grayscale eye under a diverging colour overlay whose
-/// alpha grows with |delta|/vmax. Warm (red) = occluding/glinting here RAISED the signed
-/// delta, cool (blue) = lowered it; transparent where the model barely reacts.
 fn heat_color(gray: u8, delta: f32, vmax: f32) -> Color32 {
     let base = gray as f32;
     let v = (delta / vmax).clamp(-1.0, 1.0);
@@ -18485,12 +17875,8 @@ fn dashboard_wide_display(
     custom_raw: [f32; 2],
 ) -> DashboardWideDisplay {
     if custom_active {
-        // Custom Wide has its own score space; the SRanipal neutral is not a
-        // meaningful marker on this bar.
         DashboardWideDisplay { raw: custom_raw, neutral: [None; 2] }
     } else if let Some(comparison) = comparison {
-        // Same physical-eye routing as the independent ch2 Wide state: shadow
-        // right head for LEFT, normal right head for RIGHT. Never use ch1 here.
         DashboardWideDisplay {
             raw: [comparison.openness[0], comparison.normal_openness[1]],
             neutral: wide_baselines.map(Some),
@@ -18528,8 +17914,6 @@ impl DashboardBrowSource {
     }
 }
 
-/// Compact two-way source selector used in the ML diagnostics footer. Its bounds are
-/// explicit so it cannot push into the DROP readout when the card is narrow.
 fn brow_source_switch(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -18554,8 +17938,6 @@ fn brow_source_switch(
         },
     );
 
-    // Return the explicit selection, not just a changed legacy bit. Old configs
-    // can have both sources disabled; clicking Estimate must enable its worker.
     let selected = if legacy_response.clicked() {
         Some(DashboardBrowSource::Legacy)
     } else if brow_model_loaded && estimate_response.clicked() {
@@ -18629,8 +18011,6 @@ fn brow_source_switch(
     selected
 }
 
-/// Conventional pill switch for optional eyebrow stereo synchronization. The
-/// label and pill share one hit target so the compact footer remains easy to use.
 fn brow_lr_sync_switch(ui: &mut egui::Ui, hit_rect: Rect, switch_rect: Rect, value: &mut bool, enabled: bool) {
     let response = ui.interact(hit_rect, Id::new("ml_brow_lr_sync"), if enabled { Sense::click() } else { Sense::hover() });
     if enabled && response.clicked() {
@@ -18641,8 +18021,6 @@ fn brow_lr_sync_switch(ui: &mut egui::Ui, hit_rect: Rect, switch_rect: Rect, val
     }
 
     let painter = ui.painter();
-    // Preserve the preference while Legacy is selected, but never paint an
-    // effective ON state for a feature that the VRCFT Legacy route does not use.
     let active = enabled && *value;
     let fill = if active { ACCENT_BG } else { INNER };
     let outline = if active { ACCENT } else { BORDER_STRONG };
@@ -18691,7 +18069,6 @@ fn ml_params_card(
     card().show(ui, |ui| {
         ui.set_width(inner);
         ui.set_min_height(min_inner);
-        // Header: title left, "L / R · <ml>/s" (live rate) pinned right.
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("ML PARAMETERS")
@@ -18709,31 +18086,17 @@ fn ml_params_card(
             });
         });
         ui.add_space(11.0 * S);
-        // Columns: label 64 | bar 1fr | value 38 | bar 1fr | value 38, gap 6.
         let bar_w = ((inner - 64.0 * S - 2.0 * 38.0 * S - 4.0 * 6.0 * S) / 2.0).max(40.0 * S);
-        // Grow the 4 ML data rows (openness/wide/squeeze/brow —
-        // pupil is NOT an ML output, it lives in the eye-cameras card) + taller
-        // bars to fill a stretched card. The math sums EXACTLY to min_inner
-        // (header + lr + 4*row + 4*gap + footer); the footer pad below clamps at
-        // 0 to avoid overflow.
         let lr_h = 11.0 * S;
         let row_gap = 8.0 * S;
-        // Footer = separator(1) + gap(10*S) + one flat diagnostics row(20*S). No
-        // nested tiles (was bordered mini-cells inside this bordered card).
         let footer_h = 30.0 * S + 1.0;
         let header_block = ui.cursor().top() - ui.min_rect().top();
-        // egui won't render a row shorter than its interact_size.y (~18 logical pts),
-        // so PREDICT every row at >= that height. 5 row_gaps actually render (before the
-        // LEFT/RIGHT header row + between the 4 data rows), not 4. Under-predicting any
-        // of these overshoots row_h and pushes the card past min_inner — the trailing
-        // `pad` only absorbs OVER-prediction, never overflow.
         let row_min = 18.0_f32;
         let region = (min_inner - header_block - footer_h - lr_h.max(row_min) - 5.0 * row_gap)
             .max(4.0 * row_min);
         let row_h = (region / 4.0).clamp(row_min, 52.0 * S);
         let bar_h = (row_h * 0.4).clamp(9.0 * S, 24.0 * S);
         ui.spacing_mut().item_spacing.y = row_gap;
-        // Header row: LEFT / RIGHT centered over their bar columns.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0 * S;
             ui.allocate_exact_size(vec2(64.0 * S, lr_h), Sense::hover());
@@ -18756,11 +18119,8 @@ fn ml_params_card(
             );
             ui.allocate_exact_size(vec2(38.0 * S, lr_h), Sense::hover());
         });
-        // Blink is folded into openness: a blinking eye reads ~0 and its value
-        // turns amber, so no separate blink indicator is needed.
         let l_open = if results[0].blink { WARN } else { OK };
         let r_open = if results[1].blink { WARN } else { OK };
-        // Thin bars use each expression's own model source, not the final output.
         ml_row(
             ui,
             "openness",
@@ -18777,8 +18137,6 @@ fn ml_params_card(
             row_h,
             bar_h,
         );
-        // Independent ch2 raw input and its neutral, matching the Wide state that
-        // drives the live response rail. Never pair a ch2 value with a ch1 baseline.
         ml_row(
             ui,
             "wide",
@@ -18811,8 +18169,6 @@ fn ml_params_card(
             row_h,
             bar_h,
         );
-        // Eyebrow (signed brow in [-1,1]) shown as ONE center-origin bar: 0 = center,
-        // positive extends RIGHT, negative extends LEFT. 0 when no brow model is loaded.
         let brow_l = results[0].brow;
         let brow_r = results[1].brow;
         ml_row_bipolar(
@@ -18829,10 +18185,6 @@ fn ml_params_card(
             row_h,
             bar_h,
         );
-        // Footer (separator + mini-row) pinned to the bottom of the stretched
-        // card. Measure content height from the cursor, NOT min_rect (set_min_height
-        // already inflated min_rect to min_inner, which would zero out the pad).
-        // Zero item-spacing so the footer height is exactly footer_h.
         ui.spacing_mut().item_spacing.y = 0.0;
         let used = ui.cursor().top() - ui.min_rect().top();
         let pad = (min_inner - used - footer_h).max(0.0);
@@ -18840,9 +18192,6 @@ fn ml_params_card(
         let (sep, _) = ui.allocate_exact_size(vec2(inner, 1.0), Sense::hover());
         ui.painter().rect_filled(sep, 0.0, BORDER);
         ui.add_space(10.0 * S);
-        // Flat diagnostics + live switches row. DROP = % of 120Hz emit cycles that
-        // ran late (0 = keeping up). Explicit rectangles keep every control clear of
-        // DROP even at the card's minimum supported width.
         let (row, _) = ui.allocate_exact_size(vec2(inner, 20.0 * S), Sense::hover());
         let cy = row.center().y;
         let dc = if drop < 0.5 { OK } else { WARN };
@@ -18861,7 +18210,6 @@ fn ml_params_card(
             dc,
         );
 
-        // Right-aligned controls: eyebrow source plus optional stereo output sync.
         let switch_size = vec2(28.0 * S, 16.0 * S);
         let switch_rect =
             Rect::from_center_size(pos2(row.right() - switch_size.x * 0.5, cy), switch_size);
@@ -18915,8 +18263,6 @@ fn eye_cams_card(
     ctx: &egui::Context,
 ) -> bool {
     let inner = w - 2.0 * CARD_PAD;
-    // Resolution label: the live frame's real dims when streaming, else the device
-    // profile's nominal — per-HMD (VR4/StarVR 200x200, Varjo higher), not hardcoded.
     let (dw, dh) = frames
         .iter()
         .flatten()
@@ -18927,8 +18273,6 @@ fn eye_cams_card(
     card().show(ui, |ui| {
         ui.set_width(inner);
         ui.set_min_height(min_inner);
-        // Header: a small gear (opens ML-input settings) at the far left, then the title.
-        // The dashboard preview switch affects presentation only; tracking stays live.
         let clicked = ui
             .horizontal(|ui| {
                 let (grect, gresp) = ui.allocate_exact_size(vec2(18.0 * S, 14.0 * S), if raw_only {Sense::hover()}else{Sense::click()});
@@ -18968,8 +18312,6 @@ fn eye_cams_card(
                     );
                     if *preview_enabled {
                         ui.add_space(4.0 * S);
-                        // Source toggle: RAW cameras vs the exact image sent to the eye
-                        // net (all filters + geometry, shown un-mirrored).
                         let txt = if *net_view { "NET" } else { "RAW" };
                         let color = if *net_view { ACCENT } else { TEXT3 };
                         let tr = ui
@@ -19007,9 +18349,6 @@ fn eye_cams_card(
             .inner;
         ui.add_space(9.0 * S);
         let box_w = ((inner - 9.0 * S) / 2.0).floor();
-        // Keep the original two-eye layout while preview is off. Only the image
-        // texture disappears; L/R identity, camera rate, spacing, and card geometry
-        // stay unchanged, so toggling preview cannot make the dashboard jump.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 9.0 * S;
             if *preview_enabled && *net_view {
@@ -19048,8 +18387,6 @@ fn eye_cam_box(
         ui.set_width(w);
         if upload_texture {
             if let Some((fw, fh, px)) = frame {
-                // Build the texture at the frame's NATIVE resolution (per-HMD); the box
-                // displays it scaled to the square slot.
                 let (iw, ih) = (fw as usize, fh as usize);
                 if iw > 0 && ih > 0 && px.len() >= iw * ih {
                     let mut img = egui::ColorImage::new([iw, ih], Color32::BLACK);
@@ -19065,9 +18402,6 @@ fn eye_cam_box(
                 }
             }
         }
-        // Allocate an exact w x w rect FIRST, then paint into it. egui::Image with
-        // a texture otherwise ignores its size and inflates to phantom available
-        // width, which would widen the whole card.
         let sz = vec2(w, w);
         let (rect, _) = ui.allocate_exact_size(sz, Sense::hover());
         if show_texture {
@@ -19086,13 +18420,8 @@ fn eye_cam_box(
                 );
             }
         } else {
-            // Preview OFF deliberately looks like the normal L/R camera slots with
-            // their video layer removed, not one merged placeholder panel.
             ui.painter().rect_filled(rect, R_BOX, INNER);
         }
-        // Box frame + overlays (L/R top-left, fps bottom-right). Each overlay gets a
-        // dark scrim chip so it stays legible over bright IR (token contrast can't be
-        // guaranteed against live imagery).
         ui.painter()
             .rect_stroke(rect, R_BOX, Stroke::new(1.0, BORDER));
         let p = ui.painter().clone();
@@ -19100,7 +18429,6 @@ fn eye_cam_box(
             let fid = FontId::monospace(sz);
             let g = ui.fonts(|f| f.layout_no_wrap(txt.to_string(), fid.clone(), col));
             let ts = g.size();
-            // Place the text rect per alignment, then a padded dark backing behind it.
             let min = pos2(
                 anchor.x
                     - if align.x() == egui::Align::Max {
@@ -19138,7 +18466,6 @@ fn eye_cam_box(
             8.0 * S,
             TEXT3,
         );
-        // Under-box line: pupil Ø only (blink lives in the ML card now).
         ui.add_space(5.0 * S);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0 * S;
@@ -19181,9 +18508,6 @@ enum Icon {
     Console,
 }
 
-/// Hand-drawn vector glyphs (Tabler-equivalents) so the console matches the
-/// mockup's icon set without bundling an icon font. Coordinates are in a unit
-/// box [0,1] mapped onto the `size` square centered at `c`.
 fn draw_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
     let st = Stroke::new(1.6, col);
     let thin = Stroke::new(1.3, col);
@@ -19337,7 +18661,6 @@ fn draw_icon(p: &egui::Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
             line(vec![pt(0.17, 0.26), pt(0.18, 0.51), pt(0.40, 0.40)], bold);
         }
         Icon::Console => {
-            // A terminal window with a `>_` prompt: rounded frame + chevron + caret line.
             p.rect_stroke(
                 Rect::from_min_max(pt(0.14, 0.20), pt(0.86, 0.80)),
                 size * 0.08,

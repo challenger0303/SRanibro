@@ -1,9 +1,3 @@
-//! Research-only counterfactual replay for the XR5 nine-target residual recording.
-//!
-//! The tool applies one bounded intervention at a time after the captured adaptive
-//! brightness affine and before production geometry, then replays the exact EyeNet.
-//! Discovery-train rows alone rank probes. Holdout rows are report-only and become
-//! statistically consumed once displayed. No probe is applied to live configuration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -445,8 +439,6 @@ fn residual_metrics(
             .collect::<Vec<_>>();
         percentile(&errors, 0.50).unwrap_or(f32::INFINITY)
     });
-    // Score each instructed close/open cycle independently so a target-specific
-    // openness offset cannot manufacture or erase trajectory compliance.
     let slow_rho = std::array::from_fn(|eye| {
         let correlations = slow_by_phase[eye]
             .values()

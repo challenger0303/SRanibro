@@ -1,4 +1,3 @@
-//! World-fixed recorder target context. No measured eye gaze is inferred here.
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -17,7 +16,6 @@ pub struct WorldPose {
     pub queried_at: Instant,
     pub target_world: [f32; 3],
     pub head_to_world: Matrix34,
-    /// Runtime view transforms; these are not measured anatomical eye centers.
     pub eye_to_head: [Matrix34; 2],
     pub angular_velocity: [f32; 3],
     pub tracking_result: i32,
@@ -101,7 +99,6 @@ impl PoseHistory {
         self.error = Some(error);
     }
     pub fn at(&self, session: u64, received_at: Instant) -> Option<WorldPose> {
-        // Latest preceding query, never a future pose across a tracking gap.
         let pose = self
             .poses
             .iter()

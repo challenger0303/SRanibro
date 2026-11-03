@@ -1,8 +1,3 @@
-//! Explicit, collection-only client for the private SRanibro model service.
-//!
-//! The official service origin is baked into an official collector build. A
-//! debug build may override it with `--service-url` for local end-to-end tests.
-//! There is deliberately no training call and no model activation in this client.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

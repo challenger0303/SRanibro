@@ -1,4 +1,3 @@
-//! Renderer preparation and deterministic analysis for the frozen Phase 1.3 study.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -213,7 +212,6 @@ pub struct SelectedTargetPair {
     pub q25: f64,
     pub q75: f64,
     pub cells: [CellRecord; 4],
-    /// Target-major `[mean, stddev]` higher-minus-lower achieved imbalance.
     pub signed_cell_imbalances: [[f64; 2]; 2],
 }
 

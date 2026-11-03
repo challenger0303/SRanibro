@@ -1,12 +1,12 @@
-"""Explicit partial-session visual mapping, NOT a passed ray calibration."""
+""
 import hashlib,json,math
 import numpy as np
 
 def fit_visual(report):
     if not report['integrity']['all_image_hashes_verified']:raise ValueError('unverified images')
     if report['source_provenance']['source_kind']!='live_xr5':raise ValueError('live XR5 required')
-    # Fixed policy: first repetition only, all 18 train poses; no checkpoint or
-    # threshold selection from the later repeated poses or missing holdout.
+
+
     entries=[e for e in report['selected_attempts'] if 1<=e['step']['id']<=18]
     if {e['step']['id'] for e in entries}!=set(range(1,19)) or not all(e['pass_quality'] for e in entries):
         raise ValueError('first complete 18-pose block required')

@@ -1,9 +1,3 @@
-//! Dream Air/XR5 image-based EyeWide network.
-//!
-//! The convolution implementation is intentionally shared byte-for-byte with the
-//! proven eyebrow TinyEyeNet runtime (`BrowNet`). Only the task header and input crop
-//! differ. New models use `TINYEYE1 + task_id + out_dim`; the task id prevents a brow
-//! model from being selected accidentally as an EyeWide model.
 
 use std::io::Read;
 use std::path::Path;
@@ -16,7 +10,6 @@ const LEGACY_WIDE_MAGIC: &[u8; 8] = b"WIDENET1";
 const BROW_MAGIC: &[u8; 8] = b"BROWNET1";
 const TASK_WIDE: u32 = 2;
 
-/// Thin task wrapper around the shared TinyEyeNet convolution runtime.
 pub struct WideNet {
     inner: BrowNet,
 }
@@ -75,8 +68,6 @@ impl WideNet {
         self.inner.brow_features(input64)
     }
 
-    /// Serialize the shared frozen backbone plus a fitted one-output head in the
-    /// task-tagged generic format.
     pub fn to_bytes_with_head(&self, head: &HeadWeights) -> Result<Vec<u8>, String> {
         let brow = self.inner.to_bytes_with_head(head)?;
         let mut out = Vec::with_capacity(brow.len() + 4);

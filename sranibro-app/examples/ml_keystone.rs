@@ -1,10 +1,3 @@
-//! ML keystone verifier + microbenchmark.
-//!
-//! Loads SRanipal weights (TVM params) in pure Rust, runs the EyePrediction CNN
-//! forward, and compares to the Python ONNX reference on an identical fixed
-//! input. Proves pure-Rust ML straight from the user's SRanipal directory.
-//!
-//! Run: cargo run --release --example ml_keystone -- [params path] [rust_ref dir]
 
 use sranibro_rs::ml::{eye_net::EyeNet, tvm_params};
 
@@ -63,7 +56,6 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Honest perf check (the point is low load): time the naive forward.
     let iters = 300usize;
     let t0 = std::time::Instant::now();
     let mut sink = 0f32;

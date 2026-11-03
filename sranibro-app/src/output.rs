@@ -1,10 +1,3 @@
-//! Output sinks: where post-processed [`EyeResult`]s go (avatar / debug / etc.).
-//!
-//! The pipeline feeds every sink each frame. `DebugSink` prints throttled state;
-//! `BrokenEyeSink` is a TCP server speaking the BrokenEye protocol so
-//! VRCFaceTracking's TobiiAdvanced module connects and consumes our eye data.
-//! `VrchatEyeOscSink` sends native eye OSC without requiring a VRCFT module;
-//! `OscSink` is the separate, avatar-parameter-specific expression protocol.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -15,13 +8,10 @@ use std::time::Duration;
 
 use crate::core::types::{Eye, EyeResult};
 
-/// A consumer of post-processed per-eye results. Sinks run on the emit thread.
 pub trait OutputSink: Send {
     fn name(&self) -> &str;
     fn on_eye(&mut self, result: &EyeResult);
 
-    /// Publish one coherent stereo frame. Shared-state sinks can override this so a
-    /// reader never observes a new left eye together with a stale right eye.
     fn on_frame(&mut self, results: &[EyeResult; 2]) {
         for result in results {
             self.on_eye(result);
@@ -29,14 +19,12 @@ pub trait OutputSink: Send {
     }
 }
 
-/// Prints throttled left-eye state — for end-to-end verification.
 pub struct DebugSink {
     every: u64,
     count: u64,
 }
 
 impl DebugSink {
-    /// `every` = print once per this many left-eye frames (e.g. 60 ≈ 0.5s @120Hz).
     pub fn new(every: u64) -> Self {
         Self {
             every: every.max(1),
@@ -52,7 +40,7 @@ impl OutputSink for DebugSink {
 
     fn on_eye(&mut self, r: &EyeResult) {
         if r.eye != Eye::Left {
-            return; // throttle on the left eye only
+            return;
         }
         self.count += 1;
         if self.count % self.every == 0 {
@@ -65,24 +53,16 @@ impl OutputSink for DebugSink {
     }
 }
 
-// ---------------------------------------------------------------------------
-// BrokenEye TCP sink (VRCFaceTracking compatibility)
-// ---------------------------------------------------------------------------
 
-/// Live status of the BrokenEye server, for the UI's OUTPUT node detail.
 #[derive(Default)]
 pub struct BrokenEyeStatus {
     pub port: u16,
     pub clients: AtomicUsize,
     pub frames: AtomicU64,
-    /// Live filter window sent to the VRCFT module in every JSON frame.
     pub filter_samples: AtomicU32,
-    /// Live native-SRanipal-style EyeWide/EyeSquint -> eyebrow mapping request.
     pub sranipal_brow_link: AtomicBool,
 }
 
-/// One eye's already-clamped values, ready to serialize (BrokenEye convention:
-/// gaze X is negated and every numeric field is clamped).
 #[derive(Clone, Copy)]
 struct EyeJson {
     gaze: [f32; 2],
@@ -93,7 +73,6 @@ struct EyeJson {
     openness_valid: bool,
     wide: f32,
     squeeze: f32,
-    /// Signed per-eye eyebrow expression: +1 raised, -1 lowered.
     brow: f32,
     brow_valid: bool,
     frown: f32,
@@ -121,9 +100,6 @@ fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
     v.max(lo).min(hi)
 }
 
-/// The core has already resolved blink/dropout policy and any user-selected close
-/// slew into `EyeResult::openness`. `blink` remains semantic state for gaze gating;
-/// forcing zero again in a sink would bypass the configured minimum closing time.
 fn emitted_openness(r: &EyeResult) -> f32 {
     let openness = clamp(r.openness, 0.0, 1.0);
     if r.blink && openness < 0.08 {
@@ -275,16 +251,10 @@ mod broken_eye_json_tests {
     }
 }
 
-/// BrokenEye-compatible TCP server. VRCFT connects to `port` (default 5555),
-/// sends a 1-byte mode (0x00 = JSON), then receives `[0x00][u32 LE len][JSON]`
-/// frames at 120Hz. Image modes (0x01-0x03) are accepted but not yet served.
 pub struct BrokenEyeSink {
     data: Arc<Mutex<[EyeJson; 2]>>,
     status: Arc<BrokenEyeStatus>,
     stop: Arc<AtomicBool>,
-    /// Accept-loop handle, joined on Drop so the `TcpListener` (and thus the port)
-    /// is released BEFORE Drop returns — required for the UI's live "Apply & reload"
-    /// to rebind the same port without a race.
     accept: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -292,8 +262,6 @@ const MODE_JSON: u8 = 0x00;
 
 impl BrokenEyeSink {
     pub fn new(port: u16, filter_samples: u8) -> std::io::Result<Self> {
-        // VRCFaceTracking is a same-machine consumer. Eye/gaze/expression data must
-        // never be exposed to the LAN merely because the host has a public interface.
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
@@ -320,7 +288,6 @@ impl BrokenEyeSink {
                         Err(_) => thread::sleep(Duration::from_millis(200)),
                     }
                 }
-                // listener drops here (loop exited) -> port freed.
             })?;
         eprintln!("[vrcft] VRCFT server listening on 127.0.0.1:{port}");
         Ok(Self {
@@ -339,16 +306,12 @@ impl BrokenEyeSink {
 impl Drop for BrokenEyeSink {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Wait for the accept loop to observe `stop` and drop the listener, so the
-        // port is free the instant Drop returns (the loop polls every <=50ms).
         if let Some(h) = self.accept.take() {
             let _ = h.join();
         }
     }
 }
 
-/// Read the 1-byte mode, then (for JSON) stream frames at 120Hz until the peer
-/// drops or the server stops.
 fn spawn_client(
     mut stream: TcpStream,
     data: Arc<Mutex<[EyeJson; 2]>>,
@@ -362,7 +325,6 @@ fn spawn_client(
             return;
         }
         if mode[0] != MODE_JSON {
-            // Image modes (0x01-0x03) not served yet; close politely.
             return;
         }
         stream
@@ -413,14 +375,7 @@ impl OutputSink for BrokenEyeSink {
 
     fn on_eye(&mut self, r: &EyeResult) {
         let e = EyeJson {
-            // Single canonical gaze sign (decoders emit RAW). BrokenEye/VRCFT
-            // convention = X mirrored, Y as-is -> net vs the chip's raw vector is
-            // [-raw_x, +raw_y]. Matches brokeneye_compat.py and the live avatar's
-            // vertical; L/R worth one on-avatar confirm.
             gaze: [clamp(-r.gaze[0], -1.0, 1.0), clamp(r.gaze[1], -1.0, 1.0)],
-            // Suppress gaze while blinking so a garbage mid-blink gaze doesn't leak —
-            // EXCEPT a yoked gaze (mirrored from the open eye), which IS good and must
-            // still drive the squinting eye so it follows instead of freezing.
             gaze_valid: r.gaze_valid && (!r.blink || r.gaze_yoked),
             pupil_mm: r.pupil_mm.max(0.0),
             pupil_valid: r.pupil_valid,
@@ -442,40 +397,27 @@ impl OutputSink for BrokenEyeSink {
         for result in results {
             frame[result.eye.idx()] = eye_json(result);
         }
-        // Publish the stereo pair with one assignment under one lock. The TCP writer
-        // sees either the previous complete frame or the next complete frame.
         if let Ok(mut data) = self.data.lock() {
             *data = frame;
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// OSC sink (VRChat-direct — the "no VRCFT" wing of the hybrid output)
-// ---------------------------------------------------------------------------
 
-/// Sends gaze + eye shapes straight to VRChat over OSC (UnifiedExpressions-style
-/// `/avatar/parameters/Eye*`), so SRanibro can drive an avatar WITHOUT VRCFT.
-/// Self-contained OSC encoder (no deps). Uses the SAME canonical gaze sign as
-/// [`BrokenEyeSink`] (X mirrored, Y as-is) so both outputs agree. Faithful port
-/// of the reference `sranibro/outputs/osc.py`.
 pub struct OscSink {
     sock: std::net::UdpSocket,
     host: String,
     port: u16,
     prefix: String,
-    /// Full eye/gaze OSC when true; eyebrow-only FT/v2 sender when false.
     eyes_enabled: bool,
     latest: [[f32; 2]; 2],
     have: [bool; 2],
-    /// Per-eye signed brow [-1,1] + presence, for the combined BrowUp/Down averages.
     brow: [f32; 2],
     brow_have: [bool; 2],
     brow_active: [bool; 2],
 }
 
 impl OscSink {
-    /// Bind an ephemeral UDP socket; datagrams are sent to `host:port`.
     pub fn new(
         host: impl Into<String>,
         port: u16,
@@ -484,8 +426,6 @@ impl OscSink {
         Self::new_mode(host, port, prefix, true)
     }
 
-    /// VRCFT remains responsible for eyes/gaze; send only the eight eyebrow
-    /// parameters used by the original `vr_eyebrow` application.
     pub fn new_brow_only(
         host: impl Into<String>,
         port: u16,
@@ -528,17 +468,13 @@ impl OscSink {
     }
 }
 
-/// Encode a single-float OSC message: address + ",f" type tag + big-endian f32,
-/// each string null-terminated and padded to a 4-byte boundary.
 fn osc_message(address: &str, value: f32) -> Vec<u8> {
     osc_float_message(address, &[value])
 }
 
-/// Encode OSC float arguments without converting direction vectors into angles
-/// or losing the six independent components of a stereo gaze sample.
 fn osc_float_message(address: &str, values: &[f32]) -> Vec<u8> {
     fn padded(bytes: &[u8]) -> Vec<u8> {
-        let pad = 4 - (bytes.len() % 4); // 1..=4: always at least one null terminator
+        let pad = 4 - (bytes.len() % 4);
         let mut v = Vec::with_capacity(bytes.len() + pad);
         v.extend_from_slice(bytes);
         v.extend(std::iter::repeat(0u8).take(pad));
@@ -554,24 +490,7 @@ fn osc_float_message(address: &str, values: &[f32]) -> Vec<u8> {
     msg
 }
 
-// ---------------------------------------------------------------------------
-// VRChat native eye OSC (no custom avatar parameters or VRCFT module required)
-// ---------------------------------------------------------------------------
 
-/// VRChat's documented `/tracking/eye` protocol, distinct from [`OscSink`].
-///
-/// Sends `LeftRightVec` (six unit-vector components) and `EyesClosedAmount` (one
-/// shared eyelid value). The native protocol does not expose independent winks,
-/// pupil dilation, wide/squint, or eyebrows, so none of those are synthesized.
-/// See <https://docs.vrchat.com/docs/osc-eye-tracking>.
-///
-/// The input must be a real HMD-local direction with +Z forward, as required by
-/// SRanibro's gaze-vector contract. The pipeline has already applied per-device
-/// mappings; this sink applies the same final X sign as the existing OSC sink,
-/// then normalizes the vector. It never treats normalized avatar parameters as
-/// degrees, invents a missing Z component, or applies a gaze-strength multiplier.
-/// Invalid gaze/eyelids are not sent, allowing VRChat's independent ten-second
-/// tracking timeouts to restore automatic eye behavior after tracking is lost.
 pub struct VrchatEyeOscSink {
     sock: std::net::UdpSocket,
     pending: [Option<EyeResult>; 2],
@@ -592,8 +511,6 @@ impl VrchatEyeOscSink {
             std::io::ErrorKind::AddrNotAvailable,
             "VRChat OSC host resolved to no addresses",
         );
-        // Resolve once, outside the emit loop. Match the socket's address family
-        // to the destination (including explicit IPv6 loopback configurations).
         for target in (host.as_str(), port).to_socket_addrs()? {
             let bind = if target.is_ipv6() {
                 "[::]:0"
@@ -626,7 +543,6 @@ impl VrchatEyeOscSink {
                 "/tracking/eye/LeftRightVec",
                 &[left[0], left[1], left[2], right[0], right[1], right[2]],
             );
-            // OSC is best-effort UDP. Never block inference/emit on a slow peer.
             let _ = self.sock.send(&message);
         }
         if let Some(closed) = native_eyes_closed(left, right) {
@@ -660,8 +576,6 @@ fn native_eyes_closed(left: &EyeResult, right: &EyeResult) -> Option<f32> {
     {
         return None;
     }
-    // VRChat currently has only one eyelid channel. Explicit policy: average the
-    // core's clamped/slew-limited openness, then invert (0=open, 1=closed).
     Some(1.0 - 0.5 * (emitted_openness(left) + emitted_openness(right)))
 }
 
@@ -679,7 +593,6 @@ impl OutputSink for VrchatEyeOscSink {
     }
 
     fn on_frame(&mut self, results: &[EyeResult; 2]) {
-        // Never mix a partially collected on_eye pair with a coherent on_frame.
         self.pending = [None, None];
         for result in results {
             self.on_eye(result);
@@ -704,8 +617,6 @@ impl OutputSink for OscSink {
             self.send(&format!("EyeWide{side}"), clamp(r.wide, 0.0, 1.0));
             self.send(&format!("EyeSquint{side}"), clamp(r.squeeze, 0.0, 1.0));
 
-            // Canonical gaze sign, matching BrokenEyeSink: X mirrored, Y as-is.
-            // Hold gaze during a blink, but yoked gaze from the open eye is usable.
             if r.gaze_valid && (!r.blink || r.gaze_yoked) {
                 self.send(&format!("Eye{side}X"), gx);
                 self.send(&format!("Eye{side}Y"), gy);
@@ -719,9 +630,6 @@ impl OutputSink for OscSink {
             }
         }
 
-        // Eyebrow (FT v2). Signed BrowExpression + split Up/Down per eye; the combined
-        // BrowUp/BrowDown averages are emitted once per fresh L+R brow pair. Only sent
-        // when a brow model is producing values, so we never force a 0 over another source.
         if r.brow_valid {
             let b = clamp(r.brow, -1.0, 1.0);
             self.send(&format!("FT/v2/BrowExpression{side}"), b);
@@ -732,8 +640,6 @@ impl OutputSink for OscSink {
             self.brow[bi] = b;
             self.brow_have[bi] = true;
             if self.brow_have[0] && self.brow_have[1] {
-                // vr_eyebrow combines the signed values first. Opposite
-                // unilateral expressions therefore cancel in the combined pair.
                 let avg = 0.5 * (self.brow[0] + self.brow[1]);
                 let up = avg.max(0.0);
                 let dn = (-avg).max(0.0);
@@ -742,8 +648,6 @@ impl OutputSink for OscSink {
                 self.brow_have = [false, false];
             }
         } else {
-            // Clear values once when eyebrow tracking is turned off. Without this edge,
-            // direct OSC avatars would keep the last non-zero brow pose indefinitely.
             let bi = r.eye.idx();
             if self.brow_active[bi] {
                 self.send(&format!("FT/v2/BrowExpression{side}"), 0.0);
@@ -764,9 +668,6 @@ impl OutputSink for OscSink {
             let i = r.eye.idx();
             self.latest[i] = [gx, gy];
             self.have[i] = true;
-            // Emit combined gaze once per FRESH L+R pair, then require a new pair.
-            // Previously it re-sent every call, mixing the current eye with a stale
-            // opposite eye and introducing avoidable gaze jitter.
             if self.have[0] && self.have[1] {
                 self.send("EyeX", 0.5 * (self.latest[0][0] + self.latest[1][0]));
                 self.send("EyeY", 0.5 * (self.latest[0][1] + self.latest[1][1]));
@@ -825,7 +726,6 @@ mod eyebrow_osc_tests {
         assert_eq!(got[&format!("{prefix}BrowExpressionRight")], -0.4);
         assert_eq!(got[&format!("{prefix}BrowUpLeft")], 0.8);
         assert_eq!(got[&format!("{prefix}BrowDownRight")], 0.4);
-        // vr_eyebrow: avg=(0.8-0.4)/2=0.2, then split by sign.
         assert!((got[&format!("{prefix}BrowUp")] - 0.2).abs() < 1e-6);
         assert_eq!(got[&format!("{prefix}BrowDown")], 0.0);
     }
@@ -912,7 +812,6 @@ mod native_eye_osc_tests {
         let mut right = tracked(Eye::Right);
         right.gaze = [0.0, 6.0, 8.0];
         right.openness = 0.75;
-        // Order is anatomical, not array order.
         sink.on_frame(&[right, left]);
 
         let (address, values) = receive(&receiver);

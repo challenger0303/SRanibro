@@ -1,9 +1,3 @@
-//! Standalone PSVR2Toolkit hardware probe for SRanibro.
-//!
-//! This is intentionally read-only: it never sends calibration, USB-state,
-//! haptic, or driver commands. The returned archive establishes the remaining
-//! hardware facts (camera half order, mirroring, gaze sign, frame rate and
-//! availability) before the adapter is enabled in the main application.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -32,8 +26,6 @@ mod app {
     use zip::write::SimpleFileOptions;
 
     const TOOLKIT_CONTRACT_COMMIT: &str = "9e24e6ef475660481e8b46366aaa3cb24d0b4fde";
-    /// Every pose gets a quiet preparation interval before any labelled evidence
-    /// is accepted. This keeps reading/repositioning motion out of the dataset.
     const PREP_SECONDS: f32 = 4.0;
     const CAPTURE_SECONDS: f32 = 8.0;
     const STEP_SECONDS: f32 = PREP_SECONDS + CAPTURE_SECONDS;
@@ -300,8 +292,6 @@ mod app {
 
     impl eframe::App for ProbeApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            // Keep the probe visually consistent even when the platform integration
-            // refreshes system theme settings after app construction.
             ctx.set_visuals(egui::Visuals::dark());
             ctx.request_repaint_after(Duration::from_millis(16));
             let state = self.shared.lock().unwrap().clone();
@@ -813,7 +803,6 @@ foveated_tracking_state,convergence_mm,exp_l,exp_r,dsp_return_code\n",
         }
     }
 
-    /// Returns true when the real backend should reconnect, false on app shutdown.
     fn run_connected(
         shared: Arc<Mutex<LiveState>>,
         commands: impl CommandSource,

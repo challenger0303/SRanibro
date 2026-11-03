@@ -1,8 +1,3 @@
-//! Provenance, immutable-input verification, and sealed artifacts for Phase 1.4.
-//!
-//! This module deliberately has no dependency on the XR5 parser, image decoder,
-//! preprocessing code, or model wrapper.  In particular, [`preflight`] can run
-//! before the recording root is even constructed by the caller.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -60,7 +55,6 @@ const MANIFEST_FILE: &str = "manifest.json";
 const STAGING_SUFFIX: &str = ".phase14-staging";
 const SOURCE_FINGERPRINT_DOMAIN: &[u8] = b"SRanibro\0Phase-1.4\0compiled-source-fingerprint\0v1\0";
 
-/// The exact source allowlist frozen by the Phase 1.4 preregistration.
 pub const COMPILED_SOURCE_PATHS: [&str; 16] = [
     "Cargo.toml",
     "Cargo.lock",
@@ -135,7 +129,6 @@ pub struct VerifiedArtifact {
     pub manifest_bytes: Vec<u8>,
     pub manifest_sha256: String,
     pub inventory: Vec<FileInventoryEntry>,
-    /// Exact non-manifest bytes, keyed by normalized artifact-relative path.
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
@@ -155,8 +148,6 @@ pub struct VerifiedPhase13Artifacts {
     pub confirmation: VerifiedArtifact,
 }
 
-/// Run every check that must precede construction or enumeration of the XR5
-/// recording root. No argument to this function can name that root.
 pub fn preflight(
     repository_root: &Path,
     decision_directory: &Path,
@@ -242,10 +233,6 @@ pub fn verify_preregistration(
         )
         .into());
     }
-    // Ancestry alone is insufficient: a descendant could rewrite the protocol
-    // and still have the original commit as an ancestor. Pin the committed Git
-    // blob as well. The clean-worktree and compiled-source checks separately
-    // bind these frozen committed bytes to the file used by this executable.
     let frozen_spec = format!("{PREREGISTRATION_COMMIT}:{PREREGISTRATION_REPOSITORY_PATH}");
     let frozen_blob = git(repository_root, &["rev-parse", &frozen_spec])?;
     if frozen_blob != PREREGISTRATION_BLOB_OID {
@@ -261,8 +248,6 @@ pub fn verify_preregistration(
     Ok(())
 }
 
-/// Recompute the complete repository/runtime identity and require exact equality
-/// with the preflight snapshot.
 pub fn recheck(repository_root: &Path, expected: &RepositoryState) -> Result<(), Box<dyn Error>> {
     let observed = repository_state(repository_root)?;
     if &observed != expected {
@@ -294,7 +279,6 @@ pub fn checkout_source_fingerprint(repository_root: &Path) -> Result<String, Box
     ))
 }
 
-/// Domain-separated source hash over UTF-8-byte-sorted paths and exact bytes.
 pub fn source_fingerprint<'a>(entries: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
     let mut entries: Vec<_> = entries.into_iter().collect();
     entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
@@ -329,8 +313,6 @@ pub fn verify_phase13_artifacts(
     )?;
     validate_phase13_confirmation(&confirmation.manifest)?;
 
-    // Close the pair-verification window as well as each artifact's internal
-    // verification window. Fixed external seals make any changed byte fatal.
     let decision_after = verify_sealed_artifact(
         decision_directory,
         PHASE13_DECISION_MANIFEST_SHA256,
@@ -432,7 +414,6 @@ fn validate_phase13_confirmation(manifest: &Value) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-/// Validate and hash a file without retaining its bytes.
 pub fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(file_identity(path)?.sha256)
 }
@@ -506,9 +487,6 @@ fn require_frozen_model_identity(identity: &FileIdentity) -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// Core-type-independent equality guard used for recomputed recording-tree or
-/// plan identities. It intentionally omits values from the error to avoid
-/// leaking original session names through a higher-level identity type.
 pub fn require_unchanged<T: PartialEq>(
     label: &str,
     expected: &T,
@@ -530,8 +508,6 @@ where
     Ok(observed)
 }
 
-/// Reject an existing output *and* the deterministic staging name. This is
-/// non-mutating and is safe to call before any private input is opened.
 pub fn validate_new_output_destination(output: &Path) -> Result<(), Box<dyn Error>> {
     if path_entry_exists(output)? {
         return Err(format!("output path already exists: {}", output.display()).into());
@@ -549,10 +525,6 @@ pub fn validate_new_output_destination(output: &Path) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-/// Write an exact-allowlist artifact through a private staging directory. All
-/// non-manifest files are reopened and hashed, their inventory is injected into
-/// the manifest, and `manifest.json` is written last. The returned SHA-256 is the
-/// external seal over the raw manifest bytes and is never embedded in it.
 pub fn write_sealed_artifact(
     output: &Path,
     nonmanifest_files: BTreeMap<String, Vec<u8>>,
@@ -564,11 +536,6 @@ pub fn write_sealed_artifact(
     })
 }
 
-/// Identical to [`write_sealed_artifact`], with one final caller-supplied trust
-/// guard. The guard runs exactly once after the complete staged artifact has
-/// been verified and immediately before the destination check and atomic rename.
-/// A guard or other pre-rename failure removes only this writer's deterministic
-/// staging directory; a successfully renamed output is never removed.
 pub fn write_sealed_artifact_with_guard<F>(
     output: &Path,
     nonmanifest_files: BTreeMap<String, Vec<u8>>,
@@ -682,8 +649,6 @@ where
     }
 }
 
-/// Verify the external raw-manifest seal before parsing JSON, then enforce the
-/// exact stage allowlist and every non-manifest length/hash in `file_inventory`.
 pub fn verify_sealed_artifact(
     directory: &Path,
     external_manifest_sha256: &str,
@@ -702,7 +667,6 @@ pub fn verify_sealed_artifact(
         .into());
     }
 
-    // The seal comparison above intentionally precedes this parse.
     let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
     let object = manifest
         .as_object()
@@ -743,8 +707,6 @@ pub fn verify_sealed_artifact(
         files.insert(entry.path.clone(), bytes);
     }
 
-    // Close the verification window: the manifest, exact tree and every member
-    // identity must still match after the first complete read.
     if std::fs::read(&manifest_path)? != manifest_bytes {
         return Err("sealed manifest changed during verification".into());
     }
@@ -788,9 +750,6 @@ pub fn verify_input_seal(
     })
 }
 
-/// Validate a completed or reduced Phase 1.4 analysis artifact using the
-/// status-selected exact allowlist. The external seal is checked before status
-/// is parsed.
 pub fn verify_analysis_artifact(
     directory: &Path,
     external_manifest_sha256: &str,
@@ -1019,9 +978,6 @@ fn cleanup_deterministic_staging(output: &Path, staging: &Path) -> Result<(), Bo
     ensure_ordinary_directory(parent, "output parent")?;
     ensure_ordinary_directory(staging, "artifact staging directory")?;
 
-    // Resolve both paths immediately before recursive removal. The staging
-    // target must still be an ordinary direct child of the explicitly named
-    // output parent and retain the exact deterministic basename.
     let resolved_parent = std::fs::canonicalize(parent)?;
     let resolved_staging = std::fs::canonicalize(staging)?;
     if resolved_staging.parent() != Some(resolved_parent.as_path())
@@ -1030,8 +986,6 @@ fn cleanup_deterministic_staging(output: &Path, staging: &Path) -> Result<(), Bo
         return Err("refusing to clean staging outside the validated output parent".into());
     }
 
-    // Reject nested symlinks, junctions/reparse points and special entries
-    // before remove_dir_all is allowed to recurse.
     let _ = scan_artifact_tree(staging)?;
     std::fs::remove_dir_all(staging)?;
     sync_directory(parent)?;

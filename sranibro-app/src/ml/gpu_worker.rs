@@ -1,10 +1,3 @@
-//! Private, supervised compute process. No camera, config, log capture or network.
-//!
-//! wgpu/driver panics and blocked calls must not run on the tracking thread. The
-//! parent exchanges one bounded job at a time over anonymous pipes and falls back
-//! to CPU on a deadline, EOF, malformed reply or failure. There is no auto-restart.
-//! A single process-wide lease remains held until the I/O thread has exited AND
-//! its child has been reaped; a broken teardown cannot accumulate more workers.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -26,9 +19,6 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const LIVE_TIMEOUT: Duration = Duration::from_millis(250);
 const LIVE_POLL: Duration = Duration::from_millis(2);
 
-// Protocol dimensions are fixed by the already-validated model, never by an
-// unchecked pipe length. We pass the exact loaded weights, not a path that could
-// be replaced between the CPU validation and child startup.
 const SPEC: &[(&str, &[i64])] = &[
     ("conv1_weight", &[20, 2, 5, 5]),
     ("conv1_bias", &[20]),
@@ -44,8 +34,6 @@ const SPEC: &[(&str, &[i64])] = &[
 
 static HOST: OnceLock<PathBuf> = OnceLock::new();
 static OCCUPIED: AtomicBool = AtomicBool::new(false);
-// If thread creation/termination itself fails, fail closed for this application
-// session instead of repeatedly creating resources against a broken driver.
 static QUARANTINED: AtomicBool = AtomicBool::new(false);
 
 struct Lease;
@@ -74,16 +62,12 @@ struct WorkerProcess {
     _job: WorkerJob,
 }
 
-// An unnamed, non-inheritable job ensures a parent crash/forced exit also stops
-// its GPU helper, including a helper blocked inside the driver or native Drop.
 #[cfg(windows)]
 pub(super) struct WorkerJob(isize);
 #[cfg(windows)]
 impl WorkerJob {
     #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
     pub(super) fn terminate_tree(&self) {
-        // The Python model can own a GPU child that inherited its output pipe.
-        // Kill the entire tree before waiting for pipe EOF, not on final Drop.
         unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0 as _, 1); }
     }
     pub(super) fn attach(child: &Child) -> io::Result<Self> {
@@ -127,8 +111,6 @@ impl WorkerProcess {
             _ => String::new(),
         }
     }
-    // No wait/join here. The owner I/O thread reaps after pipe EOF; any stalled
-    // cleanup keeps the lease occupied and prevents additional GPU processes.
     fn terminate(&self) {
         if self.stopping.swap(true, Ordering::AcqRel) {
             return;
@@ -145,8 +127,6 @@ impl WorkerProcess {
         self.terminate();
         let child = self.child.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(mut child) = child {
-            // This is ONLY the bounded-count pipe thread, never the GUI/tracker.
-            // Its lease stays occupied if the OS cannot finish reaping the child.
             if child.wait().is_err() {
                 QUARANTINED.store(true, Ordering::Release);
             }
@@ -234,7 +214,7 @@ impl GpuWorkerClient {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            command.creation_flags(0x0800_0000);
         }
         let mut child = command
             .spawn()
@@ -296,8 +276,6 @@ impl GpuWorkerClient {
                 if let Err(error) = result {
                     let _ = replies.try_send(Err(format!("{error}{}", thread_process.exit_note())));
                 }
-                // Closing pipes first also releases any waiting producer/consumer in
-                // the child. Kill handles a blocked driver or blocked native Drop.
                 drop(input);
                 drop(output);
                 thread_process.reap();
@@ -652,8 +630,6 @@ fn run_worker(reader: &mut impl Read, writer: &mut impl Write) -> Result<(), Str
     }
 }
 
-/// Main binary only: call before diagnostics/config/services. Tools that do not
-/// implement this entry point safely stay CPU-only rather than spawning themselves.
 #[doc(hidden)]
 pub fn gpu_worker_entrypoint() -> bool {
     if std::env::args().nth(1).as_deref() != Some(WORKER_ARG) {
@@ -661,10 +637,6 @@ pub fn gpu_worker_entrypoint() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        // PR_SET_PDEATHSIG follows the *creating thread*, not the parent process.
-        // Reload starts the helper on a short-lived thread, so that signal would
-        // kill a healthy helper as soon as Reload finished. Observe reparenting
-        // independently instead; this thread remains runnable if compute blocks.
         let parent = unsafe { libc::getppid() };
         if parent <= 1 {
             return true;
@@ -673,7 +645,6 @@ pub fn gpu_worker_entrypoint() -> bool {
             .name("gpu-parent-watch".into())
             .spawn(move || loop {
                 if unsafe { libc::getppid() } != parent {
-                    // Do not enter a potentially blocked GPU Drop on parent death.
                     unsafe {
                         libc::_exit(0);
                     }

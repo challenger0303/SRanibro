@@ -1,8 +1,3 @@
-//! Development-only positive control for the XR5 absolute-geometry initializers.
-//!
-//! It reads the already-authorized local `blink_negative` recordings, reverses the
-//! capture writer's right-eye storage mirror, and reports only aggregate geometry.  It
-//! never writes camera frames, application configuration, or model state.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -49,8 +44,6 @@ fn run() -> Result<(), String> {
     for (session_index, session) in sessions.iter().enumerate() {
         let mut left = load_label_side(session, "blink_negative", 'l')?;
         let mut right = load_label_side(session, "blink_negative", 'r')?;
-        // `wide_calib` mirrors right PNGs only for storage. The live geometry capture
-        // sees the original camera orientation, so reverse that exact operation here.
         for frame in &mut right {
             mirror_horizontal(
                 &mut frame.pixels,
@@ -276,9 +269,6 @@ fn frame_refs<'a>(frames: &'a [GrayFrame], group: usize) -> Vec<MotionFrame<'a>>
 }
 
 fn frame_refs_20hz<'a>(frames: &'a [GrayFrame], group: usize) -> Vec<MotionFrame<'a>> {
-    // Saved Wide sessions are 30 Hz; keeping two of each three frames reproduces the
-    // cadence of the in-memory geometry capture closely enough to catch a rate-sensitive
-    // motion descriptor before it reaches the UI.
     frames
         .iter()
         .enumerate()

@@ -1,21 +1,3 @@
-//! In-app capture of the process's OWN stdout/stderr, so the egui "Console" tab can
-//! show the runtime log (`eprintln!("[xr5] …")`, `[vr4]`, `[ml]`, `[brokeneye]`, …)
-//! without launching from a terminal.
-//!
-//! How it works (Windows): [`init`] creates an anonymous pipe, then points BOTH std
-//! handles at the write end via `SetStdHandle(STD_OUTPUT_HANDLE/STD_ERROR_HANDLE, …)`.
-//! Rust's `println!`/`eprintln!` fetch the std handle *per write* on Windows, so any
-//! print issued AFTER `init()` flows into the pipe instead of the console. A background
-//! thread `ReadFile`s the read end, splits on newlines, and pushes lines into the bounded
-//! [`LOG`] ring buffer (oldest dropped past the cap). The UI renders that buffer.
-//!
-//! Interaction with `AttachConsole`: `main` normally re-attaches to the parent terminal
-//! so CLI subcommands print there. When we redirect stdout/stderr into the pipe (UI path
-//! only), those prints go to the Console tab instead of the terminal — the intended
-//! behaviour. CLI subcommands (`status`, `mlcheck`, …) never call `init`, so they keep
-//! printing to the console as before.
-//!
-//! This is additive: the `sranibro.log` file writer (`append_log` in `main`) is untouched.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -23,11 +5,8 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Max lines retained in the ring buffer. Oldest are dropped past this.
 const CAP: usize = 2000;
 
-/// Global capture buffer. Lazily created on first access so [`log_buffer`] works even
-/// if [`init`] was never called (e.g. non-Windows, or a CLI path) — it just stays empty.
 static LOG: OnceLock<Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
 static FILE_LOG: OnceLock<Option<Mutex<FileLog>>> = OnceLock::new();
 
@@ -91,22 +70,17 @@ fn file_log() -> Option<&'static Mutex<FileLog>> {
         .as_ref()
 }
 
-/// Handle to the shared capture buffer (newest line last). Cheap to clone.
 pub fn log_buffer() -> Arc<Mutex<VecDeque<String>>> {
     LOG.get_or_init(|| Arc::new(Mutex::new(VecDeque::with_capacity(CAP + 1))))
         .clone()
 }
 
-/// Push one line into the ring buffer, dropping the oldest past [`CAP`].
 fn push_line(line: String) {
-    // The UI redirects stderr into this pipe, so without an explicit tee all
-    // adapter diagnostics disappear when the process exits. Keep the documented
-    // `%APPDATA%\SRanibro\sranibro.log` useful for remote hardware bring-up.
     append_file_log(&line);
     let buf = log_buffer();
     let mut q = match buf.lock() {
         Ok(q) => q,
-        Err(_) => return, // poisoned — drop the line rather than panic in the reader thread
+        Err(_) => return,
     };
     q.push_back(line);
     while q.len() > CAP {
@@ -114,8 +88,6 @@ fn push_line(line: String) {
     }
 }
 
-/// Best-effort file side of the UI log tee. Never writes to stderr (that would
-/// recurse back into this pipe) and never lets a logging failure affect the app.
 fn append_file_log(line: &str) {
     if let Some(log) = file_log() {
         let Ok(mut log) = log.lock() else { return };
@@ -148,9 +120,6 @@ fn append_file_log(line: &str) {
     }
 }
 
-/// Redirect this process's stdout+stderr into the in-memory [`LOG`] ring buffer and spawn
-/// the reader thread. Call ONCE, EARLY in `main` (before the first print) on the UI path.
-/// Idempotent: a second call is a no-op.
 #[cfg(windows)]
 pub fn init() {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
@@ -161,29 +130,21 @@ pub fn init() {
 
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.set(()).is_err() {
-        return; // already initialised
+        return;
     }
 
-    // Prime the buffer so `log_buffer()` returns the same instance the reader fills.
     let _ = log_buffer();
 
     unsafe {
         let mut read: HANDLE = INVALID_HANDLE_VALUE;
         let mut write: HANDLE = INVALID_HANDLE_VALUE;
-        // Default pipe buffer size (0). No SECURITY_ATTRIBUTES: the handles stay in-process
-        // (we don't hand them to a child), so inheritability doesn't matter here.
         if CreatePipe(&mut read, &mut write, std::ptr::null(), 0) == 0 {
-            return; // pipe creation failed — leave std handles alone
+            return;
         }
 
-        // Point BOTH std handles at the write end so println!/eprintln! flow into the pipe.
-        // (Rust fetches the std handle per write on Windows, so prints AFTER this redirect.)
         SetStdHandle(STD_OUTPUT_HANDLE, write);
         SetStdHandle(STD_ERROR_HANDLE, write);
 
-        // Own the read end so it is closed if the thread ever unwinds. The write end stays
-        // open for the process lifetime (it's now the std handle target), so the reader
-        // never sees a clean EOF — it blocks in ReadFile until real output arrives.
         let read_owned = OwnedHandle::from_raw_handle(read as *mut _);
 
         std::thread::Builder::new()
@@ -193,8 +154,6 @@ pub fn init() {
     }
 }
 
-/// Blocking read loop: pull bytes from the pipe, split into lines, push into [`LOG`].
-/// Robust — a 0-byte read loops, an error exits quietly, non-UTF8 is lossily decoded.
 #[cfg(windows)]
 fn reader_loop(read: std::os::windows::io::OwnedHandle) {
     use std::os::windows::io::AsRawHandle;
@@ -204,8 +163,6 @@ fn reader_loop(read: std::os::windows::io::OwnedHandle) {
 
     let handle = read.as_raw_handle() as HANDLE;
     let mut buf = [0u8; 4096];
-    // Carry an incomplete trailing line across reads so a line split across two ReadFiles
-    // is emitted whole (not as two fragments).
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
@@ -220,26 +177,24 @@ fn reader_loop(read: std::os::windows::io::OwnedHandle) {
             )
         };
         if ok == 0 {
-            return; // broken pipe / error — stop quietly
+            return;
         }
         if n_read == 0 {
-            continue; // no data this call — keep waiting
+            continue;
         }
         pending.extend_from_slice(&buf[..n_read as usize]);
 
-        // Emit every complete `\n`-terminated line; keep the remainder in `pending`.
         loop {
             let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
                 break;
             };
             let mut line: Vec<u8> = pending.drain(..=nl).collect();
-            line.pop(); // drop '\n'
+            line.pop();
             if line.last() == Some(&b'\r') {
-                line.pop(); // drop '\r' (CRLF)
+                line.pop();
             }
             push_line(String::from_utf8_lossy(&line).into_owned());
         }
-        // Guard against a pathological no-newline flood: cap the carry, flushing as a line.
         if pending.len() > 64 * 1024 {
             let line = std::mem::take(&mut pending);
             push_line(String::from_utf8_lossy(&line).into_owned());
@@ -247,8 +202,6 @@ fn reader_loop(read: std::os::windows::io::OwnedHandle) {
     }
 }
 
-/// Linux GUI logs use the same bounded ring and rotating file as Windows.
-/// CLI modes do not call this and retain their normal terminal output.
 #[cfg(target_os = "linux")]
 pub fn init() {
     use std::io::Read;

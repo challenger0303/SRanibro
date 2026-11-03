@@ -1,4 +1,3 @@
-//! Optional raw-200x200 research model. Bounded child IPC, no UI-thread inference.
 use crate::core::types::EyeResult;
 use serde::{Deserialize, Serialize};
 mod fallback;
@@ -19,15 +18,12 @@ use std::{
 #[serde(default)]
 pub struct Settings {
     pub response: ResponseSettings,
-    /// Data-only model file for normal builds; legacy research folders stay separate.
     pub model_file: String,
     pub enabled: bool,
     pub avatar: bool,
     pub bundle: String,
     pub python: String,
     pub python_path: String,
-    /// Worker/diagnostic preference; the live app overrides this legacy field
-    /// with the shared ui.eyelid_inference_backend setting.
     pub gpu: bool,
 }
 impl Default for Settings {
@@ -46,8 +42,6 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// An unset selection uses the distributed model, but never replaces an
-    /// explicit model selection. Explicit backend selections survive deserialization.
     pub fn model_file(&self) -> &str {
         #[cfg(all(feature = "external-eyelid-model", any(not(feature = "xr5-only"), target_os = "linux")))]
         if self.model_file.is_empty() {
@@ -57,12 +51,9 @@ impl Settings {
     }
 }
 
-/// Coordinates are measured aperture / relaxed-open reference, not EyeNet units.
-/// Keep them separate from SRanipal endpoints and adaptive Wearing Memory.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResponseSettings {
-    /// Opt-in research readout; legacy aperture remains the default.
     pub independent_wide: bool,
     pub wide_reference: [f32; 2],
     pub independent_start: [f32; 2],
@@ -168,8 +159,6 @@ impl Default for Snapshot {
     }
 }
 impl Snapshot {
-    /// Adapter into the app's existing scalar-model domain. This affine change
-    /// of units is not a new classifier: neutral1 ->0.5; closed0 ->0.1.
     pub fn common_frame(&self, now: Instant) -> [[f32; 5]; 2] {
         std::array::from_fn(|i| {
             let p = self.eyes[i];
@@ -181,8 +170,6 @@ impl Snapshot {
             }
         })
     }
-    /// Only the processing copy gets model closure evidence. Native gaze/pupil
-    /// values and their validity remain untouched, including in dedicated OSC.
     pub fn common_lid_sample(&self, mut gaze: crate::core::types::GazeSample, now: Instant) -> crate::core::types::GazeSample {
         let frame = self.common_frame(now);
         for (i, eye) in [&mut gaze.left, &mut gaze.right].into_iter().enumerate() {
@@ -215,14 +202,12 @@ impl Snapshot {
             let prediction = self.eyes[i];
             let value = self.fresh(now).then_some(prediction.opening).flatten()
                 .filter(|v| prediction.status < 2 && v.is_finite() && (0.0..=8.0).contains(v));
-            // Unknown is neutral-open + INVALID, never synthetic closure or stale hold.
             let (openness, wide) = value.map(|v| {
                 if prediction.status == 1 { (0.0, 0.0) } else { response.map(i, v) }
             }).unwrap_or((1.0, 0.0));
             result.openness = openness;
             result.openness_valid = value.is_some();
             result.blink = value.is_some() && openness == 0.0;
-            // Wide is aperture-derived, not a separate expression classifier.
             result.wide = if response.independent_wide {
                 if value.is_some() && prediction.status == 0 && openness > 0.0 {
                     response.map_independent_wide(i, prediction.wide_height)
@@ -230,15 +215,11 @@ impl Snapshot {
             } else { wide };
             result.squeeze = 0.0;
             result.frown = 0.0;
-            // Independent eyebrow output is owned by the eyebrow worker.
         }
         true
     }
 }
 
-/// Presentation continuity only. This never manufactures model evidence or feeds
-/// a held/fallback value into calibration. Transport validity must remain true:
-/// VRCFT otherwise ignores the fallback and leaves the avatar frozen indefinitely.
 #[derive(Default)]
 pub struct OutputRecovery {
     eyes: [RecoveryEye; 2],
@@ -257,8 +238,6 @@ struct RecoveryEye {
     loss_origin: [f32; 2],
 }
 impl OutputRecovery {
-    /// Diagnostic codes: 0 tracking, 1 fresh uncertain hold, 2 transport/sensor
-    /// fallback, 3 reentry. Presentation continuity is not measured evidence.
     pub fn modes(&self) -> [u8; 2] { self.eyes.each_ref().map(|eye| eye.mode) }
 
     pub fn apply(&mut self, snapshot: &Snapshot, results: &mut [EyeResult; 2], now: Instant) {
@@ -270,11 +249,6 @@ impl OutputRecovery {
             s.last_tick = Some(now);
             let measured = frame[i][0] > 0.0 && r.openness.is_finite() && r.wide.is_finite();
             let p = snapshot.eyes[i];
-            // Fresh segmentation uncertainty is NOT evidence of opening and is
-            // NOT a transport outage. Preserve the last delivered pose, including
-            // a partly completed wink. Never synthesize full closure from Unknown.
-            // An actual outage must first recover with valid measurements; fresh
-            // but unclassifiable replies alone cannot re-authorize a stale pose.
             let hold_uncertain = !measured && snapshot.fresh(now)
                 && (2..=4).contains(&p.status)
                 && p.closed_score.is_finite() && (0.0..=1.0).contains(&p.closed_score)
@@ -286,7 +260,7 @@ impl OutputRecovery {
                 r.wide = 0.0;
                 r.squeeze = 0.0;
                 r.frown = 0.0;
-                r.openness_valid = true; // Presentation only; common_frame stays invalid.
+                r.openness_valid = true;
                 r.blink = previous[0] < 0.08;
                 s.output = Some([previous[0], 0.0]);
                 s.uncertain_hold = true;
@@ -343,7 +317,6 @@ impl OutputRecovery {
     }
 }
 
-/// UI-owned, bounded capture. Never changes the eyelid worker's reference.
 pub struct WideReferenceCapture {
     start: Instant,
     last_count: Option<u64>,
@@ -600,8 +573,6 @@ fn model_command(settings: &Settings) -> io::Result<Command> {
         let path = super::external_eyelid::resolve(settings.model_file());
         super::external_eyelid::Package::read(&path)?;
         let executable = std::env::current_exe()?;
-        // The ignored no-camera integration test runs the built app as its child,
-        // rather than treating the Rust test harness as a model worker.
         #[cfg(test)]
         let executable = std::env::var_os("XR5_NATIVE_TEST_EXE").map(std::path::PathBuf::from).unwrap_or(executable);
         let mut command = Command::new(executable);
@@ -688,8 +659,6 @@ impl Bridge {
                 }
             }
         }
-        // Output is already invalid after 200ms. The outer manager replaces a
-        // failed GPU worker with CPU only after its process/pipe owner has drained.
         if (!self.ready && self.started.elapsed() > Duration::from_secs(35))
             || self
                 .pending
@@ -906,8 +875,6 @@ mod tests {
             ..Default::default()
         };
         let mut out = [EyeResult::new(Eye::Left), EyeResult::new(Eye::Right)];
-        // EyeResult starts without valid gaze. The independent image model owns
-        // only openness validity; losing Tobii must not suppress a valid image.
         s.apply(&mut out, now);
         assert!(out.iter().all(|e| e.openness_valid && e.openness == 0.35));
     }
@@ -1109,8 +1076,6 @@ mod tests {
     }
     #[test]
     fn recovery_recorded_partial_winks_do_not_reopen_during_fresh_uncertainty() {
-        // Delivered values just before the 2026-09-29 recording lost per-eye
-        // model evidence. Neither wink reached the former 8% hold gate.
         let traces: [&[f32];2] = [
             &[1.0,0.9489,0.8676,0.7777,0.6804,0.5622,0.4399,0.2397,0.1897],
             &[1.0,0.9882,0.9522,0.8964,0.8128,0.7401,0.6487,0.5393,0.4276,0.2936,0.1366],
@@ -1149,7 +1114,6 @@ mod tests {
             if ms<=208 {assert_eq!(r[0].openness,0.19);}
             if ms>=464 {assert_eq!(r[0].openness,1.0);assert_eq!(recovery.modes()[0],2);}
         }
-        // New uncertain frames cannot revive the pre-outage held pose.
         s.captured_at=Some(t+Duration::from_millis(1008));s.count=3;
         let mut r=recovery_results(0.0);
         recovery.apply(&s,&mut r,t+Duration::from_millis(1008));
@@ -1224,7 +1188,7 @@ mod tests {
         let mut stalled=WideReferenceCapture::new(start);
         for i in 0..100 {
             let now=start+Duration::from_millis(2000+i*35); s.captured_at=Some(now);
-            assert!(stalled.tick(&s,now).is_none()); // same count cannot create samples
+            assert!(stalled.tick(&s,now).is_none());
         }
         assert!(stalled.tick(&s,start+Duration::from_secs(6)).unwrap().is_err());
         assert!(stalled.samples.iter().all(|v| v.len()==1));
@@ -1330,7 +1294,6 @@ mod tests {
                 }
             }
             assert_eq!(state.backend, if gpu { "GPU" } else { "CPU" });
-            // Kill while a request is outstanding: descendants must release pipes.
             assert!(bridge.submit(&images[0], &images[1], Instant::now(), false));
             drop(bridge);
             let stopped = Instant::now();

@@ -1,4 +1,3 @@
-//! Public source provider: no embedded or extracted vendor runtime.
 use std::path::PathBuf;
 pub(crate) fn path() -> Option<PathBuf> { None }
 pub(crate) fn starvr_path() -> Option<PathBuf> { None }

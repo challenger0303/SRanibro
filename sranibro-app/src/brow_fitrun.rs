@@ -1,32 +1,16 @@
-//! In-app eyebrow HEAD-fit runner — the pure-Rust counterpart to [`crate::brow_train`].
-//!
-//! Where `brow_train` shells out to the user's PyTorch venv for a full retrain, this fits
-//! ONLY the output head (fc1 + fc2) onto the captured `brow_data/`, reusing an existing
-//! `brow.bin`'s FROZEN conv backbone ([`crate::ml::brow_calfit`]). No subprocess, no Python:
-//! it decodes the PNGs, runs them through the backbone, fits the head, and writes a fresh
-//! `BROWNET1` `brow.bin` — seconds, ideal for a quick per-user recalibration.
-//!
-//! Same scaffolding as [`crate::brow_train::BrowTrainer`]: a background thread writes a
-//! bounded log + status behind an `Arc<Mutex>` that the UI polls each frame; `Drop` detaches.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// Max lines kept in the live log ring buffer (older lines drop off the front).
 const LOG_CAP: usize = 200;
 
-/// Fully-resolved inputs for a fit run (paths pre-validated by [`BrowFitter::start`]).
 pub struct FitInputs {
-    /// The existing `brow.bin` whose conv backbone is frozen and reused.
     pub backbone_bin: PathBuf,
-    /// The captured `brow_data` dir (holds `images/` + `labels.csv`).
     pub brow_data_dir: PathBuf,
-    /// Seed for the deterministic head init / shuffle.
     pub seed: u64,
 }
 
-/// Which stage the fit is in (drives the log tags / labels).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
     Load,
@@ -36,7 +20,6 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// Short lowercase log tag (`[load]`, `[features]`, …).
     fn tag(self) -> &'static str {
         match self {
             Stage::Load => "load",
@@ -46,7 +29,6 @@ impl Stage {
         }
     }
 
-    /// Human-readable stage label (for a status line, mirroring [`crate::brow_train::Stage`]).
     pub fn label(self) -> &'static str {
         match self {
             Stage::Load => "loading backbone",
@@ -57,16 +39,11 @@ impl Stage {
     }
 }
 
-/// Public status snapshot for the UI (cheap to clone each frame).
 #[derive(Clone, Debug)]
 pub enum Status {
-    /// Never started, or reset back to idle.
     Idle,
-    /// A run is in progress; `log` is the recent tail (bounded).
     Running { log: Vec<String> },
-    /// Finished: the produced `brow.bin`. `log` is the full tail for review.
     Done { brow_bin: PathBuf, log: Vec<String> },
-    /// Failed with a human-readable reason; `log` is the tail.
     Failed { msg: String, log: Vec<String> },
 }
 
@@ -76,10 +53,8 @@ impl Status {
     }
 }
 
-/// Shared, thread-owned state behind a single mutex (worker writes, UI reads a clone).
 struct Shared {
     status: Status,
-    /// Bounded ring buffer of the fit's granular log lines.
     log: Vec<String>,
 }
 
@@ -90,7 +65,6 @@ impl Shared {
             self.log.drain(0..drop);
         }
         self.log.push(line);
-        // Keep the live Running status' log tail in sync so the UI sees new lines.
         if let Status::Running { .. } = self.status {
             self.status = Status::Running {
                 log: self.log.clone(),
@@ -99,7 +73,6 @@ impl Shared {
     }
 }
 
-/// The in-app head-fit runner. Owns a background thread; poll [`Self::status`] each UI frame.
 pub struct BrowFitter {
     shared: Arc<Mutex<Shared>>,
     handle: Option<JoinHandle<()>>,
@@ -122,7 +95,6 @@ impl BrowFitter {
         }
     }
 
-    /// Current status (cheap clone). Call each UI frame.
     pub fn status(&self) -> Status {
         self.shared
             .lock()
@@ -130,7 +102,6 @@ impl BrowFitter {
             .unwrap_or(Status::Idle)
     }
 
-    /// True while a run is in progress.
     pub fn is_running(&self) -> bool {
         self.shared
             .lock()
@@ -138,9 +109,6 @@ impl BrowFitter {
             .unwrap_or(false)
     }
 
-    /// Validate inputs and, if OK, spawn the background fit. Returns `Err(msg)` (and stays
-    /// Idle) when a precondition fails — the UI shows the message and nothing is launched. A
-    /// no-op (Err) if a run is already in progress.
     pub fn start(&mut self, inputs: FitInputs) -> Result<(), String> {
         if self.is_running() {
             return Err("a fit run is already in progress".into());
@@ -158,13 +126,11 @@ impl BrowFitter {
                 labels.display()
             ));
         }
-        // Reset shared state to a fresh Running.
         {
             let mut s = self.shared.lock().unwrap();
             s.log.clear();
             s.status = Status::Running { log: Vec::new() };
         }
-        // Join a finished previous thread (if any) so we don't leak the handle.
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -180,20 +146,15 @@ impl BrowFitter {
 
 impl Drop for BrowFitter {
     fn drop(&mut self) {
-        // Don't block app shutdown on an in-flight fit — detach the handle.
         if let Some(h) = self.handle.take() {
             drop(h);
         }
     }
 }
 
-/// The whole fit, on the worker thread: load backbone -> features -> fit -> write -> Done/Failed.
-/// Calls the lower-level [`crate::ml::brow_calfit::load_dataset`] + [`crate::ml::brow_fit::fit_head`]
-/// + [`crate::ml::brow_net::BrowNet::to_bytes_with_head`] directly so each stage gets its own log line.
 fn run_fit(shared: Arc<Mutex<Shared>>, inputs: FitInputs) {
     use crate::ml::brow_net::BrowNet;
 
-    // 1) Load the frozen backbone.
     log(
         &shared,
         format!(
@@ -208,7 +169,6 @@ fn run_fit(shared: Arc<Mutex<Shared>>, inputs: FitInputs) {
     };
     let out_dim = backbone.out_dim();
 
-    // 2) Decode + feature-extract every labeled frame through the frozen conv backbone.
     log(
         &shared,
         format!("[{}] decoding frames…", Stage::Features.tag()),
@@ -227,14 +187,12 @@ fn run_fit(shared: Arc<Mutex<Shared>>, inputs: FitInputs) {
         ),
     );
 
-    // 3) Fit the head.
     log(
         &shared,
         format!("[{}] training head (out_dim={out_dim})", Stage::Fit.tag()),
     );
     let head = crate::ml::brow_fit::fit_head(&ds.features, &ds.labels, out_dim, inputs.seed);
 
-    // 4) Serialize (frozen conv + new head) and write brow.bin.
     log(&shared, format!("[{}] brow.bin", Stage::Write.tag()));
     let bytes = match backbone.to_bytes_with_head(&head) {
         Ok(b) => b,
@@ -257,14 +215,12 @@ fn run_fit(shared: Arc<Mutex<Shared>>, inputs: FitInputs) {
     s.status = Status::Done { brow_bin, log };
 }
 
-/// Append a line to the shared log (no-op if the lock is poisoned).
 fn log(shared: &Arc<Mutex<Shared>>, line: String) {
     if let Ok(mut s) = shared.lock() {
         s.push_log(line);
     }
 }
 
-/// Transition the shared state to `Failed`, keeping the log tail for the UI.
 fn fail(shared: &Arc<Mutex<Shared>>, msg: String) {
     let mut s = shared.lock().unwrap();
     s.push_log(format!("[error] {msg}"));
@@ -288,7 +244,6 @@ mod tests {
     fn start_errs_without_backbone_or_labels() {
         let dir = tmp_dir("start_bad");
         let mut f = BrowFitter::new();
-        // No backbone file yet.
         let e = f
             .start(FitInputs {
                 backbone_bin: dir.join("nope.bin"),
@@ -298,7 +253,6 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("base eyebrow model"), "{e}");
         assert!(!f.is_running());
-        // Backbone present but labels.csv missing.
         std::fs::write(dir.join("brow.bin"), b"BROWNET1").unwrap();
         let e = f
             .start(FitInputs {

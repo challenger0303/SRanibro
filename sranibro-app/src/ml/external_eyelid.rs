@@ -1,4 +1,3 @@
-//! Data-only XR5 model packages. Native inference runs only in a supervised child.
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -7,8 +6,6 @@ use std::{
 };
 
 const MAX_MODEL: u64 = 32 * 1024 * 1024;
-/// Continuous fixed-axis readout, independent of the eyelid's fixed strip.
-/// Projection bins are cached in canonical network orientation; no new inference.
 fn weighted_wide_height(foreground: &[f32], bins: &[usize], mass: &mut [f64]) -> f32 {
     mass.fill(0.0);
     for (&p, &bin) in foreground.iter().zip(bins) { mass[bin] += p as f64; }
@@ -168,7 +165,6 @@ mod native {
         session: Session,
         profile: Profile,
         roi: [Vec<f32>; 3],
-        // (pixel index, lateral bin) in raw camera orientation.
         bands: [Vec<(usize, usize)>; 2],
         columns: [usize; 2],
         pub gpu: bool,
@@ -198,7 +194,6 @@ mod native {
     }
     impl Runner {
         pub fn new(package: Package, gpu: bool) -> io::Result<Self> {
-            // Never load a library named by a model or found via CWD/PATH.
             let dll = runtime_library_path()?;
             if !dll.is_file() {
                 return Err(invalid(
@@ -271,7 +266,6 @@ mod native {
                 columns,
                 gpu,
             };
-            // Validate actual graph inputs, output types/shapes and values before Ready.
             runner.predict(&vec![128; 80000])?;
             Ok(runner)
         }
@@ -397,7 +391,6 @@ mod native {
         let mut reference_status = 0u8;
         loop {
             let mut header = [0; 9];
-            // EOF between packets is a normal parent shutdown, partial packets are not.
             if input.read(&mut header[..1])? == 0 {
                 return Ok(());
             }
@@ -465,7 +458,6 @@ pub fn worker_entrypoint() -> bool {
     let result = (|| {
         #[cfg(target_os = "linux")]
         {
-            // Match the Windows worker's parent-lifetime ownership.
             let parent = unsafe { libc::getppid() };
             if parent <= 1 || unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
                 return Err(invalid("Could not bind XR5 worker to its parent"));
@@ -577,7 +569,6 @@ mod tests {
 }
 
 
-/// Resolve only the runtime shipped beside this executable, independent of CWD.
 pub fn runtime_library_path() -> io::Result<PathBuf> {
     let name = if cfg!(target_os = "linux") { "libonnxruntime.so" } else { "onnxruntime.dll" };
     Ok(std::env::current_exe()?.parent().ok_or_else(|| invalid("No application folder"))?.join("model-runtime").join(name))

@@ -1,9 +1,3 @@
-//! Guided eye-camera capture shared by geometry and photometric fitting.
-//!
-//! Raw stereo frames remain in memory during capture. The UI automatically exports the
-//! completed dataset to a local feedback ZIP before fit/audit can consume it.
-//! A separate holdout tail is never exposed to the search and is used only to decide
-//! whether a candidate is safer than the geometry that was active when capture started.
 
 use std::fmt::Write as _;
 use std::io;
@@ -13,13 +7,8 @@ use std::time::{Duration, Instant};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 const PREPARE_COUNTDOWN_SECONDS: f32 = 3.0;
-// Slightly below one 60 Hz UI interval so scheduler jitter does not make the
-// collector accept only every second repaint (~30 Hz).
 const BLINK_SAMPLE_INTERVAL: Duration = Duration::from_millis(15);
 
-/// Categorical target shown during a gaze/landmark capture. Coordinates are
-/// normalized screen coordinates: X grows to the right and Y grows downward.
-/// These are instructed UI positions, not a claim about calibrated gaze angle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GazeTarget {
     Center,
@@ -46,7 +35,6 @@ impl GazeTarget {
         Self::DownRight,
     ];
 
-    /// Stable recording/schema spelling. Do not change existing strings.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Center => "center",
@@ -163,9 +151,6 @@ impl SampleKind {
             Self::NaturalBlinks | Self::HoldoutNaturalBlinks => SampleFamily::NaturalBlinks,
             Self::Closed | Self::HoldoutClosed => SampleFamily::Closed,
             Self::HalfOpen | Self::HoldoutHalfOpen => SampleFamily::HalfOpen,
-            // Wink fitting distinguishes these by exact SampleKind. Mapping them to
-            // Closed keeps legacy geometry scorers exhaustive while the Full plan
-            // continues to exclude every wink phase.
             Self::LeftWink | Self::RightWink | Self::HoldoutLeftWink | Self::HoldoutRightWink => {
                 SampleFamily::Closed
             }
@@ -183,11 +168,6 @@ pub enum SampleFamily {
     HalfOpen,
 }
 
-/// Semantic role of one recorded evidence block.
-///
-/// Fitters must use this label instead of relying on a capture protocol's
-/// numeric phase positions. `block_id` remains opaque: it identifies repeated
-/// contiguous blocks, but its numeric value has no pose meaning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EvidenceAction {
     RelaxedOpen,
@@ -217,45 +197,23 @@ pub struct EvidenceLabel {
 #[derive(Clone, Debug)]
 pub struct GeometrySample {
     pub kind: SampleKind,
-    /// Explicit capture instruction when a categorical gaze target was shown.
-    /// `None` means that the capture protocol did not command a gaze position.
     pub commanded_target: Option<GazeTarget>,
-    /// Expected open fraction for the metronome-driven slow-close phases and the
-    /// explicit held-half evidence. The normal fitter ignores the separate HalfOpen
-    /// family; only the diagnostic audit treats its 0.5 label as an absolute target.
     pub expected_open: Option<f32>,
-    /// Seconds on the capture source clock since this evidence block became
-    /// recordable. Preparation/rest time and UI/event-loop suspension are excluded.
     pub phase_time_s: f32,
     pub left: Vec<u8>,
     pub right: Vec<u8>,
     pub left_size: (u32, u32),
     pub right_size: (u32, u32),
-    /// Per-frame brightness affine captured from the live pipeline.  The fitter applies
-    /// the configured deterministic filters, then this affine, before trying geometries.
     pub brightness_affine: [[f32; 2]; 2],
-    /// Native Tobii openness captured only as a compliance cross-check. It never enters
-    /// a geometry score or candidate selection. Reported Disable is represented as 0.
     pub native_open: [Option<f32>; 2],
-    /// Native per-eye gaze direction before SRanibro output correction. Invalid or
-    /// unreported vectors stay absent; angles are derived deterministically by the fitter.
     pub native_gaze: [Option<[f32; 3]>; 2],
-    /// Native wearable pupil position in the EyeChip's normalized, unmapped
-    /// coordinate space. A missing or reported-invalid value remains absent.
     pub native_pupil_pos: [Option<[f32; 2]>; 2],
-    /// Monotonic camera generations copied with this stereo sample.
     pub frame_generation: [u64; 2],
-    /// Latest native device timestamp associated with the sampled native evidence.
-    /// It is not assumed to be synchronized exactly to the camera exposure.
     pub native_timestamp_us: Option<u64>,
-    /// PHASES index, retained so repeated OPEN/HALF/CLOSED blocks can be compared.
     pub phase_index: usize,
 }
 
 impl GeometrySample {
-    /// Derive a stable semantic label from fields already present in schema-v2+
-    /// recordings. This keeps old ZIPs readable while allowing new protocols to
-    /// reorder phases freely.
     pub fn evidence_label(&self) -> EvidenceLabel {
         let action = match self.kind {
             SampleKind::Neutral | SampleKind::HoldoutNeutral => {
@@ -309,11 +267,6 @@ impl GeometryDataset {
     }
 }
 
-/// Immutable, cheaply cloneable ownership of one captured eye-image dataset.
-///
-/// Fitters receive this handle instead of taking a deep copy of every raw frame.
-/// The capture remains immutable while one or more analyses replay the same
-/// evidence, and cloning this value only increments an [`Arc`] reference count.
 #[derive(Clone, Debug)]
 pub struct SharedEvidence(Arc<GeometryDataset>);
 
@@ -322,7 +275,6 @@ impl SharedEvidence {
         Self(Arc::new(dataset))
     }
 
-    /// Captured samples in their original temporal order.
     pub fn samples(&self) -> &[GeometrySample] {
         &self.0.samples
     }
@@ -339,11 +291,6 @@ impl SharedEvidence {
         &self.0
     }
 
-    /// Recover owned evidence for legacy single-capture retry paths.
-    ///
-    /// A start failure normally leaves this as the only handle, so no frame data
-    /// is copied. If another analysis intentionally retained a handle, cloning is
-    /// the safe fallback needed to restore the legacy mutable capture container.
     pub fn into_dataset(self) -> GeometryDataset {
         Arc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
     }
@@ -517,8 +464,6 @@ const PHASES: &[Phase] = &[
         instruction: "HOLDOUT BLINKS - blink three times with open pauses.",
     },
     Phase::Done,
-    // Wink phases are appended after the legacy Done sentinel so every pre-v1.6
-    // canonical sample phase ID (0..29) remains byte-for-byte stable.
     Phase::Rest {
         seconds: 2.0,
         instruction: "Next, make a natural, comfortable LEFT wink. Keep the RIGHT eye open; do not force it or squeeze hard.",
@@ -583,25 +528,14 @@ const PHASES: &[Phase] = &[
     Phase::Done,
 ];
 
-/// Ordered views over the canonical [`PHASES`] table.
-///
-/// A sample always stores its canonical `PHASES` index, never the cursor inside
-/// one of these plans.  Old schema-v3 recordings and the fit/audit block grouping
-/// therefore keep exactly the same phase IDs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CapturePlan {
-    /// The original Safe Geometry Fit / Photometric Fit protocol.
     #[default]
     Full,
-    /// Repeated open, half-open and gently-closed endpoint evidence.
     EyelidEndpoints,
-    /// Relaxed-open plus gaze-direction evidence.
     GazeDirections,
-    /// Repeated held left/right winks with untouched per-eye holdout.
     Winks,
-    /// Relaxed-open plus deliberately slow close/open evidence.
     SlowClose,
-    /// Relaxed-open plus natural-blink evidence.
     NaturalBlinks,
 }
 
@@ -614,9 +548,6 @@ const EYELID_ENDPOINT_PLAN: &[usize] = &[
 ];
 const GAZE_DIRECTION_PLAN: &[usize] = &[0, 1, 6, 7, 24, 25, 30];
 const SLOW_CLOSE_PLAN: &[usize] = &[0, 1, 8, 9, 26, 27, 30];
-// The blink scorer uses the open pauses inside each instructed blink block and
-// the already-locked endpoints. Excluding the separate 4 s neutral-image block
-// keeps this 60 Hz recording bounded to roughly 62 MB for 200x200 stereo frames.
 const NATURAL_BLINK_PLAN: &[usize] = &[0, 10, 11, 28, 29, 30];
 const WINK_PLAN: &[usize] = &[0, 1, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43];
 
@@ -682,8 +613,6 @@ pub enum Status {
         instruction: &'static str,
         remaining_s: f32,
         overall: f32,
-        /// Reading time is unlimited. Once confirmed, the existing Rest duration
-        /// becomes the visible pose-preparation countdown.
         awaiting_confirmation: bool,
         next_kind: Option<SampleKind>,
     },
@@ -704,7 +633,6 @@ pub enum Status {
 }
 
 pub struct GeometryCapture {
-    /// Cursor in `plan.phase_indices()`, not a canonical PHASES index.
     phase: Option<usize>,
     plan: CapturePlan,
     entered: Instant,
@@ -713,12 +641,8 @@ pub struct GeometryCapture {
     accepted_in_phase: usize,
     quota_met_at: Option<Instant>,
     paused_at: Option<Instant>,
-    /// Every Rest phase starts as an untimed instruction screen. The user must
-    /// confirm it before its short preparation countdown begins.
     rest_confirmed: bool,
     dataset: GeometryDataset,
-    /// Counts retained while the completed dataset is temporarily owned by the
-    /// background ZIP writer. This keeps the Done UI stable without cloning frames.
     completed_train_samples: usize,
     completed_holdout_samples: usize,
     completed_seconds: f32,
@@ -810,8 +734,6 @@ impl GeometryCapture {
             && matches!(self.current_phase(), Some(Phase::Rest { .. }))
     }
 
-    /// Start the short preparation countdown for the current instruction. No
-    /// image is recorded until that countdown has completed.
     pub fn continue_step(&mut self) -> bool {
         if !self.is_awaiting_confirmation() {
             return false;
@@ -843,8 +765,6 @@ impl GeometryCapture {
             .or(self.quota_met_at);
     }
 
-    /// Exclude a UI/event-loop hiatus discovered after the fact. The generation
-    /// cursor discards frames produced while the wearer could not see the prompt.
     pub fn suspend_for(&mut self, duration: Duration, generation: [u64; 2]) {
         if !self.is_running() || self.is_paused() || duration.is_zero() {
             return;
@@ -862,8 +782,6 @@ impl GeometryCapture {
         self.last_generation
     }
 
-    /// Advance the bounded-history cursor even when a valid frame belonged to a
-    /// rest/settle period or was skipped by the sampling cadence.
     pub fn discard_through(&mut self, generation: [u64; 2]) {
         self.last_generation[0] = self.last_generation[0].max(generation[0]);
         self.last_generation[1] = self.last_generation[1].max(generation[1]);
@@ -883,8 +801,6 @@ impl GeometryCapture {
         let Phase::Capture { seconds, .. } = phase else {
             return 0;
         };
-        // Retain a real temporal-rate floor while allowing modest scheduler jitter.
-        // Natural-blink timing needs substantially denser evidence than image fits.
         let coverage = if self.plan == CapturePlan::NaturalBlinks {
             0.75
         } else {
@@ -901,8 +817,6 @@ impl GeometryCapture {
         if self.is_paused() {
             return;
         }
-        // A delayed UI callback may cross a Rest boundary. Advance through rests,
-        // but never cross a capture whose generation quota is still missing.
         for _ in 0..self.plan.phase_indices().len() {
             let Some(cursor) = self.phase else { return };
             let Some(phase) = self.current_phase() else {
@@ -947,8 +861,6 @@ impl GeometryCapture {
         }
     }
 
-    /// True only when the plan's collector can accept this exact stereo generation.
-    /// Natural-blink timing uses 60 Hz; image-fit plans remain at 20 Hz.
     pub fn wants_frame(&self, generation: [u64; 2]) -> bool {
         self.wants_frame_at(generation, Instant::now())
     }
@@ -1077,9 +989,6 @@ impl GeometryCapture {
         Some(std::mem::take(&mut self.dataset))
     }
 
-    /// Put a completed in-memory capture back after the background fitter could not
-    /// be started. This avoids making the wearer repeat the guided sequence for a
-    /// transient thread/model error; no frames are written to disk.
     pub fn restore_completed_dataset(&mut self, dataset: GeometryDataset) {
         self.completed_train_samples = dataset.train_len();
         self.completed_holdout_samples = dataset.holdout_len();
@@ -1108,10 +1017,6 @@ impl GeometryCapture {
             .and_then(|index| PHASES.get(index).copied())
     }
 
-    /// Move a completed biometric dataset into a background exporter without
-    /// cloning its image buffers. The Done status and counts remain visible while
-    /// ownership is in flight. The caller must restore the returned dataset on
-    /// both success and failure because fit/audit consumes it later.
     pub(crate) fn take_export_dataset(
         &mut self,
         metadata: &str,
@@ -1133,9 +1038,6 @@ impl GeometryCapture {
         Ok((std::mem::take(&mut self.dataset), metadata_v3(metadata)))
     }
 
-    /// Return ownership from the background exporter. This is intentionally used
-    /// after a successful save too: Safe Geometry Fit and Objective Audit still
-    /// need the exact in-memory frames that were written to the ZIP.
     pub(crate) fn restore_export_dataset(&mut self, dataset: GeometryDataset) {
         if self.is_done() && self.dataset.samples.is_empty() {
             self.completed_train_samples = dataset.train_len();
@@ -1144,8 +1046,6 @@ impl GeometryCapture {
         }
     }
 
-    /// Export the exact completed dataset used by the geometry fitter. The caller owns the
-    /// disclosure policy because the archive contains raw eye-camera images (biometric data).
     pub fn export_recording(&self, path: &Path, metadata: &str) -> io::Result<()> {
         if !self.is_done() || self.dataset.samples.is_empty() {
             return Err(io::Error::new(
@@ -1506,14 +1406,10 @@ mod tests {
         let pixels = [0u8; 4];
         let mut source_ms = 0u64;
         let mut generation = 1u64;
-        // A 24 Hz present loop drains every coherent ~60 Hz source sample that
-        // arrived since its previous callback.
         for ui_ms in (0..=duration_ms).step_by(42) {
             while source_ms <= ui_ms {
                 let at = base + Duration::from_millis(source_ms);
                 capture.tick_at(at);
-                // The camera-clock test is not a reading-speed test: simulate an
-                // immediate Continue click whenever an instruction appears.
                 if capture.is_awaiting_confirmation() {
                     capture.rest_confirmed = true;
                     capture.entered = at;
@@ -1542,8 +1438,6 @@ mod tests {
     #[test]
     fn twenty_hz_capture_is_camera_clocked_on_a_24_hz_monitor() {
         let capture = drive_source_history_at_24_hz_ui(CapturePlan::EyelidEndpoints, 8_000);
-        // Rest 3 s + first 4 s OPEN block. A reset-to-now UI clock would record
-        // only ~48 frames here; the deadline accumulator stays near 20 Hz.
         assert!((76..=82).contains(&capture.dataset.samples.len()));
         assert_eq!(capture.canonical_phase_index(), Some(2));
     }
@@ -1551,8 +1445,6 @@ mod tests {
     #[test]
     fn blink_capture_keeps_source_rate_above_fifty_hz_on_a_24_hz_monitor() {
         let capture = drive_source_history_at_24_hz_ui(CapturePlan::NaturalBlinks, 10_100);
-        // Two three-second preparation phases consume 6 s; the remaining 4.1 s is sampled at
-        // the 16 ms source cadence, not at the 24 Hz presentation cadence.
         assert!((250..=265).contains(&capture.dataset.samples.len()));
         assert_eq!(capture.canonical_phase_index(), Some(11));
     }
@@ -1593,7 +1485,7 @@ mod tests {
         let mut capture = GeometryCapture::new();
         capture.start_plan(CapturePlan::EyelidEndpoints, [1, 1]);
         let base = Instant::now();
-        capture.phase = Some(1); // OPEN capture
+        capture.phase = Some(1);
         capture.entered = base;
         capture.suspend_for(Duration::from_secs(2), [99, 99]);
         assert!(

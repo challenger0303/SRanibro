@@ -1,5 +1,3 @@
-//! Experimental stationary Tobii anchor. Receipt times are NOT exposure times.
-//! Never used outside opt-in XR5 model gaze; never changes expression outputs.
 use super::xr5_gaze::Snapshot;
 use crate::core::types::GazeSample;
 use std::{
@@ -135,8 +133,6 @@ impl EyeAnchor {
             .map_or(0., |t| (now - t).clamp(0., 1. / 120.));
         if self.last_time.is_some_and(|t| now - t > 0.1 || now <= t) {
             self.pairs.clear();
-            // A blink or short observation loss must not erase the first pose.
-            // Never combine pre-gap samples or carry update permission across it.
             if self.last_time.is_some_and(|t| now - t > 1. || now <= t) {
                 self.reference = None;
             }
@@ -268,8 +264,6 @@ impl Hybrid {
         if self.context != Some(context) {
             let keep_bias = self.context.is_some_and(|(_, old_flip)| old_flip == flip_x);
             for eye in &mut self.eyes {
-                // A native clock reset may be a disconnect: discard its evidence,
-                // not the already displayed offset. Explicit mapping/reload resets.
                 let (bias, updated) = (eye.bias, eye.updated);
                 *eye = Default::default();
                 if keep_bias {
@@ -316,8 +310,6 @@ impl Hybrid {
                     } else {
                         n.sample.right
                     };
-                    // Model uses raw camera eye identity; do not apply legacy stream swap.
-                    // Match native handedness then convert the app's axes to OpenVR.
                     let v = [
                         if flip_x { e.gaze[0] } else { -e.gaze[0] },
                         e.gaze[1],
@@ -336,7 +328,6 @@ impl Hybrid {
                 status.diagnostics[eye].gate = "partner-estimated eye";
             }
             let bias = self.eyes[eye].bias;
-            // Zero correction preserves model bits. Estimated eyes never teach.
             if bias != [0.; 2] {
                 let adjusted = [a[0] + bias[0], a[1] + bias[1]];
                 if adjusted.iter().any(|x| x.abs() >= 89.) {

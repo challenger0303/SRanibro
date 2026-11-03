@@ -1,8 +1,3 @@
-//! Privacy-conscious support bundle writer.
-//!
-//! The archive intentionally omits `sranibro.toml`: it can contain local asset
-//! paths and user names.  The caller supplies a hardware/settings summary, the
-//! persisted eyelid calibration, and a bounded log tail.
 
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -33,8 +28,6 @@ pub(crate) fn crc32_fingerprint(bytes: &[u8]) -> u32 {
     crc32(bytes)
 }
 
-/// Stable label for comparing reports from one physical unit without exporting
-/// its real hardware serial.
 pub fn pseudonymous_unit_id(serial: Option<&str>) -> String {
     serial
         .filter(|value| !value.is_empty())
@@ -42,9 +35,6 @@ pub fn pseudonymous_unit_id(serial: Option<&str>) -> String {
         .unwrap_or_else(|| "unavailable".into())
 }
 
-/// Remove the common personally identifying fragments from captured logs.  The
-/// bundle still contains technical paths below the profile root, which are useful
-/// for diagnosis, but not the Windows account name or real EyeChip serial.
 pub fn redact_support_text(text: &str, eyechip_serial: Option<&str>) -> String {
     let mut redacted = text.to_string();
     if let Some(serial) = eyechip_serial.filter(|value| !value.is_empty()) {
@@ -69,9 +59,6 @@ pub fn redact_support_text(text: &str, eyechip_serial: Option<&str>) -> String {
     redacted
 }
 
-/// Incremental standards-compatible ZIP writer using the uncompressed "store" method.
-/// Keeping only the central directory in memory lets calibration exports stream thousands
-/// of already-compressed PNG frames without building a second copy of the whole recording.
 pub struct StoredZipWriter {
     file: BufWriter<std::fs::File>,
     central: Vec<u8>,
@@ -175,7 +162,6 @@ impl StoredZipWriter {
     }
 }
 
-/// Write a small standards-compatible ZIP using the incremental writer above.
 pub fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> io::Result<()> {
     let mut writer = StoredZipWriter::create(path)?;
     for (name, data) in entries {

@@ -1,9 +1,3 @@
-//! SRanibro — all-Rust, distribution-safe eye/face tracker.
-//!
-//! Library crate holding the HMD-agnostic engine. Nothing proprietary is bundled:
-//! ML weights load from the user's SRanipal directory at runtime ([`ml`]), and
-//! the post-processor ([`core`]) is original code. The `sranibro-rs` binary (and
-//! later the egui app) build on this.
 
 #[cfg(all(feature = "psvr2-only", feature = "xr5-only"))]
 compile_error!("psvr2-only and xr5-only are mutually exclusive build variants");

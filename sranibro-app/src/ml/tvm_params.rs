@@ -1,17 +1,3 @@
-//! Parser for SRanipal's TVM params file (`*.params_opencl.params`).
-//!
-//! Distribution note: we ship this parser (our reverse-engineering), NOT the
-//! weights. At runtime the user points us at their SRanipal install directory
-//! and we read the proprietary weights they already own.
-//!
-//! Binary format (little-endian), reverse-engineered in `extract_weights.py`:
-//! ```text
-//! magic:u64  reserved:u64  num_params:u64
-//! names[n]:  { name_len:u64, name:[u8; name_len] (utf-8) }
-//! arrays[n]: { reserved:u64, dev_type:u32, dev_id:u32, ndim:u32,
-//!              dtype_code:u8 (2=float), dtype_bits:u8, dtype_lanes:u16,
-//!              shape:[i64; ndim], data_size:u64, data:[u8; data_size] }  // row-major
-//! ```
 
 use std::collections::HashMap;
 use std::io;
@@ -24,7 +10,7 @@ pub struct Tensor {
 }
 
 impl Tensor {
-    #[allow(dead_code)] // shape helper; used by validation/tooling
+    #[allow(dead_code)]
     pub fn numel(&self) -> usize {
         self.shape.iter().product::<i64>().max(0) as usize
     }
@@ -37,10 +23,6 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn need(&self, n: usize) -> io::Result<()> {
-        // `self.p <= self.b.len()` always holds (p only advances past a checked need),
-        // so `len - p` can't underflow. Comparing remaining-vs-n avoids the `p + n`
-        // overflow a garbage length field would otherwise cause (which wrapped the
-        // bounds check and panicked on the slice).
         if n > self.b.len() - self.p {
             Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -85,11 +67,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parse an already-read TVM params buffer into ordered tensors.
-///
-/// The byte-oriented seam lets offline research tools fingerprint the exact bytes they
-/// parse. Runtime callers may keep using [`parse`], which remains one file read followed
-/// by this function.
 pub fn parse_bytes(data: &[u8]) -> io::Result<Vec<Tensor>> {
     let mut r = Reader { b: data, p: 0 };
 
@@ -106,9 +83,6 @@ pub fn parse_bytes(data: &[u8]) -> io::Result<Vec<Tensor>> {
         );
     }
 
-    // Cap the pre-allocation: a garbage `n` (huge u64 from a wrong/corrupt file) would
-    // otherwise abort on a giant allocation. Legit models have ~10 params; the bounded
-    // per-item reads below return Err gracefully if `n` is bogus.
     let mut names = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
         let len = r.u64()? as usize;
@@ -119,14 +93,12 @@ pub fn parse_bytes(data: &[u8]) -> io::Result<Vec<Tensor>> {
         eprintln!("[dbg] names={:?}  pos_after_names={}", names, r.p);
     }
 
-    // After the names array comes the NDArray list: a u64 count, then each
-    // entry is a full TVM NDArray (magic + reserved + DLTensor fields + data).
     let _arrays_count = r.u64()?;
 
     let mut out = Vec::with_capacity(n.min(1 << 16));
     for name in names {
         let pos0 = r.p;
-        let magic2 = r.u64()?; // kTVMNDArrayMagic 0xDD5E40F096B4A13F
+        let magic2 = r.u64()?;
         let _reserved = r.u64()?;
         let _dev_type = r.u32()?;
         let _dev_id = r.u32()?;
@@ -157,7 +129,6 @@ pub fn parse_bytes(data: &[u8]) -> io::Result<Vec<Tensor>> {
                 .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                 .collect()
         } else {
-            // Non-f32 tensor (unexpected for this model) — leave empty; caller checks.
             Vec::new()
         };
         out.push(Tensor {
@@ -169,13 +140,11 @@ pub fn parse_bytes(data: &[u8]) -> io::Result<Vec<Tensor>> {
     Ok(out)
 }
 
-/// Parse a TVM params file into ordered tensors.
 pub fn parse(path: &str) -> io::Result<Vec<Tensor>> {
     let data = std::fs::read(path)?;
     parse_bytes(&data)
 }
 
-/// Parse an already-read buffer into a name -> tensor map.
 pub fn parse_map_bytes(data: &[u8]) -> io::Result<HashMap<String, Tensor>> {
     Ok(parse_bytes(data)?
         .into_iter()
@@ -183,7 +152,6 @@ pub fn parse_map_bytes(data: &[u8]) -> io::Result<HashMap<String, Tensor>> {
         .collect())
 }
 
-/// Parse into a name -> tensor map.
 pub fn parse_map(path: &str) -> io::Result<HashMap<String, Tensor>> {
     Ok(parse(path)?
         .into_iter()

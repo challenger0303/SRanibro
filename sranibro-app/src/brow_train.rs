@@ -1,38 +1,13 @@
-//! B-2: offline eyebrow train -> bake runner.
-//!
-//! Drives the user's external PyTorch toolchain as a SUBPROCESS to turn a captured
-//! `brow_data/` dir (from B-1, [`crate::brow_calib`]) into a live `brow.bin` (`BROWNET1`)
-//! that [`crate::ml::brow_net::BrowNet`] loads. Nothing here bundles Python or torch —
-//! the user supplies a venv-with-torch (`python_exe`) and their `vr_eyebrow` project
-//! (`vr_eyebrow_dir`, holding train.py/dataset.py/model.py). The only shipped piece is
-//! `tools/bake_brow_weights.py`, resolved next to the exe and, failing that, embedded via
-//! `include_str!` and written to a temp file at run time so a distributed exe can still bake.
-//!
-//! The runner is a background thread (never blocks the UI):
-//!   1. split `labels.csv` -> `train.csv` + `val.csv` (pure Rust, [`crate::brow_calib::split_labels`]),
-//!   2. `python train.py --data-dir images --train-csv train.csv --val-csv val.csv --save-path model.pth`
-//!      (1-channel; we deliberately DON'T pass --reference-* so the trained model matches
-//!      the 1-channel inference path),
-//!   3. `python bake_brow_weights.py --pth model.pth --out <brow_data>` -> `<brow_data>/brow.bin`.
-//!
-//! Child stdout+stderr stream line-by-line into a bounded log the UI polls; status moves
-//! Idle -> Running -> Done{brow_bin} / Failed{msg}. A non-zero exit is a Failure carrying
-//! the stderr tail. Command construction is a pure function ([`build_commands`]) so it's
-//! unit-testable without ever launching Python.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// Max lines kept in the live log ring buffer (older lines drop off the front).
 const LOG_CAP: usize = 200;
 
-/// The embedded copy of the bake tool, used when no `bake_brow_weights.py` sits next to
-/// the exe (i.e. a distributed single-exe). Written to a temp file at run time.
 const BAKE_PY: &str = include_str!("../tools/bake_brow_weights.py");
 
-/// Which stage the runner is in (also the UI's status label).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
     Split,
@@ -50,16 +25,11 @@ impl Stage {
     }
 }
 
-/// Public status snapshot for the UI (cheap to clone each frame).
 #[derive(Clone, Debug)]
 pub enum Status {
-    /// Never started, or reset back to idle.
     Idle,
-    /// A run is in progress at `stage`; `log` is the recent tail (bounded).
     Running { stage: Stage, log: Vec<String> },
-    /// Finished: the produced `brow.bin`. `log` is the full tail for review.
     Done { brow_bin: PathBuf, log: Vec<String> },
-    /// Failed with a human-readable reason; `log` is the tail (incl. stderr).
     Failed { msg: String, log: Vec<String> },
 }
 
@@ -69,13 +39,9 @@ impl Status {
     }
 }
 
-/// Shared, thread-owned state behind a single mutex. The worker thread writes it; the UI
-/// thread reads a clone each frame via [`BrowTrainer::status`].
 struct Shared {
     status: Status,
-    /// Bounded ring buffer of the child's combined stdout+stderr lines.
     log: Vec<String>,
-    /// The current stage (mirrored into `status` on each transition).
     stage: Stage,
 }
 
@@ -86,7 +52,6 @@ impl Shared {
             self.log.drain(0..drop);
         }
         self.log.push(line);
-        // Keep the live Running status' log tail in sync so the UI sees new lines.
         if let Status::Running { stage, .. } = self.status {
             self.status = Status::Running {
                 stage,
@@ -104,7 +69,6 @@ impl Shared {
     }
 }
 
-/// The train->bake runner. Owns a background thread; poll [`Self::status`] each UI frame.
 pub struct BrowTrainer {
     shared: Arc<Mutex<Shared>>,
     handle: Option<JoinHandle<()>>,
@@ -116,25 +80,18 @@ impl Default for BrowTrainer {
     }
 }
 
-/// Fully-resolved inputs for a run (all paths pre-validated by the caller).
 #[derive(Clone, Debug)]
 pub struct TrainInputs {
-    /// Python interpreter (venv with torch).
     pub python_exe: PathBuf,
-    /// The `vr_eyebrow` project dir (train.py's working dir + import root).
     pub vr_eyebrow_dir: PathBuf,
-    /// The captured `brow_data` dir (holds `images/` + `labels.csv`).
     pub brow_data_dir: PathBuf,
 }
 
-/// A single planned subprocess: program + args + working dir. Pure data so the plan is
-/// unit-testable without spawning anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedCmd {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// Which stage this command belongs to (for status/log).
     pub stage: Stage,
 }
 
@@ -150,7 +107,6 @@ impl BrowTrainer {
         }
     }
 
-    /// Current status (cheap clone). Call each UI frame.
     pub fn status(&self) -> Status {
         self.shared
             .lock()
@@ -158,7 +114,6 @@ impl BrowTrainer {
             .unwrap_or(Status::Idle)
     }
 
-    /// True while a run is in progress.
     pub fn is_running(&self) -> bool {
         self.shared
             .lock()
@@ -166,20 +121,14 @@ impl BrowTrainer {
             .unwrap_or(false)
     }
 
-    /// Validate inputs and, if OK, spawn the background run. Returns `Err(msg)` (and stays
-    /// Idle) when a precondition fails — the UI shows the message and nothing is launched.
-    /// A no-op (Err) if a run is already in progress.
     pub fn start(&mut self, inputs: TrainInputs) -> Result<(), String> {
         if self.is_running() {
             return Err("a training run is already in progress".into());
         }
         validate_inputs(&inputs)?;
-        // Resolve the (shipped-or-embedded) bake script up front so a bad exe layout fails
-        // before we spawn any subprocess.
         let bake = resolve_bake_script().map_err(|e| format!("bake tool: {e}"))?;
         let plan = build_commands(&inputs, &bake.path);
 
-        // Reset shared state to a fresh Running{Split}.
         {
             let mut s = self.shared.lock().unwrap();
             s.log.clear();
@@ -189,15 +138,12 @@ impl BrowTrainer {
                 log: Vec::new(),
             };
         }
-        // Join a finished previous thread (if any) so we don't leak the handle.
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
 
         let shared = self.shared.clone();
         let inputs2 = inputs.clone();
-        // `bake` (the temp-file guard) moves into the thread so the temp file outlives the
-        // bake subprocess and is cleaned up when the run ends.
         let handle = std::thread::Builder::new()
             .name("brow-trainer".into())
             .spawn(move || run_all(shared, inputs2, plan, bake))
@@ -209,15 +155,12 @@ impl BrowTrainer {
 
 impl Drop for BrowTrainer {
     fn drop(&mut self) {
-        // Don't block app shutdown on a long training run — detach the thread. The child
-        // process is left to finish/observe on its own; we only own the log buffer.
         if let Some(h) = self.handle.take() {
             drop(h);
         }
     }
 }
 
-/// Validate a run's inputs up front with clear, specific messages (fail fast).
 fn validate_inputs(inputs: &TrainInputs) -> Result<(), String> {
     if !inputs.python_exe.is_file() {
         return Err(format!(
@@ -248,8 +191,6 @@ fn validate_inputs(inputs: &TrainInputs) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the (train, bake) command plan for `inputs`. Pure — no filesystem, no spawn — so
-/// the exact program/args/cwd are unit-testable. The split step is done in Rust, not here.
 pub fn build_commands(inputs: &TrainInputs, bake_script: &Path) -> Vec<PlannedCmd> {
     let images = inputs.brow_data_dir.join("images");
     let train_csv = inputs.brow_data_dir.join("train.csv");
@@ -259,8 +200,6 @@ pub fn build_commands(inputs: &TrainInputs, bake_script: &Path) -> Vec<PlannedCm
 
     let s = |p: &Path| p.to_string_lossy().into_owned();
 
-    // Train: 1-channel (NO --reference-* so it matches the 1-channel inference path). cwd
-    // = vr_eyebrow_dir because train.py imports dataset/model by name.
     let train = PlannedCmd {
         program: inputs.python_exe.clone(),
         args: vec![
@@ -277,8 +216,6 @@ pub fn build_commands(inputs: &TrainInputs, bake_script: &Path) -> Vec<PlannedCm
         cwd: inputs.vr_eyebrow_dir.clone(),
         stage: Stage::Train,
     };
-    // Bake: model.pth -> <brow_data>/brow.bin. cwd = brow_data (the --out dir); the bake
-    // script is self-contained so it doesn't need vr_eyebrow on PYTHONPATH.
     let bake = PlannedCmd {
         program: inputs.python_exe.clone(),
         args: vec![
@@ -294,14 +231,12 @@ pub fn build_commands(inputs: &TrainInputs, bake_script: &Path) -> Vec<PlannedCm
     vec![train, bake]
 }
 
-/// The whole run, on the worker thread: split -> each planned command -> Done/Failed.
 fn run_all(
     shared: Arc<Mutex<Shared>>,
     inputs: TrainInputs,
     plan: Vec<PlannedCmd>,
     _bake: BakeScript,
 ) {
-    // 1) Split (Rust).
     {
         let mut s = shared.lock().unwrap();
         s.set_stage(Stage::Split);
@@ -318,7 +253,6 @@ fn run_all(
         }
     }
 
-    // 2..) Each planned subprocess in order.
     for cmd in &plan {
         {
             let mut s = shared.lock().unwrap();
@@ -345,7 +279,6 @@ fn run_all(
         }
     }
 
-    // 3) Done — verify the bake actually produced brow.bin.
     let brow_bin = inputs.brow_data_dir.join("brow.bin");
     if !brow_bin.is_file() {
         fail(
@@ -360,7 +293,6 @@ fn run_all(
     s.status = Status::Done { brow_bin, log };
 }
 
-/// Transition the shared state to `Failed`, keeping the log tail for the UI.
 fn fail(shared: &Arc<Mutex<Shared>>, msg: String) {
     let mut s = shared.lock().unwrap();
     s.push_log(format!("[error] {msg}"));
@@ -376,7 +308,6 @@ fn stage_tag(stage: Stage) -> &'static str {
     }
 }
 
-/// A shell-free rendering of the command line for the log (quoting args with spaces).
 fn render_cmdline(cmd: &PlannedCmd) -> String {
     let q = |s: &str| {
         if s.contains(' ') {
@@ -393,8 +324,6 @@ fn render_cmdline(cmd: &PlannedCmd) -> String {
     out
 }
 
-/// Spawn `cmd`, streaming combined stdout+stderr line-by-line into the shared log, and
-/// return the process exit code. Windows: no console window is popped for the child.
 #[cfg(windows)]
 fn run_streamed(cmd: &PlannedCmd, shared: &Arc<Mutex<Shared>>) -> std::io::Result<i32> {
     use std::io::{BufRead, BufReader};
@@ -404,7 +333,6 @@ fn run_streamed(cmd: &PlannedCmd, shared: &Arc<Mutex<Shared>>) -> std::io::Resul
     let mut child = std::process::Command::new(&cmd.program)
         .args(&cmd.args)
         .current_dir(&cmd.cwd)
-        // Unbuffered Python so lines arrive live (tqdm/print show progress promptly).
         .env("PYTHONUNBUFFERED", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -413,7 +341,6 @@ fn run_streamed(cmd: &PlannedCmd, shared: &Arc<Mutex<Shared>>) -> std::io::Resul
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    // Drain stderr on its own thread so a chatty stream on one pipe can't deadlock the other.
     let se_shared = shared.clone();
     let se_thread = stderr.map(|se| {
         std::thread::spawn(move || {
@@ -434,7 +361,6 @@ fn run_streamed(cmd: &PlannedCmd, shared: &Arc<Mutex<Shared>>) -> std::io::Resul
     Ok(status.code().unwrap_or(-1))
 }
 
-/// Non-Windows stub (the app is Windows-only, but keep the lib cross-compilable).
 #[cfg(not(windows))]
 fn run_streamed(cmd: &PlannedCmd, shared: &Arc<Mutex<Shared>>) -> std::io::Result<i32> {
     use std::io::{BufRead, BufReader};
@@ -473,11 +399,8 @@ fn push_shared(shared: &Arc<Mutex<Shared>>, line: String) {
     }
 }
 
-/// The resolved bake script + an optional temp-file guard. When embedded, the temp file is
-/// deleted on drop (after the bake subprocess has run and this guard leaves scope).
 pub struct BakeScript {
     pub path: PathBuf,
-    /// `Some` when we wrote the embedded copy to a temp file (deleted on drop).
     temp: Option<PathBuf>,
 }
 
@@ -489,11 +412,7 @@ impl Drop for BakeScript {
     }
 }
 
-/// Resolve `bake_brow_weights.py`: prefer a copy shipped next to the exe (repo `tools/`
-/// during dev, or alongside a distributed exe), else write the `include_str!`-embedded copy
-/// to a temp file so a single-exe distribution can still bake.
 pub fn resolve_bake_script() -> std::io::Result<BakeScript> {
-    // Candidate locations relative to the exe dir: `bake_brow_weights.py`, `tools/…`.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for rel in ["bake_brow_weights.py", "tools/bake_brow_weights.py"] {
@@ -507,7 +426,6 @@ pub fn resolve_bake_script() -> std::io::Result<BakeScript> {
             }
         }
     }
-    // Fall back to the embedded copy in a per-process temp file.
     let tmp = std::env::temp_dir().join(format!(
         "sranibro_bake_brow_weights_{}.py",
         std::process::id()
@@ -538,7 +456,6 @@ mod tests {
         let plan = build_commands(&inputs(base), bake);
         assert_eq!(plan.len(), 2);
 
-        // Command 0: train.py with the 4 dataset args, NO --reference-*.
         let train = &plan[0];
         assert_eq!(train.stage, Stage::Train);
         assert!(train.args[0].ends_with("train.py"));
@@ -556,13 +473,11 @@ mod tests {
             !joined.contains("--reference"),
             "1-channel: no reference args: {joined}"
         );
-        // Paths point inside brow_data.
         assert!(train.args.iter().any(|a| a.ends_with("images")));
         assert!(train.args.iter().any(|a| a.ends_with("train.csv")));
         assert!(train.args.iter().any(|a| a.ends_with("val.csv")));
         assert!(train.args.iter().any(|a| a.ends_with("model.pth")));
 
-        // Command 1: the bake script, --pth model.pth --out brow_data.
         let b = &plan[1];
         assert_eq!(b.stage, Stage::Bake);
         assert_eq!(b.args[0], bake.to_string_lossy());
@@ -579,7 +494,6 @@ mod tests {
         let base = std::env::temp_dir().join(format!("sranibro_bt_val_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let inp = inputs(&base);
-        // Nothing exists yet -> python missing.
         let e = validate_inputs(&inp).unwrap_err();
         assert!(e.contains("Python interpreter"), "{e}");
         let _ = std::fs::remove_dir_all(&base);
@@ -587,8 +501,6 @@ mod tests {
 
     #[test]
     fn resolve_bake_script_always_yields_a_readable_script() {
-        // In dev this finds tools/bake_brow_weights.py next to the test exe OR falls back
-        // to the embedded copy; either way the file exists and is the bake tool.
         let bs = resolve_bake_script().expect("resolve");
         let text = std::fs::read_to_string(&bs.path).expect("read");
         assert!(text.contains("BROWNET1"), "resolved file is the bake tool");
@@ -596,7 +508,6 @@ mod tests {
 
     #[test]
     fn embedded_bake_script_is_the_bake_tool() {
-        // The include_str! copy must be the real tool (guards against a moved/renamed file).
         assert!(BAKE_PY.contains("BROWNET1"));
         assert!(BAKE_PY.contains("--pth"));
         assert!(BAKE_PY.contains("--out"));

@@ -1,10 +1,3 @@
-//! Loopback-only HTTP/MJPEG output for the latest mapped eye-camera images.
-//!
-//! The server never queues camera frames: every client reads the newest telemetry
-//! snapshot and skips duplicate generations. JPEG encoding happens only while a
-//! client is connected and follows camera events (120 Hz per eye on XR5), not UI
-//! redraws or a 30 Hz polling cap. Slow clients skip to the latest frame. Idle clients are checked
-//! for disconnects without sending fake frames or expiring a healthy quiet stream.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -20,8 +13,6 @@ use crate::pipeline::{EyeFrame, Telemetry};
 const MAX_CLIENTS: usize = 4;
 const BOUNDARY: &str = "sranibro-eye-frame";
 
-/// Running eye-image HTTP server. Dropping it closes the listener and asks every
-/// active stream to stop; no frame history is retained.
 pub struct EyeImageHttpServer {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -92,8 +83,6 @@ impl Drop for EyeImageHttpServer {
 }
 
 fn loopback_address(host: &str, port: u16) -> io::Result<SocketAddr> {
-    // Port 0 is accepted by the test-only ephemeral-server path below, but the product
-    // UI constrains persisted ports to 1..=65535 so its displayed URL stays exact.
     let ip: IpAddr = host.trim().parse().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -278,7 +267,6 @@ fn write_not_found(stream: &mut TcpStream) {
 }
 
 fn reject_busy(mut stream: TcpStream) {
-    // This small rejection runs on the accept thread, not a client worker.
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     write_response(
         &mut stream,
@@ -347,10 +335,6 @@ fn write_stream(stream: &mut TcpStream, telemetry: &Telemetry, stop: &AtomicBool
             }
             last_generation = frame.generation;
         } else if stream_finished(stream).unwrap_or(true) {
-            // A stopped camera must not pin the browser's slot forever. Writes
-            // detect disconnects while frames flow; this check covers the quiet
-            // path without repeating an image, emitting invalid multipart bytes,
-            // or disconnecting a still-open client just because no frame arrived.
             return;
         }
         telemetry.wait_image_frame(&mut image_epoch);
@@ -358,16 +342,10 @@ fn write_stream(stream: &mut TcpStream, telemetry: &Telemetry, stop: &AtomicBool
 }
 
 fn stream_finished(stream: &TcpStream) -> io::Result<bool> {
-    // Only this client's thread accesses this socket. Temporarily use nonblocking
-    // peek for the receive side, then restore blocking writes and their existing
-    // timeout. A read timeout would add latency to every idle camera poll.
     stream.set_nonblocking(true)?;
     let peek = stream.peek(&mut [0u8; 1]);
     stream.set_nonblocking(false)?;
     match peek {
-        // EOF includes a peer's write-half shutdown. The MJPEG endpoint has one
-        // GET per connection (Connection: close); it does not support half-closed
-        // request streams, pipelining, request bodies, or further client messages.
         Ok(_) => Ok(true),
         Err(error)
             if matches!(
@@ -499,9 +477,6 @@ mod tests {
             for client in clients {
                 client.shutdown(Shutdown::Both).unwrap();
             }
-            // No camera frame is ever published. Every occupied slot must clear,
-            // not merely one reusable slot serving sequential index requests.
-            // The next iteration reopens and retains all four streams together.
             let deadline = Instant::now() + Duration::from_secs(2);
             while server.clients.load(Ordering::Relaxed) != 0 {
                 assert!(

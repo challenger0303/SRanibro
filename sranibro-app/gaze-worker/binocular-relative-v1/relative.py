@@ -1,4 +1,4 @@
-"""Research-only causal2D gaze transfer; no eyelid changes or neural models."""
+""
 from collections import deque
 import math
 import numpy as np
@@ -99,7 +99,7 @@ class RelativeGaze:
                 self.history[eye].append(point)
                 out.append(np.median(np.stack(self.history[eye]),axis=0) if self.median and len(self.history[eye])==3 else point.copy())
         self.update_mapping(time, raw, [float(s) if p is not None else 0. for p,s in zip(raw,confidence)])
-        # Use observed partner only. Never recursively recover both eyes.
+
         if self.recover:
             for eye in (0,1):
                 if raw[eye] is None and raw[1-eye] is not None:

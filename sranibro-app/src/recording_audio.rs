@@ -1,7 +1,3 @@
-//! Non-blocking notification sounds for calibration recordings.
-//!
-//! The UI publishes only state transitions. A bounded worker queue plays short,
-//! distinguishable in-memory WAV earcons through the current default audio device.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,8 +60,6 @@ impl RecordingAudio {
         Self { shared }
     }
 
-    /// Queue a cue without waiting on the audio device. Terminal and warning cues replace
-    /// stale phase markers; duplicate sampling ticks are deliberately lossy.
     pub fn cue(&self, cue: Cue, enabled: bool) {
         if !enabled {
             return;

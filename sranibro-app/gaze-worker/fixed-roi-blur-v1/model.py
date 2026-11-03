@@ -1,4 +1,4 @@
-"""Separate fixed-ROI-blur research model; original candidates remain unchanged."""
+""
 from pathlib import Path
 import hashlib,importlib.util,json
 ROOT=Path(__file__).resolve().parent;GOAL=ROOT.parent

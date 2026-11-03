@@ -1,21 +1,3 @@
-//! `vpetest` — Vive Pro Eye eyechip native-wake VALIDATOR (diagnostic, 2026-06-30).
-//!
-//! Goal: prove (or disprove) that SRanibro can keep the VPE eyechip registered over
-//! USB by itself — replacing the "run SRanipal in the background" workaround. It uses
-//! the SAME WinUSB transport SRanibro ships, so a pass here means the real adapter can
-//! do it too.
-//!
-//! Protocol RE'd from GhostIam's `testvpe.exe` (Go/gousb) — see project_vpe_native_wake:
-//! every ~500 ms the chip emits a 64-B interrupt-IN "challenge" starting `03 D0 2C`; the
-//! host must reply with a HID **SET_REPORT** (bmRequestType 0x21, bRequest 0x09,
-//! wValue 0x0304, wIndex = HID interface) carrying a 64-B feature report whose 3 checksum
-//! bytes are a CRC32(serial)+challenge-tail fold. Sustain it and the chip stays alive.
-//!
-//! This tool is DIAGNOSTIC: it dumps the device/interface/endpoint/serial layout (the
-//! unknowns the RE couldn't pin without hardware) and then runs the keepalive for ~30 s,
-//! logging every step. Even if the keepalive guess is slightly off, the dumped layout is
-//! what we need to finish the real adapter. It does not change anything permanently; run
-//! `sranibro-rs restore` afterwards to hand the chip back to the Tobii runtime.
 
 #![cfg(windows)]
 
@@ -39,8 +21,6 @@ use windows_sys::Win32::Devices::Usb::{
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING};
 
-/// EyeChip device-interface GUID {85C0F97C-E2B1-422A-92A9-5F96072E79D8} (same as usb.rs;
-/// Sepfox confirmed this resolves to the VPE eyechip too — VPE runs as `pimax_vr4`).
 const GUID_EYECHIP: GUID = GUID {
     data1: 0x85C0_F97C,
     data2: 0xE2B1,
@@ -51,8 +31,6 @@ const GENERIC_RW: u32 = 0xC000_0000;
 const ERROR_SEM_TIMEOUT: u32 = 121;
 const USBD_PIPE_TYPE_INTERRUPT: i32 = 3;
 
-// ---- CRC32 IEEE, reflected, RAW running update (no pre/post inversion) ----
-// Matches Go's `hash/crc32.update` called directly (NOT ChecksumIEEE). Seed is 0.
 pub(crate) fn crc32_table() -> [u32; 256] {
     let mut t = [0u32; 256];
     let mut i = 0u32;
@@ -84,7 +62,6 @@ fn last_err(ctx: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{ctx}: win32 error {e}"))
 }
 
-/// First present EyeChip interface path (NUL-terminated UTF-16), like usb.rs::find_device.
 fn find_eyechip() -> io::Result<Vec<u16>> {
     let mut len: u32 = 0;
     let cr = unsafe {
@@ -217,7 +194,6 @@ unsafe fn read_pipe(h: WINUSB_INTERFACE_HANDLE, ep: u8, buf: &mut [u8]) -> io::R
     Ok(got as usize)
 }
 
-/// Decode a USB string descriptor (UTF-16LE after the 2-byte header) to a String.
 fn decode_string_desc(d: &[u8]) -> String {
     if d.len() < 2 {
         return String::new();
@@ -230,7 +206,6 @@ fn decode_string_desc(d: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// One discovered interface: its WinUSB handle + descriptor + pipes.
 struct IfaceInfo {
     handle: WINUSB_INTERFACE_HANDLE,
     number: u8,
@@ -258,18 +233,14 @@ unsafe fn query_iface(h: WINUSB_INTERFACE_HANDLE) -> Option<IfaceInfo> {
     })
 }
 
-/// Entry point for the `vpetest` subcommand.
 pub fn run() {
     println!("=== SRanibro VPE eyechip wake VALIDATOR ===");
     println!("(diagnostic only; run `sranibro-rs restore` afterwards to hand the chip back)\n");
 
-    // Read-only interface/driver map FIRST (before any service change), so we always get
-    // the layout even if the exclusive open below fails.
     println!("[scan] present eyechip USB interfaces + drivers:");
     unsafe { scan_usb() };
     println!();
 
-    // Free the EyeChip from the Tobii runtime so WinUSB can claim it exclusively.
     crate::platform::ensure_capture_ready();
 
     let path = match find_eyechip() {
@@ -304,7 +275,6 @@ pub fn run() {
     }
     println!("[open] WinUSB interface opened.");
 
-    // --- Device descriptor: confirm VID/PID + find the serial-string index. ---
     let mut serial_bytes: Vec<u8> = Vec::new();
     match unsafe { ctrl_in(base, 0x80, 0x06, 0x0100, 0x0000, 18) } {
         Ok(dd) if dd.len() >= 18 => {
@@ -338,7 +308,6 @@ pub fn run() {
         Err(e) => println!("[desc] GET_DESCRIPTOR(device) failed: {e}"),
     }
 
-    // --- Enumerate the base interface + every associated interface; dump pipes. ---
     println!("\n[iface] enumerating interfaces (base + associated):");
     let mut ifaces: Vec<IfaceInfo> = Vec::new();
     if let Some(info) = unsafe { query_iface(base) } {
@@ -349,7 +318,7 @@ pub fn run() {
     loop {
         let mut h: WINUSB_INTERFACE_HANDLE = std::ptr::null_mut();
         if unsafe { WinUsb_GetAssociatedInterface(base, ai, &mut h) } == 0 {
-            break; // no more associated interfaces
+            break;
         }
         if let Some(info) = unsafe { query_iface(h) } {
             print_iface(&format!("assoc[{ai}]"), &info);
@@ -361,8 +330,6 @@ pub fn run() {
         }
     }
 
-    // --- Pick the keepalive target: an interface with an interrupt-IN endpoint
-    //     (prefer HID class 3). That endpoint carries the chip's challenge. ---
     let target = ifaces
         .iter()
         .find(|i| i.class == 3 && interrupt_in(i).is_some())
@@ -382,7 +349,6 @@ pub fn run() {
     );
     unsafe { set_timeout(t.handle, in_ep, 200) };
 
-    // --- Run the RE'd challenge-response keepalive for ~30 s. ---
     let table = crc32_table();
     let mut buf = [0u8; 64];
     let (mut challenges, mut acks, mut reads, mut errs) = (0u32, 0u32, 0u32, 0u32);
@@ -420,7 +386,6 @@ pub fn run() {
         }
         challenges += 1;
 
-        // CRC = update(0, serial) then update(crc, challenge[n-2..n]) — raw reflected, no XOR.
         let mut crc = crc32_update(&table, 0, &serial_bytes);
         if n >= 2 {
             crc = crc32_update(&table, crc, &buf[n - 2..n]);
@@ -518,7 +483,6 @@ fn hex(b: &[u8]) -> String {
         .join(" ")
 }
 
-// ---- read-only SetupAPI scan: which USB interfaces the eyechip exposes + their drivers ----
 const SPDRP_SERVICE: u32 = 4;
 const SPDRP_CLASS: u32 = 7;
 
@@ -556,10 +520,6 @@ unsafe fn dev_prop(h: HDEVINFO, d: *mut SP_DEVINFO_DATA, prop: u32) -> String {
     String::from_utf16_lossy(&u[..n])
 }
 
-/// List every PRESENT USB device whose hardware id is the eyechip (VID 0BB4 = VPE,
-/// 2104 = Pimax), with its interface number (MI), device class and bound driver. This
-/// is the make-or-break map: it shows whether the HID (challenge) interface exists and
-/// whether it is WinUSB-claimable (driver = WinUSB/libusbK) vs HID-stack-bound (HidUsb).
 unsafe fn scan_usb() {
     let enumerator: Vec<u16> = "USB".encode_utf16().chain(std::iter::once(0)).collect();
     let h = SetupDiGetClassDevsW(
@@ -609,8 +569,6 @@ unsafe fn scan_usb() {
     SetupDiDestroyDeviceInfoList(h);
 }
 
-/// `vpescan` subcommand — READ-ONLY interface/driver map (no service changes). Run this
-/// both WITH SRanipal running and WITHOUT, to compare which interfaces appear/vanish.
 pub fn scan() {
     println!("=== VPE / eyechip USB interface map (read-only — nothing is changed) ===");
     println!("(driver = WinUSB/libusbK -> we can claim it; HidUsb/mshidkmdf -> HID-stack-bound)\n");

@@ -1,19 +1,3 @@
-//! StarVR One adapter — Tobii Stream Engine acquisition.
-//!
-//! StarVR One uses the SAME Tobii IS4 EyeChip as the Pimax VR4/Crystal (200x200
-//! @120Hz stereo IR, `slot A = LEFT`), but a DIFFERENT transport: instead of VR4's
-//! DLL-free WinUSB+TTP path, StarVR is driven through a compatible stream-engine
-//! runtime via the standard Tobii C API. Official binaries can provide a runtime
-//! validated specifically for StarVR; public-source builds contain no payload.
-//!
-//! The acquisition sequence is `tobii_api_create` -> `enumerate_local_device_urls`
-//! -> `tobii_device_create` -> `tobii_image_subscribe` + `tobii_wearable_data_subscribe`
-//! -> pump `tobii_device_process_callbacks`. Struct layouts verified against
-//! ReStar's vendored `tobii_wearable.h` (compile-time size asserts below).
-//!
-//! Startup is not reported as successful until several complete stereo pairs and
-//! wearable samples have arrived. Runtime stalls are surfaced instead of leaving a
-//! frozen camera image marked as streaming.
 
 #![cfg(windows)]
 
@@ -31,14 +15,9 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 use super::{FrameFn, GazeFn, HmdAdapter};
 use crate::core::types::{DeviceProfile, Eye, EyeSample, GazeSample};
 
-// If vendor initialization or shutdown exceeds our timeout, its detached thread may
-// still own DLL state. Do not stack another potentially wedged API instance in
-// the same process; a process restart is the only reliable isolation boundary.
 static INIT_WEDGED: AtomicBool = AtomicBool::new(false);
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The worker keeps ownership of callback contexts and the loaded DLL even when
-/// detached. Never unload its runtime or terminate a native call from this thread.
 fn join_or_quarantine(handle: JoinHandle<()>, budget: Duration, quarantine: &AtomicBool) -> bool {
     let deadline = Instant::now() + budget;
     while !handle.is_finished() {
@@ -50,12 +29,9 @@ fn join_or_quarantine(handle: JoinHandle<()>, budget: Duration, quarantine: &Ato
         thread::sleep(remaining.min(Duration::from_millis(5)));
     }
     let _ = handle.join();
-    // A prior timeout is intentionally permanent, even if a later worker exits.
     true
 }
 
-// --- Tobii SDK 2.x struct layout (verified vs ReStar's tobii_wearable.h) ---
-// Validity flag ALWAYS precedes its value.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TobiiWearableEye {
@@ -87,7 +63,7 @@ const _: () = assert!(core::mem::size_of::<TobiiWearableData>() == 144);
 impl TobiiWearableEye {
     fn to_eye_sample(&self) -> EyeSample {
         EyeSample {
-            gaze: self.gaze_direction, // RAW; the output sink negates once.
+            gaze: self.gaze_direction,
             gaze_valid: self.gaze_direction_validity != 0,
             gaze_reported: true,
             origin_mm: self.gaze_origin_mm,
@@ -104,7 +80,6 @@ impl TobiiWearableEye {
     }
 }
 
-// --- Tobii C API function-pointer types (cdecl == C on x64 Windows) ---
 type UrlCb = extern "C" fn(*const c_char, *mut c_void);
 type ImgCb = extern "C" fn(*const c_void, *mut c_void);
 type AdvCb = extern "C" fn(*const TobiiWearableData, *mut c_void);
@@ -128,8 +103,6 @@ struct TobiiCustomLog {
     log_func: Option<TobiiLogFn>,
 }
 
-/// Stable names from `tobii_error_t` in the SDK header. Keeping the numeric value
-/// too is important when a vendor DLL adds a code newer than our header.
 fn error_name(rc: i32) -> &'static str {
     match rc {
         0 => "NO_ERROR",
@@ -174,9 +147,6 @@ extern "C" fn tobii_log(_context: *mut c_void, level: i32, text: *const c_char) 
     eprintln!("[starvr:tobii] {level}: {message}");
 }
 
-/// Shared context handed to the C callbacks via the `user_data` pointer. Lives on
-/// the pump thread for the whole subscription; callbacks fire synchronously inside
-/// `tobii_device_process_callbacks` on that same thread (no cross-thread aliasing).
 struct Ctx {
     on_frame: FrameFn,
     on_gaze: GazeFn,
@@ -205,10 +175,6 @@ fn signal_init_ok(sender: &mut Option<InitSender>) {
     }
 }
 
-/// The two eye images in one stereo capture arrive almost back-to-back, while
-/// consecutive captures are about 8.3 ms apart at 120 Hz. Grouping by the
-/// device timestamp lets the next capture re-synchronise even if a callback is
-/// malformed or dropped; a global parity bit cannot recover from that.
 const STEREO_PAIR_MAX_DELTA_US: u64 = 2_000;
 const STARTUP_STEREO_PAIRS: u64 = 5;
 const STARTUP_WEARABLE_SAMPLES: u64 = 3;
@@ -258,8 +224,6 @@ extern "C" fn img_cb(img: *const c_void, user: *mut c_void) {
     if ctx.stop.load(Ordering::Acquire) {
         return;
     }
-    // StarVR's tobii_image_t header: device timestamp @0x00 (u64), width @0x10
-    // (u32), height @0x14 (u32), data ptr @0x18 (u64).
     let base = img as *const u8;
     let (timestamp_us, w, h, dptr) = unsafe {
         (
@@ -269,8 +233,6 @@ extern "C" fn img_cb(img: *const c_void, user: *mut c_void) {
             core::ptr::read_unaligned(base.add(0x18) as *const u64) as *const u8,
         )
     };
-    // Route before validating the payload. An invalid first-eye payload still
-    // occupies its timestamp slot, so the valid mate must remain the other eye.
     let eye = route_image_eye(
         &mut ctx.last_image_timestamp_us,
         ctx.slot_a_eye,
@@ -298,7 +260,7 @@ extern "C" fn img_cb(img: *const c_void, user: *mut c_void) {
         eprintln!("[starvr] first image callback: {w}x{h} ({n} bytes)");
     }
     if !ctx.stop.load(Ordering::Acquire) {
-        (ctx.on_frame)(eye, w, h, px); // on_frame copies the slice; borrow ends here.
+        (ctx.on_frame)(eye, w, h, px);
     }
 }
 
@@ -328,9 +290,6 @@ extern "C" fn adv_cb(data: *const TobiiWearableData, user: *mut c_void) {
 pub struct StarVrAdapter {
     profile: DeviceProfile,
     dll_path: Option<String>,
-    /// Whether to stop the Tobii Platform Runtime before connecting. True when the
-    /// patched stream engine accesses the EyeChip DIRECTLY (Pimax `pimax_dll`); false
-    /// for a service-routed StarVR (don't pull its service out from under it).
     handoff: bool,
     preferred_url_marker: Option<String>,
     stop: Arc<AtomicBool>,
@@ -340,16 +299,9 @@ pub struct StarVrAdapter {
 
 impl StarVrAdapter {
     pub fn new(cfg: &crate::config::Config) -> Self {
-        // Verified: slot A (brighter) = LEFT on StarVR One. The connection route is
-        // discovered automatically and then remembered in the private config field.
         Self::with_profile(cfg, "StarVR One", Eye::Left, cfg.hmd.starvr_direct)
     }
 
-    /// Generic Tobii stream-engine adapter for any IS4 HMD (StarVR, or Pimax via
-    /// `device = "pimax_dll"`). `name` is the display profile; `slot_a` is which eye
-    /// the first image of each callback pair belongs to (Left on the units verified
-    /// so far — flip with the eye-swap option if a unit is wired the other way).
-    /// `handoff` = stop the Tobii runtime first (direct EyeChip access, e.g. Pimax).
     pub fn with_profile(
         cfg: &crate::config::Config,
         name: &str,
@@ -359,15 +311,13 @@ impl StarVrAdapter {
         Self {
             profile: DeviceProfile {
                 name: name.into(),
-                ml_device: "vr4".into(), // same IS4 frontal preprocessing as VR4
+                ml_device: "vr4".into(),
                 slot_a_eye: slot_a,
                 transport: "Tobii stream engine".into(),
                 streams: "Tobii image + wearable_data".into(),
                 gaze_src: "gaze · pupil · openness (Tobii)".into(),
                 ..DeviceProfile::default()
             },
-            // StarVR uses a separately validated runtime in official builds;
-            // the generic Pimax stream-engine route keeps the general runtime.
             dll_path: if name.contains("StarVR") {
                 cfg.starvr_runtime_path()
             } else {
@@ -375,8 +325,6 @@ impl StarVrAdapter {
             }
             .map(|p| p.to_string_lossy().into_owned()),
             handoff,
-            // Observed StarVR serial URLs start with VRS. Prefer that device if
-            // another Tobii runtime also exposes a local URL on the machine.
             preferred_url_marker: name.contains("StarVR").then(|| "VRS".into()),
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
@@ -391,7 +339,6 @@ fn set_status(s: &Arc<Mutex<String>>, msg: impl Into<String>) {
     }
 }
 
-/// Resolve an `extern "C"` proc by NUL-terminated name; `None` if absent.
 unsafe fn proc<T: Copy>(hmod: *mut c_void, name: &[u8]) -> Option<T> {
     debug_assert_eq!(*name.last().unwrap(), 0, "name must be NUL-terminated");
     GetProcAddress(hmod, name.as_ptr()).map(|f| std::mem::transmute_copy::<_, T>(&f))
@@ -462,7 +409,6 @@ impl HmdAdapter for StarVrAdapter {
                 return;
             }
 
-            // Resolve the C API.
             macro_rules! load {
                 ($name:literal, $t:ty) => {
                     match unsafe { proc::<$t>(hmod, concat!($name, "\0").as_bytes()) } {
@@ -491,10 +437,7 @@ impl HmdAdapter for StarVrAdapter {
             let adv_unsub = load!("tobii_wearable_data_unsubscribe", AdvUnsub);
             let process = load!("tobii_device_process_callbacks", ProcCb);
 
-            // api_create -> enumerate -> device_create
             let mut api: *mut c_void = std::ptr::null_mut();
-            // Capture the Tobii stack's own diagnostics. The struct stays alive for
-            // the entire API lifetime because this pump thread owns the stack frame.
             let custom_log = TobiiCustomLog {
                 context: std::ptr::null_mut(),
                 log_func: Some(tobii_log),
@@ -589,8 +532,6 @@ impl HmdAdapter for StarVrAdapter {
             }
             eprintln!("[starvr] device opened: {}", url.to_string_lossy());
 
-            // Subscribe. Ctx lives on this thread for the whole loop; its raw ptr is
-            // the callbacks' user_data.
             let mut ctx = Box::new(Ctx {
                 on_frame,
                 on_gaze,
@@ -780,7 +721,6 @@ impl HmdAdapter for StarVrAdapter {
                 thread::sleep(Duration::from_millis(2));
             }
 
-            // Teardown BEFORE dropping ctx, so no callback can fire on freed state.
             unsafe {
                 if have_adv {
                     adv_unsub(dev);
@@ -823,8 +763,6 @@ impl HmdAdapter for StarVrAdapter {
                     &self.status,
                     "initialization timed out; restart SRanibro before retrying",
                 );
-                // A vendor call may itself be wedged. Detach rather than block
-                // the UI forever; the stop flag makes it exit if the call returns.
                 self.thread.take();
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -891,7 +829,6 @@ mod tests {
         release_tx.send(()).unwrap();
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(Arc::strong_count(&owned), 1);
-        // A late return does not make restarting a native API instance safe.
         assert!(quarantine.load(Ordering::Acquire));
     }
 
@@ -925,7 +862,6 @@ mod tests {
         };
         let user = &mut ctx as *mut Ctx as *mut c_void;
         let image_header = [0u8; 32];
-        // All fields are integers or floating-point values: zero is valid here.
         let wearable: TobiiWearableData = unsafe { std::mem::zeroed() };
         img_cb(image_header.as_ptr().cast(), user);
         adv_cb(&wearable, user);
@@ -940,9 +876,6 @@ mod tests {
         assert_eq!(route_image_eye(&mut last, Eye::Left, 10_000), Eye::Left);
         assert_eq!(route_image_eye(&mut last, Eye::Left, 10_085), Eye::Right);
 
-        // The second callback of this capture never arrives. The long gap to
-        // the next capture must reset routing to slot A instead of swapping all
-        // subsequent eyes as parity routing would.
         assert_eq!(route_image_eye(&mut last, Eye::Left, 18_333), Eye::Left);
         assert_eq!(route_image_eye(&mut last, Eye::Left, 26_666), Eye::Left);
         assert_eq!(route_image_eye(&mut last, Eye::Left, 26_750), Eye::Right);
@@ -952,8 +885,6 @@ mod tests {
     fn timestamp_pair_routing_counts_an_invalid_payload_slot() {
         let mut last = 0;
 
-        // img_cb calls the router before payload validation. Even if the first
-        // payload is rejected, its close-timestamp mate remains slot B.
         assert_eq!(route_image_eye(&mut last, Eye::Left, 50_000), Eye::Left);
         assert_eq!(route_image_eye(&mut last, Eye::Left, 50_090), Eye::Right);
     }

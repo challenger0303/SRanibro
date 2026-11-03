@@ -1,4 +1,3 @@
-//! Deterministic artifact and provenance boundary for the renderer-only atlas.
 
 use std::error::Error;
 use std::path::Path;
@@ -97,8 +96,6 @@ struct AtlasManifest<'a> {
     interpretation_limit: &'static str,
 }
 
-/// Reject a destination that could mix this run with an earlier or partial run.
-/// This check is intentionally repeated immediately before writing.
 pub fn ensure_output_empty(out_dir: &Path) -> Result<(), Box<dyn Error>> {
     if out_dir.exists() {
         if !out_dir.is_dir() {
@@ -115,7 +112,6 @@ pub fn ensure_output_empty(out_dir: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Resolve the exact source commit and dirty state without importing the model runner.
 pub fn repository_state(repo: &Path) -> Result<RepositoryState, Box<dyn Error>> {
     let commit = git(repo, &["rev-parse", "--verify", "HEAD"])?;
     if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -129,8 +125,6 @@ pub fn repository_state(repo: &Path) -> Result<RepositoryState, Box<dyn Error>> 
     })
 }
 
-/// Bind the executable's compiled implementation bytes to the clean checkout that
-/// will be named in the manifest. This rejects stale and dirty-built executables.
 pub fn verify_compiled_identity(repository: &RepositoryState) -> Result<(), Box<dyn Error>> {
     if BUILD_COMMIT != repository.commit {
         return Err(format!(
@@ -150,7 +144,6 @@ pub fn verify_compiled_identity(repository: &RepositoryState) -> Result<(), Box<
     Ok(())
 }
 
-/// Ensure that the frozen protocol is a real ancestor of the implementation run.
 pub fn verify_preregistration(repo: &Path) -> Result<(), Box<dyn Error>> {
     let status = Command::new("git")
         .args([
@@ -170,8 +163,6 @@ pub fn verify_preregistration(repo: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Write deterministic atlas artifacts. `manifest.json` is the completion marker and
-/// is deliberately written last. No path or wall-clock value enters its bytes.
 pub fn write_atlas(
     out_dir: &Path,
     repo_dir: &Path,

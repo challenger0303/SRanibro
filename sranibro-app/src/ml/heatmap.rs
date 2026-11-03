@@ -1,32 +1,13 @@
-//! Spatial response heatmaps for the eye model — diagnostics that show how the openness
-//! output RESPONDS to each region of the eye image (e.g. the lid/iris boundary or bright
-//! specular dots glasses / IR-LEDs throw onto the IR frame).
-//!
-//! The net is forward-pass only (no autograd), so instead of a gradient we PERTURB a
-//! patch of the input and watch the openness output move. Besides erase-to-mean and glint
-//! injection, centred brighten/darken and local-contrast probes distinguish "the model
-//! needs this shape" from "the model merely reacts to this region becoming brighter".
-//! The 8 px / 4 px grid is deliberately high-resolution on the canonical 100x100 input;
-//! it runs once on demand rather than as a live per-frame overlay.
 
 use super::eye_net::EyeNet;
 use super::eyelid_model::{CanonicalStereoInput, EyelidModel};
 use super::preprocess::DST;
 
-/// Which perturbation the heatmap applies to each patch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HeatMode {
-    /// Erase each patch to the channel mean and measure how much openness moves — the
-    /// regions the model actually relies on for its openness estimate.
     OcclusionMean,
-    /// Paint each patch bright (simulate a specular glint) and measure how much openness
-    /// is corrupted — where a glasses / IR-LED reflection actually hurts the reading.
     GlintInject,
-    /// Brighten and darken the same patch by equal amounts. Positive response means local
-    /// brightness raises openness; negative means it lowers openness.
     BrightnessSensitivity,
-    /// Increase and decrease contrast inside a patch around that patch's own mean. This
-    /// keeps local brightness approximately fixed and exposes sensitivity to boundaries.
     ContrastSensitivity,
 }
 
@@ -41,40 +22,25 @@ impl HeatMode {
     }
 }
 
-/// Whole-channel response probes shown beside the spatial map. Brightness uses the same
-/// multiplicative definition as the live manual-brightness control. Contrast is centred
-/// on the eye channel's median, so it does not intentionally move the median brightness.
 pub const RESPONSE_FACTORS: [f32; 5] = [0.70, 0.85, 1.00, 1.25, 1.50];
 
-/// One computed heatmap pair (both eyes) plus the grayscale model input it was scored
-/// over, so the UI can composite the overlay 1:1 with no resampling offset.
 pub struct HeatResult {
-    /// Signed openness delta per pixel (`DST*DST` each). `[left, right]`.
     pub delta: [Vec<f32>; 2],
-    /// The grayscale model input (`DST*DST` u8) each eye was scored on. `[left, right]`.
     pub base: [Vec<u8>; 2],
     pub mode: HeatMode,
-    /// Robust display scale (98th percentile of finite absolute spatial response) and the
-    /// true maximum. Auto-scaling uses p98; peak remains visible so weak maps are honest.
     pub p98_abs_delta: f32,
     pub peak_abs_delta: f32,
-    /// Raw current-frame openness and one-eye-at-a-time global response curves.
     pub baseline_openness: [f32; 2],
     pub brightness_response: [[f32; RESPONSE_FACTORS.len()]; 2],
     pub contrast_response: [[f32; RESPONSE_FACTORS.len()]; 2],
 }
 
-// Patch = 8 px on the 100x100 grid: still wider than conv1's 5x5 receptive field, but
-// narrow enough to separate lid margin, iris and glints. Stride 4 gives 50% overlap and
-// a 24x24 probe grid instead of the old ~14x14 grid.
 const P: usize = 8;
 const S: usize = 4;
 const BRIGHTNESS_STEP: f32 = 0.12;
 const CONTRAST_HIGH: f32 = 1.35;
 const CONTRAST_LOW: f32 = 0.65;
 
-/// Top-left patch positions along one axis: 0,4,…,DST-P, with the last clamped to the
-/// edge so the whole grid is covered.
 fn positions() -> Vec<usize> {
     let mut v: Vec<usize> = (0..=DST - P).step_by(S).collect();
     if v.last() != Some(&(DST - P)) {
@@ -83,11 +49,6 @@ fn positions() -> Vec<usize> {
     v
 }
 
-/// Occlusion-sensitivity map for ONE eye. `input` is the live 2x100x100 stereo buffer
-/// (`[c][h][w]`, L=ch0 / R=ch1); `eye_ch` = the channel to perturb (0/1); `out_idx` =
-/// the openness output to read (1 for L, 2 for R). The OTHER channel is left at its real
-/// value throughout (the net is dual-eye — perturbing it would move openness for reasons
-/// unrelated to the patch). Returns a `DST*DST` signed delta map.
 fn occlusion_map_with(
     input: &[f32],
     eye_ch: usize,
@@ -100,9 +61,9 @@ fn occlusion_map_with(
     let fill = match mode {
         HeatMode::OcclusionMean => {
             let sum: f32 = input[off..off + n * n].iter().sum();
-            sum / (n * n) as f32 // erase to the average grey — neutral, no injected feature
+            sum / (n * n) as f32
         }
-        HeatMode::GlintInject => 1.0, // brightest = a specular reflection
+        HeatMode::GlintInject => 1.0,
         HeatMode::BrightnessSensitivity | HeatMode::ContrastSensitivity => 0.0,
     };
     let mut work = input.to_vec();
@@ -126,8 +87,6 @@ fn occlusion_map_with(
                         }
                     }
                     let o = infer_openness(&work)?;
-                    // OcclusionMean: base - o (positive = erasing here lowered openness).
-                    // GlintInject: o - base (signed shift a fake glint induces).
                     if mode == HeatMode::OcclusionMean {
                         base - o
                     } else {
@@ -181,7 +140,7 @@ fn occlusion_map_with(
                     let k = (cy + y) * n + (cx + x);
                     heat[k] += delta;
                     cover[k] += 1.0;
-                    work[off + k] = saved[y * P + x]; // restore
+                    work[off + k] = saved[y * P + x];
                 }
             }
         }
@@ -294,11 +253,8 @@ fn compute_with(
     })
 }
 
-/// Compute both eyes' heatmaps for `mode` over the live `input` (2x100x100), and copy the
-/// grayscale model input per eye for the UI overlay base.
 pub fn compute(net: &mut EyeNet, input: &[f32], mode: HeatMode) -> HeatResult {
     compute_with(input, mode, |sample, eye| {
-        // left eye: input ch0 -> out[1]; right eye: input ch1 -> out[2]
         Some(net.forward_one(sample)[eye + 1])
     })
     .expect("the legacy EyeNet always provides openness")
@@ -309,8 +265,6 @@ fn model_openness(model: &mut dyn EyelidModel, input: &[f32], eye: usize) -> Opt
     model.infer(input).ok()?.openness[eye]
 }
 
-/// Contract-backed heatmap used by the live runtime. The public legacy API above remains
-/// unchanged; both routes share the exact perturbation loop and arithmetic order.
 pub(crate) fn compute_model(
     model: &mut dyn EyelidModel,
     input: &[f32],

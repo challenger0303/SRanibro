@@ -1,11 +1,3 @@
-//! XR5 geometry initialization from the motion of the eyelids in raw camera frames.
-//!
-//! This is deliberately independent of EyeNet.  The old geometry fitter could find
-//! several crops with similar open/closed scores because the network output alone does
-//! not identify a unique image transform.  Here we first estimate a low-dimensional
-//! blink-motion ellipse, then solve for the crop and rotation that place that ellipse in
-//! the canonical region occupied by a known-good XR5 reconstruction.  EyeNet and the
-//! untouched holdout remain the final safety checks in `geometry_fitrun`.
 
 use crate::core::types::MlGeometry;
 
@@ -15,30 +7,16 @@ const MIN_GROUP_FRAMES: usize = 8;
 const MIN_MOTION_PAIRS: usize = 20;
 const MIN_EFFECTIVE_PIXELS: usize = 64;
 
-// Absolute appearance references measured from two independent XR5 recordings after
-// undoing the capture writer's storage-only right mirror. Unlike the blink envelope,
-// the pupil centre and aperture axis repeated closely across both sessions. Geometry
-// below is expressed in the live, raw 200x200 camera coordinates.
 const APPEARANCE_PUPIL_REFERENCE: [[f64; 2]; 2] = [[71.0, 100.0], [127.0, 99.0]];
 const APPEARANCE_AXIS_REFERENCE_DEG: [f64; 2] = [12.75, -6.05];
 const XR5_PRESET_CENTER_PX: [[f64; 2]; 2] = [[60.0, 100.0], [140.0, 100.0]];
 const XR5_PRESET_ROTATION_DEG: [f64; 2] = [-30.0, 30.0];
 const XR5_PRESET_WIDTH_PX: f64 = 120.0;
 const XR5_PRESET_HEIGHT_PX: f64 = 140.0;
-// The inner LED/lens stack is fixed hardware, not user geometry. Keep it out of
-// appearance and motion evidence before estimating any per-user transform. The mask is
-// deliberately a little stronger than the shipped 40% crop because flare extends past
-// the visibly saturated emitters.
 const XR5_LED_SAFE_LEFT_MAX_X: usize = 108;
 const XR5_LED_SAFE_RIGHT_MIN_X: usize = 91;
 const XR5_MIN_INNER_CROP: f64 = 0.40;
 
-/// Non-reconstructable aggregate blink-motion statistics in the 100x100 EyeNet input.
-///
-/// These are the mean and covariance of the motion envelope produced by the validated
-/// XR5 preset over two development sessions.  No camera frame, template image, user
-/// identifier, or model output is embedded.  Keeping a per-eye target is intentional:
-/// the XR5 optical paths and the final right-eye handedness are not identical.
 const CANONICAL_MEAN: [[f64; 2]; 2] = [[64.837_784, 44.911_706], [63.288_729, 46.098_966]];
 const CANONICAL_COVARIANCE: [[[f64; 2]; 2]; 2] = [
     [[247.287_843, 8.945_901], [8.945_901, 195.626_530]],
@@ -47,7 +25,6 @@ const CANONICAL_COVARIANCE: [[[f64; 2]; 2]; 2] = [
 
 #[derive(Clone, Copy)]
 pub struct MotionFrame<'a> {
-    /// Frames are differenced only inside one uninterrupted capture phase.
     pub group: usize,
     pub width: u32,
     pub height: u32,
@@ -75,14 +52,10 @@ pub struct MotionGeometryEstimate {
     pub eyes: [EyeMotionGeometry; 2],
     pub geometry: [MlGeometry; 2],
     pub confidence: f32,
-    /// A seed can enter the ML search only when the raw motion evidence and binocular
-    /// symmetry are plausible.  It is still never applied without the normal holdout.
     pub search_eligible: bool,
     pub reason: String,
 }
 
-/// Aggregate, non-reconstructable neutral-eye appearance measurements. The detector
-/// operates on per-block median frames; no raw image is retained in this result.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AppearanceDescriptor {
     pub pupil_center_px: [f32; 2],
@@ -92,8 +65,6 @@ pub struct AppearanceDescriptor {
     pub block_center_spread_px: f32,
     pub block_angle_spread_deg: f32,
     pub blocks: usize,
-    /// One eye had an inconsistent block and was re-detected inside the physical
-    /// counterpart neighbourhood predicted by the stable eye.
     pub stereo_recovered: bool,
 }
 
@@ -103,9 +74,6 @@ pub struct EyeAppearanceGeometry {
     pub geometry: MlGeometry,
 }
 
-/// Absolute XR5 crop/rotation hypothesis derived from the pupil and eye-aperture axis
-/// in labelled relaxed-neutral frames. It is independent of EyeNet and of the active
-/// crop/rotation; the active geometry contributes only its explicit mirror state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppearanceGeometryEstimate {
     pub eyes: [EyeAppearanceGeometry; 2],
@@ -130,9 +98,6 @@ struct SolvedEye {
     error: f64,
 }
 
-/// Estimate an absolute XR5 crop/rotation seed from temporally ordered eyelid-motion
-/// frames. `left` and `right` should contain training phases only; holdout frames must
-/// remain outside this function.
 pub fn estimate_motion_geometry(
     left: &[MotionFrame<'_>],
     right: &[MotionFrame<'_>],
@@ -230,9 +195,6 @@ pub fn estimate_motion_geometry(
     })
 }
 
-/// Estimate an absolute XR5 geometry seed from labelled relaxed-neutral frames.
-/// Frames must retain phase indices in `group`; at least two independent OPEN blocks
-/// are required so a transient gaze or glint cannot silently become geometry.
 pub fn estimate_appearance_geometry(
     left: &[MotionFrame<'_>],
     right: &[MotionFrame<'_>],
@@ -916,8 +878,6 @@ fn consider_solution(
         error += ((predicted[row][column] - target_covariance[row][column]) / scale).powi(2);
     }
     error /= 3.0;
-    // Covariance alone has a shallow scale/aspect valley. A very weak prior selects the
-    // physically ordinary solution without forcing the active crop centre or rotation.
     error += 0.006 * ((crop_width - crop_height) / 0.50).powi(2);
     error += 0.002
         * (((crop_width - baseline_width as f64) / 0.30).powi(2)
@@ -1202,7 +1162,6 @@ mod tests {
                         image[y * 200 + x] = 90u8.saturating_add(spatial);
                     }
                 }
-                // Much stronger movement in the left camera's fixed inner LED zone.
                 for y in 60..141 {
                     for x in 145..191 {
                         image[y * 200 + x] = 240;

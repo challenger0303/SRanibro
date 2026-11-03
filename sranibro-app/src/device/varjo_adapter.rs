@@ -1,13 +1,3 @@
-//! Varjo adapter — consume the **Varjo Eye Streamer** (by DimeRhyme) MJPEG-over-HTTP
-//! eye-camera feed instead of binding the Varjo Native SDK. That tool drives the Varjo
-//! SDK and re-publishes both eye cameras as MJPEG (left `:8080`, right `:8081` by
-//! default). We GET each stream, slice out JPEG frames (SOI `FF D8` .. EOI `FF D9`),
-//! decode to grayscale, and feed the existing EyePrediction ML (variable-resolution).
-//!
-//! Requires: Varjo Base + a Varjo HMD + the Varjo Eye Streamer running ("Start
-//! Server"). No Varjo SDK FFI, no Tobii DLL. Gaze is NOT provided by the streamer
-//! (images only) — native Varjo gaze is a future add via the SDK. This path's job is
-//! to verify the SRanipal eye-model on Varjo's eye images (openness/wide/squeeze).
 
 #![cfg(windows)]
 
@@ -35,8 +25,6 @@ impl VarjoAdapter {
         Self {
             profile: DeviceProfile {
                 name: "Varjo (Eye Streamer)".into(),
-                // Resize-only preprocessing; the real frame dims are carried per frame,
-                // so the model sees Varjo's native resolution downscaled to 100x100.
                 ml_device: "vr4".into(),
                 slot_a_eye: Eye::Left,
                 image_w: 640,
@@ -61,7 +49,6 @@ fn set_status(s: &Arc<Mutex<String>>, msg: impl Into<String>) {
     }
 }
 
-/// "http://host:port/path" -> "host:port" (path ignored; default port 80).
 fn host_port(url: &str) -> String {
     let s = url.trim();
     let s = s
@@ -76,7 +63,6 @@ fn host_port(url: &str) -> String {
     }
 }
 
-/// First index of `needle` in `hay`.
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -84,15 +70,11 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Parse `Content-Length` (case-insensitive) from a multipart part-header block.
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
     for line in headers.split(|&b| b == b'\n') {
         let line = String::from_utf8_lossy(line);
         let l = line.trim();
         let b = l.as_bytes();
-        // Byte-compare the prefix (no str slicing — avoids a panic if byte 15 isn't a
-        // UTF-8 char boundary on a garbage line). The 15 matched bytes are ASCII, so
-        // `l[15..]` is then on a char boundary and safe.
         if b.len() >= 15 && b[..15].eq_ignore_ascii_case(b"content-length:") {
             return l[15..].trim().parse::<usize>().ok();
         }
@@ -100,16 +82,12 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
-const MAX_JPEG_BYTES: usize = 8 << 20; // sane cap on one compressed frame (8 MB)
-const MAX_DECODE_BYTES: usize = 16 << 20; // decoded-pixel cap — rejects bogus huge dims
+const MAX_JPEG_BYTES: usize = 8 << 20;
+const MAX_DECODE_BYTES: usize = 16 << 20;
 
-/// Decode one JPEG to grayscale and hand it to `on_frame` with its native dims.
 fn decode_and_emit(eye: Eye, jpeg: &[u8], on_frame: &Arc<Mutex<FrameFn>>) {
     let mut dec = jpeg_decoder::Decoder::new(jpeg);
     dec.set_max_decoding_buffer_size(MAX_DECODE_BYTES);
-    // Read just the header first and REJECT implausible dimensions BEFORE decode()
-    // allocates dimension-sized planes — so a bogus huge-dim JPEG can't OOM/abort
-    // Real eye cameras are well under 4096².
     if dec.read_info().is_err() {
         return;
     }
@@ -145,9 +123,9 @@ fn decode_and_emit(eye: Eye, jpeg: &[u8], on_frame: &Arc<Mutex<FrameFn>>) {
             if pixels.len() < w * h * 2 {
                 return;
             }
-            pixels.chunks_exact(2).map(|c| c[1]).collect() // high byte
+            pixels.chunks_exact(2).map(|c| c[1]).collect()
         }
-        _ => return, // CMYK32 etc. — not expected from an eye camera
+        _ => return,
     };
     if let Ok(mut guard) = on_frame.lock() {
         let f: &mut FrameFn = &mut guard;
@@ -155,8 +133,6 @@ fn decode_and_emit(eye: Eye, jpeg: &[u8], on_frame: &Arc<Mutex<FrameFn>>) {
     }
 }
 
-/// One eye's MJPEG pump: connect -> GET -> slice JPEG frames -> decode -> on_frame.
-/// Reconnects on error until `stop`.
 fn pump_eye(
     eye: Eye,
     url: String,
@@ -187,7 +163,6 @@ fn pump_eye(
                 continue;
             }
         };
-        // connect_timeout (not blocking connect) so stop()/join() can't hang on a dead host.
         let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
             Ok(s) => s,
             Err(e) => {
@@ -201,8 +176,6 @@ fn pump_eye(
                 continue;
             }
         };
-        // If the read timeout can't be set, don't proceed — a blocking read would make
-        // stop()/join() hang. Reconnect instead.
         if stream
             .set_read_timeout(Some(Duration::from_millis(1000)))
             .is_err()
@@ -218,25 +191,21 @@ fn pump_eye(
         }
         set_status(&status, "streaming");
 
-        // Parse the multipart/x-mixed-replace MJPEG stream by Content-Length (exact
-        // framing — avoids the FF-D9-in-an-APP/COM-segment truncation that a blind
-        // marker scan would hit). Accumulate raw bytes; read timeouts just keep waiting.
         let mut buf: Vec<u8> = Vec::with_capacity(1 << 18);
         let mut http_done = false;
         let mut tmp = [0u8; 16384];
         'conn: while !stop.load(Ordering::Relaxed) {
             match stream.read(&mut tmp) {
-                Ok(0) => break, // peer closed
+                Ok(0) => break,
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
                 Err(ref e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    continue; // read timeout — re-check stop, keep reading
+                    continue;
                 }
                 Err(_) => break,
             }
-            // Phase 1: drop the HTTP response headers (up to the first blank line).
             if !http_done {
                 match find_sub(&buf, b"\r\n\r\n") {
                     Some(i) => {
@@ -245,20 +214,18 @@ fn pump_eye(
                     }
                     None => {
                         if buf.len() > 16384 {
-                            break; // headers absurdly large — drop the connection
+                            break;
                         }
                         continue;
                     }
                 }
             }
-            // Phase 2: extract each part — header block ends at \r\n\r\n; Content-Length
-            // gives the exact JPEG byte count that follows.
             loop {
                 let h = match find_sub(&buf, b"\r\n\r\n") {
                     Some(i) => i,
                     None => {
                         if buf.len() > 65536 {
-                            buf.clear(); // no part header in 64 KB — resync
+                            buf.clear();
                         }
                         break;
                     }
@@ -266,14 +233,12 @@ fn pump_eye(
                 let clen = match parse_content_length(&buf[..h]) {
                     Some(n) if n > 0 && n <= MAX_JPEG_BYTES => n,
                     _ => {
-                        // No usable Content-Length — not the expected multipart MJPEG.
-                        // Reconnect rather than risk scanning \r\n\r\n into JPEG body bytes.
                         break 'conn;
                     }
                 };
                 let body = h + 4;
                 if buf.len() < body + clen {
-                    break; // wait for the full JPEG
+                    break;
                 }
                 decode_and_emit(eye, &buf[body..body + clen], &on_frame);
                 buf.drain(..body + clen);
@@ -293,9 +258,6 @@ impl HmdAdapter for VarjoAdapter {
     }
 
     fn start(&mut self, on_frame: FrameFn, _on_gaze: GazeFn) -> std::io::Result<()> {
-        // Two HTTP pumps (left/right) share the single FrameFn via a mutex (each call
-        // just stashes the newest frame, so contention is negligible). The streamer
-        // provides images only — no gaze.
         let on_frame = Arc::new(Mutex::new(on_frame));
         for (eye, url) in [
             (Eye::Left, self.left_url.clone()),

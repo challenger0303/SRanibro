@@ -1,10 +1,3 @@
-//! Purpose-labelled calibration contracts.
-//!
-//! Capture, scoring and committing are intentionally separate concepts.  A
-//! descriptor tells the UI exactly which evidence is being recorded and which
-//! parameter domain the eventual objective is allowed to change.  The marker
-//! types below make that change domain part of an objective's Rust type instead
-//! of relying on button text or a free-form protocol string.
 
 use crate::geometry_calib::CapturePlan;
 use std::marker::PhantomData;
@@ -78,8 +71,6 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// Marker implemented only inside this module.  An objective can receive a
-/// commit permit only for its declared domain.
 pub trait ChangeDomain: sealed::Sealed {
     const SET: DomainSet;
 }
@@ -117,8 +108,6 @@ impl ChangeDomain for BlinkTimingChange {
     const SET: DomainSet = DomainSet::one(ParameterDomain::BlinkTiming);
 }
 
-/// Non-forgeable outside this module.  Later objective implementations stage a
-/// value through this permit before the common backup/save/apply path accepts it.
 pub struct CommitPermit<D: ChangeDomain> {
     session_id: u64,
     _domain: PhantomData<fn() -> D>,

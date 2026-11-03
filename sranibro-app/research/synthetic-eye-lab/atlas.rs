@@ -1,4 +1,3 @@
-//! Deterministic renderer-only Phase 1.3A moment-feasibility atlas.
 
 use std::collections::{BTreeMap, BTreeSet};
 

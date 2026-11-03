@@ -1,6 +1,3 @@
-//! Embed the Windows application icon (assets/sranibro.ico) into the exe so Explorer,
-//! the taskbar, and Alt-Tab show it. Best-effort: if the resource compiler isn't found
-//! the build still succeeds (just without the embedded icon) rather than failing.
 
 use std::path::Path;
 use std::process::Command;

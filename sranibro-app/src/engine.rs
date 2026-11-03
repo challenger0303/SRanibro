@@ -1,7 +1,3 @@
-//! Engine assembly: build the full acquisition -> ML -> post-process -> sinks
-//! pipeline from a [`Config`]. Extracted so both the binary entrypoint and the
-//! UI's live "Apply & reload" build the engine identically — the UI rebuilds it
-//! in-process when the user edits asset paths, with no app restart.
 
 use std::sync::Arc;
 
@@ -13,20 +9,13 @@ use crate::ml::wide_net::WideNet;
 use crate::output::BrokenEyeStatus;
 use crate::pipeline::{DeviceMap, EyelidModelIdentity, Pipeline, PipelineInit};
 
-/// A running engine plus the handles the UI needs to render/swap it.
 pub struct Engine {
     pub pipeline: Pipeline,
     pub be_status: Option<Arc<BrokenEyeStatus>>,
-    /// Non-fatal startup information surfaced by the UI (for example, that the
-    /// alternate StarVR connection route recovered the device).
     pub startup_notice: Option<String>,
-    /// The StarVR route actually used, so an in-process reload stays in sync.
     pub starvr_direct_mode: Option<bool>,
 }
 
-/// Resolve every live value needed before [`Pipeline::run`] starts its threads. The
-/// geometry's tri-state mirror wins when explicitly present; otherwise legacy mapping
-/// values remain compatible for non-XR5 configs.
 pub fn pipeline_start_settings(cfg: &Config, device_key: &str) -> (DeviceMap, PipelineInit) {
     let mapping = cfg.mapping_for(device_key);
     let geometry = cfg.geometry_for(device_key);
@@ -37,8 +26,6 @@ pub fn pipeline_start_settings(cfg: &Config, device_key: &str) -> (DeviceMap, Pi
         geometry[1].mirror_h.unwrap_or(mapping.ml_mirror_r),
     ];
     let mut eyelid_response_profile = cfg.eyelid_response_profile_for(device_key);
-    // A profile created before this feature stored closing time in global tuning.
-    // Migrate it only while this HMD has no explicit response profile yet.
     if !cfg.has_eyelid_response_profile(device_key) && cfg.tuning.blink_close_ms.is_finite() {
         eyelid_response_profile.blink_close_ms = cfg.tuning.blink_close_ms.clamp(0.0, 160.0);
     }
@@ -114,10 +101,6 @@ fn native_xr5_selected(cfg: &Config, device_key: &str) -> bool {
     { let _ = (cfg, device_key); false }
 }
 
-/// XR5 snapshots its gaze provider when the adapter is constructed. Legacy `auto`
-/// buckets are migrated only after auto-detection reveals the real device key, so a
-/// migrated provider change must be reflected by constructing the still-unstarted
-/// adapter again from the effective config.
 fn xr5_adapter_needs_rebuild_after_migration(
     before: &Config,
     after: &Config,
@@ -127,15 +110,10 @@ fn xr5_adapter_needs_rebuild_after_migration(
         && before.gaze_source_for(device_key) != after.gaze_source_for(device_key)
 }
 
-/// Load the EyePrediction net from the configured weights path (direct `ml_model`
-/// file, else `<sranipal_dir>/MODEL_REL`). Returns `None` — and prints a precise
-/// reason — when absent or invalid, so the engine simply runs gaze-only.
 pub fn load_net(cfg: &Config) -> Option<EyeNet> {
     load_net_identified(cfg).0
 }
 
-/// Read once, fingerprint those exact bytes, then parse the same buffer. This makes the
-/// runtime identity stronger than hashing a path later after its contents may have changed.
 fn load_net_identified(cfg: &Config) -> (Option<EyeNet>, Option<EyelidModelIdentity>) {
     if !cfg.ui.inference_enabled { return (None, None); }
     match cfg.ml_params_path() {
@@ -181,9 +159,6 @@ fn load_net_identified(cfg: &Config) -> (Option<EyeNet>, Option<EyelidModelIdent
     }
 }
 
-/// Load the optional eyebrow model (explicit override or packaged `eyebrow.bin`).
-/// `None` (with a printed reason) when absent/invalid, so the engine simply runs
-/// without brow output.
 pub fn load_brow_net(cfg: &Config) -> Option<BrowNet> {
     if !cfg.ui.inference_enabled { return None; }
     let p = cfg.brow_model_path()?;
@@ -207,8 +182,6 @@ pub fn load_brow_net(cfg: &Config) -> Option<BrowNet> {
     }
 }
 
-/// Load the optional task-tagged Dream Air/XR5 EyeWide model. It is still loaded while
-/// SRanipal is selected so same-frame A/B telemetry is available before cutover.
 pub fn load_wide_net(cfg: &Config) -> Option<WideNet> {
     if !cfg.ui.inference_enabled { return None; }
     let path = cfg.wide_model_path()?;
@@ -231,8 +204,6 @@ pub fn load_wide_net(cfg: &Config) -> Option<WideNet> {
     }
 }
 
-/// Resolve a persisted EyeWide preference to a runtime-safe provider. A missing or
-/// invalid optional model must never prevent the main app and camera from starting.
 fn runtime_wide_source(
     requested: WideSource,
     is_xr5: bool,
@@ -267,9 +238,6 @@ fn resolved_config_device_key(cfg: &Config) -> String {
     }
 }
 
-/// Route fallback is intentionally limited to errors that can plausibly be caused
-/// by the Tobii broker owning (or not owning) the tracker. DLL/path/export errors
-/// cannot be repaired by another UAC service switch.
 #[cfg(windows)]
 fn is_starvr_route_error(error: &std::io::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -298,18 +266,11 @@ fn persist_starvr_route(direct: bool) {
     }
 }
 
-/// Build + start the engine for `cfg`: free the EyeChip (pre-flight), open the
-/// configured adapter, wire the ML net and the VRCFT/OSC sinks, and run the
-/// pipeline. The caller owns the returned [`Engine`] (call `pipeline.stop()` /
-/// drop to tear it down). StarVR automatically retries the opposite service/direct
-/// route for connection-level failures and remembers the route that succeeds.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn build_engine(cfg: &Config) -> std::io::Result<Engine> {
     build_engine_with_gpu(cfg, None)
 }
 
-/// GUI engine builder. The legacy context parameter is retained for call-site
-/// compatibility; EyeNet runs in its isolated worker, never on the UI device.
 #[cfg(windows)]
 pub(crate) fn build_engine_with_gpu(
     cfg: &Config,
@@ -391,8 +352,6 @@ fn build_engine_once(
         println!("[ml] XR5 research model selected; SRanipal inference is bypassed");
         (None, None)
     } else { load_net_identified(cfg) };
-    // Either eyelid model supplies blink/validity to the common brow output gate.
-    // Do not disable an independent brow model merely because EyeNet was replaced.
     let brow = if net.is_some() || use_research_avatar {
         load_brow_net(cfg)
     } else {
@@ -402,8 +361,6 @@ fn build_engine_once(
         None
     };
 
-    // `auto` is only a selector, not a real HMD calibration bucket. Resolve it from the
-    // adapter selected by the serial sniff before loading any per-device settings.
     let mut effective = cfg.clone();
     if effective.migrate_auto_device_settings(&device_key) {
         if let Err(e) = effective.save(&crate::config::config_path()) {
@@ -413,8 +370,6 @@ fn build_engine_once(
         }
     }
     if xr5_adapter_needs_rebuild_after_migration(cfg, &effective, &device_key) {
-        // Do not run the `auto` serial sniff a second time. The first adapter already
-        // resolved the device, and constructors do not open hardware until `run`.
         let mut resolved = effective.clone();
         resolved.hmd.device = device_key.clone();
         adapter = make_adapter(&resolved)?;
@@ -438,10 +393,6 @@ fn build_engine_once(
             requested_wide_source.as_str()
         );
     }
-    // Free the EyeChip from the Tobii runtime (may disable services / trigger UAC)
-    // only for adapters that access the device directly (WinUSB `pimax_vr4` AND the
-    // direct stream-engine `pimax_dll`), and only once the gating Tobii DLL is present
-    // on disk (otherwise we'd cause those side effects just to then refuse).
     #[cfg(windows)]
     if adapter.needs_eyechip_handoff()
         && cfg
@@ -452,7 +403,6 @@ fn build_engine_once(
         crate::platform::ensure_capture_ready();
     }
 
-    // VRCFT-compatible BrokenEye TCP sink (+ optional VRChat OSC direct).
     let (mut sinks, be_status): (Vec<Box<dyn OutputSink>>, Option<Arc<BrokenEyeStatus>>) =
         if !cfg.output.brokeneye || !cfg.ui.inference_enabled {
             (Vec::new(), None)
@@ -489,8 +439,6 @@ fn build_engine_once(
             Err(e) => eprintln!("[osc] could not open socket: {e}"),
         }
     } else if cfg.output.eyebrow_osc && cfg.ui.inference_enabled {
-        // VRCFT remains the eye/gaze source. This sink emits only the eight
-        // FT/v2 Brow* parameters used by the original vr_eyebrow application.
         match OscSink::new_brow_only(
             cfg.output.osc_host.clone(),
             cfg.output.osc_port,
@@ -501,8 +449,6 @@ fn build_engine_once(
         }
     }
 
-    // Per-device eye mapping: each HMD's saved orientation, else its built-in preset
-    // (Pimax flips gaze X, Varjo does not). Switching devices swaps in the right one.
     let (map, mut init) = pipeline_start_settings(cfg, &device_key);
     init.wide_source = live_wide_source;
     init.eyelid_model_identity = eyelid_model_identity;
@@ -537,9 +483,6 @@ fn build_engine_once(
     })
 }
 
-/// Build a deliberately disconnected pipeline so a hardware/startup error never
-/// closes the application before the user can see the message and edit Settings.
-/// It has no sinks and does not load models or touch the EyeChip.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn build_recovery_engine(cfg: &Config, error: impl Into<String>) -> std::io::Result<Engine> {
     use std::sync::Mutex;
@@ -607,7 +550,6 @@ pub fn build_recovery_engine(cfg: &Config, error: impl Into<String>) -> std::io:
     })
 }
 
-/// Other platforms have no acquisition adapter yet.
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn build_engine(_cfg: &Config) -> std::io::Result<Engine> {
     Err(std::io::Error::new(
@@ -665,7 +607,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.ui.eyelid_inference_backend = selected;
             #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
-            { cfg.xr5_research.gpu = selected == Cpu; } // stale opposite legacy choice
+            { cfg.xr5_research.gpu = selected == Cpu; }
             let (_, vr4) = pipeline_start_settings(&cfg, "pimax_vr4");
             let (_, xr5) = pipeline_start_settings(&cfg, "pimax_xr5");
             assert_eq!(vr4.eyelid_inference_backend, selected.resolved());
@@ -693,7 +635,6 @@ mod tests {
     #[test]
     fn vr4_gaze_smoothing_switch_controls_both_outputs_only_on_vr4() {
         let mut cfg = Config::default();
-        // Auto is resolved by the running adapter before assembling the pipeline.
         cfg.hmd.device = "auto".into();
         for enabled in [true, false] {
             cfg.hmd.vr4_gaze_smoothing = enabled;
@@ -730,8 +671,6 @@ mod tests {
     #[test]
     fn xr5_mirror_is_atomic_with_geometry_and_explicit_off_wins() {
         let mut cfg = Config::default();
-        // An old mapping serializes false but has no way to mean "explicit off". The
-        // new XR5 geometry preset must still install its required right-eye mirror.
         cfg.set_mapping("pimax_xr5", crate::config::EyeMapping::default());
         let (_, initial) = pipeline_start_settings(&cfg, "pimax_xr5");
         assert_eq!(initial.ml_mirror, [false, true]);
@@ -900,8 +839,6 @@ mod tests {
             "pimax_vr4"
         ));
 
-        // A real device-specific setting wins during migration, so the adapter's
-        // already-snapshotted value remains correct and no rebuild is needed.
         let mut explicit = before.clone();
         explicit.set_gaze_source("pimax_xr5", crate::config::GazeSource::PerEye);
         let mut migrated = explicit.clone();
@@ -925,7 +862,6 @@ mod tests {
         let mut effective = before.clone();
         assert!(effective.migrate_auto_device_settings("pimax_xr5"));
 
-        // Mirror build_engine's no-resniff reconstruction path.
         effective.hmd.device = "pimax_xr5".into();
         let adapter = crate::device::make_adapter(&effective).expect("construct XR5 adapter");
         assert!(adapter.profile().gaze_src.contains("combined"));

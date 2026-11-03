@@ -1,9 +1,3 @@
-//! Background, pure-Rust search for a safer per-user XR5 EyeNet input geometry.
-//!
-//! The fixed SRanipal network is never trained here.  We search a deliberately small
-//! neighbourhood around the currently active XR5 reconstruction, score scale-free
-//! response shape on labelled capture frames, and accept a candidate only when it also
-//! beats the original geometry on a separate holdout tail.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,9 +27,6 @@ const XR5_MIN_INNER_CROP: f32 = 0.40;
 const AUDIT_FOLDS: usize = 5;
 const AUDIT_BLOCK_FRAMES: usize = 12;
 const AUDIT_GUARD_FRAMES: usize = 1;
-// Every fold must contain the same amount of train-only evidence.  Ten is the
-// guaranteed minimum after block guards in the real capture protocol; asking for
-// more made fold zero larger than the remaining folds and biased the audit mean.
 const AUDIT_FRAMES_PER_FAMILY_FOLD: usize = 10;
 const STATIC_PHASE_TRIM_S: f32 = 0.70;
 const STATIC_TAIL_S: f32 = 1.0;
@@ -49,15 +40,11 @@ const MIN_GAZE_STABLE_FRAMES: usize = 5;
 #[derive(Clone, Debug)]
 pub struct FitInputs {
     pub model_path: PathBuf,
-    /// Exact bytes verified against the live model before the capture is consumed.
-    /// Workers parse this immutable snapshot rather than re-reading a mutable path.
     pub model_bytes: Arc<[u8]>,
     pub expected_model_crc32: u32,
     pub expected_model_bytes: u64,
     pub dataset: SharedEvidence,
-    /// Geometry active at capture start. It is the immutable fallback and search centre.
     pub baseline: [MlGeometry; 2],
-    /// Effective live mirror flags. Mirror is hardware handedness, never a search variable.
     pub mirrors: [bool; 2],
     pub despeckle: DespeckleParams,
     pub flatten: FlattenParams,
@@ -90,14 +77,9 @@ pub struct GeometryMetrics {
     pub gaze_noise: f32,
     pub neutral_noise_per_eye: [f32; 2],
     pub gaze_noise_per_eye: [f32; 2],
-    /// Fraction of the open-to-closed eyelid span retained while looking around.
-    /// Values are per eye; 1.0 means gaze direction did not falsely close the lid.
     pub gaze_retention: [f32; 2],
-    /// Spurious squeeze produced during the gaze sweep, relative to relaxed neutral.
     pub gaze_squeeze_fp: [f32; 2],
-    /// Absolute difference between left and right gaze retention.
     pub gaze_asymmetry: f32,
-    /// Fraction of gaze-sweep frames with valid native Tobii vectors for both eyes.
     pub gaze_evidence_rate: f32,
     pub blink_events: [usize; 2],
 }
@@ -111,13 +93,8 @@ pub struct GeometryFitResult {
     pub baseline_holdout: GeometryMetrics,
     pub candidate_holdout: GeometryMetrics,
     pub holdout_improvement: f32,
-    /// EyeNet-independent absolute crop/rotation initialization derived from the
-    /// training blink motion. It is reported even when safety gates keep it out of the
-    /// search, and it never sees the untouched holdout.
     pub motion_seed: Option<MotionGeometryEstimate>,
     pub candidate_from_motion_seed: bool,
-    /// EyeNet-independent absolute seed derived from repeated relaxed-neutral pupil
-    /// centres and aperture axes. Like the motion seed, it never sees the holdout.
     pub appearance_seed: Option<AppearanceGeometryEstimate>,
     pub candidate_from_appearance_seed: bool,
     pub invalid_static_phases: usize,
@@ -134,12 +111,10 @@ pub struct PhotometricFitInputs {
     pub expected_model_crc32: u32,
     pub expected_model_bytes: u64,
     pub dataset: SharedEvidence,
-    /// Frozen frontal geometry. It is evaluated but never searched or changed.
     pub geometry: [MlGeometry; 2],
     pub mirrors: [bool; 2],
     pub despeckle: DespeckleParams,
     pub flatten: FlattenParams,
-    /// Correction active at capture start and the immutable fallback.
     pub baseline: PhotometricCorrection,
 }
 
@@ -193,14 +168,12 @@ impl PhotometricStatus {
     }
 }
 
-/// Mean and between-fold spread for one geometry-audit signal.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AuditStat {
     pub mean: f32,
     pub stddev: f32,
 }
 
-/// One deterministic probe around the active, user-validated geometry.
 #[derive(Clone, Debug)]
 pub struct GeometryAuditCase {
     pub name: String,
@@ -224,8 +197,6 @@ pub struct HalfQuality {
     pub warnings: Vec<String>,
 }
 
-/// Diagnostic-only comparison of the in-app objective against the criteria that found
-/// the original XR5 preset. It never changes or previews live geometry.
 #[derive(Clone, Debug)]
 pub struct GeometryAuditResult {
     pub cases: Vec<GeometryAuditCase>,
@@ -397,9 +368,6 @@ impl GeometryFitter {
         let shared = self.shared.clone();
         let panic_shared = shared.clone();
         let cancel = self.cancel.clone();
-        // Keep a second Arc to the not-yet-consumed input. If OS thread creation
-        // fails, the UI can restore the completed capture without cloning the large
-        // raw-frame dataset. A successfully started worker takes it exactly once.
         let pending = Arc::new(Mutex::new(Some(inputs)));
         let worker_pending = pending.clone();
         match std::thread::Builder::new()
@@ -410,8 +378,6 @@ impl GeometryFitter {
             .spawn(move || {
                 #[cfg(windows)]
                 unsafe {
-                    // Candidate replay is sustained bulk CPU work. Keep live camera,
-                    // ML/output and the Windows compositor ahead of it under contention.
                     let thread = windows_sys::Win32::System::Threading::GetCurrentThread();
                     let _ = windows_sys::Win32::System::Threading::SetThreadPriority(
                         thread,
@@ -460,8 +426,6 @@ impl GeometryFitter {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Drop a completed/cancelled result before a new capture starts. A running job is
-    /// never cleared: its worker must be cancelled and finish first.
     pub fn clear_finished(&mut self) -> bool {
         if self.is_running() {
             return false;
@@ -680,7 +644,6 @@ struct PreparedSample {
     phase_index: usize,
     native_open: [Option<f32>; 2],
     native_gaze_deg: [Option<[f32; 2]>; 2],
-    /// Candidate-independent capture stability derived once from the raw eye images.
     stable: bool,
     left: Vec<u8>,
     right: Vec<u8>,
@@ -688,10 +651,6 @@ struct PreparedSample {
     right_size: (u32, u32),
 }
 
-/// Unilateral wink poses are semantic evidence for `wink_fit`, not bilateral
-/// closed-eye evidence for image alignment or photometric fitting. `SampleKind`
-/// intentionally maps them to `SampleFamily::Closed` for legacy exhaustiveness,
-/// so every geometry-scoring boundary must exclude them by exact kind.
 fn is_geometry_scoring_kind(kind: SampleKind) -> bool {
     !matches!(
         kind,
@@ -781,10 +740,6 @@ struct StaticPhaseEvidence {
     invalid: bool,
 }
 
-/// Select the requested static pose from the *end* of each phase. A participant can
-/// remain perfectly still in the previous pose for several seconds, so first-quiet-
-/// streak detection is fundamentally ambiguous. End anchoring uses only raw pixels,
-/// labels and the fixed fallback crop and is therefore identical for every candidate.
 fn capture_stability_flags(
     samples: &[GeometrySample],
     baseline: [MlGeometry; 2],
@@ -888,8 +843,6 @@ fn capture_stability_flags(
         .clamp(0.002, 0.05);
     }
 
-    // A Closed phase whose final raw appearance is indistinguishable from the nearest
-    // Neutral phase is non-compliant evidence, not a valid zero-span calibration point.
     for closed_index in 0..phases.len() {
         if phases[closed_index].family != SampleFamily::Closed {
             continue;
@@ -903,11 +856,6 @@ fn capture_stability_flags(
             .min_by_key(|(_, phase)| phase.phase_index.abs_diff(phase_index));
         if let Some((_, neutral)) = nearest {
             let distance = anchor_l1(&phases[closed_index].anchor, &neutral.anchor);
-            // Compare two median pose anchors against their own within-pose noise
-            // envelopes. Using twice the frame-to-frame motion threshold here made the
-            // limit four times the camera noise and rejected real VR4 closures: the
-            // eyelid changes only a small part of the full 200x200 image, while sensor
-            // noise is present everywhere.
             let indistinguishable_limit = phases[closed_index]
                 .similarity
                 .max(neutral.similarity)
@@ -980,9 +928,6 @@ fn capture_stability_flags(
         }
     }
 
-    // Gaze begins only after the raw eye image has actually departed from the preceding
-    // static pose for two consecutive frames. This removes delayed reaction without
-    // consulting EyeNet output or a candidate geometry.
     let mut gaze_groups = BTreeMap::<usize, Vec<usize>>::new();
     for (index, sample) in samples.iter().enumerate() {
         if sample.kind.family() == SampleFamily::GazeSweep {
@@ -1003,9 +948,6 @@ fn capture_stability_flags(
                     && phase.phase_index < phase_index
             })
             .max_by_key(|phase| phase.phase_index);
-        // Without a preceding valid Neutral anchor there is no candidate-independent
-        // way to distinguish an actual gaze departure from carry-over motion. Exclude
-        // that phase instead of treating every post-trim frame as valid gaze evidence.
         let mut departed = false;
         let mut departure_streak = 0usize;
         for index in indices {
@@ -1149,8 +1091,6 @@ fn run(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
         return;
     }
 
-    // Derive the absolute seed before per-frame adaptive brightness. Geometry must
-    // follow the spatial eyelid motion, not a user's changing photometric affine.
     let motion_seed = match estimate_dataset_motion_seed(
         inputs.dataset.as_dataset(),
         inputs.baseline,
@@ -1635,10 +1575,6 @@ struct AuditFoldSignals {
     slow_curve: [[f32; 10]; 2],
 }
 
-/// Compare the current in-app objective with the absolute-span/half-position criteria
-/// that originally found the XR5 preset. Exploratory folds use train phases only;
-/// untouched holdout remains reserved for the normal frozen candidate evaluation.
-/// This is diagnostic only: no geometry is accepted, previewed, or persisted.
 fn run_audit(shared: Arc<Mutex<Shared>>, cancel: Arc<AtomicBool>, inputs: FitInputs) {
     log(
         &shared,
@@ -2571,8 +2507,6 @@ fn estimate_dataset_appearance_seed(
     dataset: &GeometryDataset,
     baseline: [MlGeometry; 2],
 ) -> Result<AppearanceGeometryEstimate, String> {
-    // Keep the spatial detector independent from adaptive brightness and user filter
-    // tuning. The normal ML evaluation below still uses the captured live pipeline.
     let despeckle = DespeckleParams::default();
     let flatten = FlattenParams::default();
     let selected = dataset
@@ -2626,9 +2560,6 @@ fn estimate_dataset_motion_seed(
     baseline: [MlGeometry; 2],
     mirrors: [bool; 2],
 ) -> Result<MotionGeometryEstimate, String> {
-    // The canonical descriptor was defined under these fixed defaults. Do not let a
-    // user's active brightness/flatten tuning move the coordinate system we are trying
-    // to recover; the ordinary ML search still evaluates with the captured live filters.
     let despeckle = DespeckleParams::default();
     let flatten = FlattenParams::default();
     let selected = dataset
@@ -2762,10 +2693,6 @@ fn evaluate_candidate(
     evaluate_candidate_detailed(net, samples, indices, geometry, mirrors, cancel).0
 }
 
-/// Research-only deterministic replay seam for comparing photometric hypotheses on a
-/// completed XR5 recording. It deliberately reuses the production stability labels,
-/// preprocessing, EyeNet inference and metrics so an offline result cannot be caused by
-/// a second scorer. The extra affine is applied after the affine captured by the app.
 #[cfg(feature = "research-synthetic-eye-lab")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SpatialGainField {
@@ -2775,36 +2702,19 @@ pub struct SpatialGainField {
     pub vertical_curve: f32,
 }
 
-/// Bounded, low-dimensional full-frame coordinate warp for offline XR5 research.
-///
-/// Coordinates are normalized to `[-1, 1]` over the complete captured eye frame,
-/// before any candidate geometry is applied. `vertical_bow` is the zero-mean
-/// quadratic vertical displacement along the horizontal axis; `radial_k1` is the
-/// first radial distortion coefficient. Translation, rotation and linear scale stay
-/// in [`MlGeometry`] instead of being duplicated here.
 #[cfg(feature = "research-synthetic-eye-lab")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResearchCoordinateWarp {
-    /// Vertical inverse-sampling displacement `b * (x^2 - 1/3)` in normalized
-    /// full-frame coordinates.
     pub vertical_bow: f32,
-    /// First inverse radial coefficient in `source = destination * (1 + k1*r^2)`.
     pub radial_k1: f32,
 }
 
 #[cfg(feature = "research-synthetic-eye-lab")]
 impl ResearchCoordinateWarp {
-    /// Maximum absolute normalized quadratic bow coefficient used by replay.
     pub const MAX_VERTICAL_BOW: f32 = 0.12;
-    /// Maximum absolute first-order radial coefficient used by replay.
     pub const MAX_RADIAL_K1: f32 = 0.10;
 }
 
-/// Per-frame output from the exact production preprocessing and EyeNet path.
-///
-/// This is exposed only to offline research tools.  `sample_index` always refers to
-/// the original [`GeometryDataset`] order, so callers can join candidate-independent
-/// raw-image measurements without relying on timing or row position.
 #[cfg(feature = "research-synthetic-eye-lab")]
 #[derive(Clone, Copy, Debug)]
 pub struct ResearchObservation {
@@ -2820,11 +2730,6 @@ pub struct ResearchObservation {
     pub squeeze: [f32; 2],
 }
 
-/// Detailed research replay result. Metrics and observations come from the same
-/// inference pass, and stability is computed once from raw pixels and the immutable
-/// capture geometry. Optional photometric interventions occur only after the captured
-/// adaptive-brightness affine; they describe a proposed research seam, not the current
-/// production preprocessing order.
 #[cfg(feature = "research-synthetic-eye-lab")]
 #[derive(Clone, Debug)]
 pub struct ResearchReplay {
@@ -2888,9 +2793,6 @@ pub fn research_evaluate_photometric(
     metrics
 }
 
-/// Detailed variant of [`research_evaluate_photometric`].  It is intentionally kept
-/// behind the research feature so production code cannot make runtime decisions from
-/// uncalibrated landmark correlations.
 #[cfg(feature = "research-synthetic-eye-lab")]
 #[allow(clippy::too_many_arguments)]
 pub fn research_replay_detailed(
@@ -2995,9 +2897,6 @@ fn research_prepare_samples(
         .map(|(index, sample)| {
             let (lw, lh) = sample.left_size;
             let (rw, rh) = sample.right_size;
-            // Reconstruct the exact deterministic capture path first.  The stored
-            // adaptive affine was learned from these captured pixels, so applying a
-            // candidate before it would not replay the stateful production controller.
             let left = preprocess::despeckle(&sample.left, lw as usize, lh as usize, &despeckle);
             let right = preprocess::despeckle(&sample.right, rw as usize, rh as usize, &despeckle);
             let left = preprocess::flatten(&left, lw as usize, lh as usize, &captured_flatten);
@@ -3013,10 +2912,6 @@ fn research_prepare_samples(
                 sample.brightness_affine[1][1],
             );
 
-            // Research interventions deliberately live after the captured adaptive
-            // brightness result and before geometry.  This makes every probe a valid
-            // counterfactual without pretending that BrightState can be reconstructed
-            // from a recording that did not save its complete initial history.
             let left =
                 preprocess::flatten(&left, lw as usize, lh as usize, &post_normalization_flatten);
             let right = preprocess::flatten(
@@ -3039,8 +2934,6 @@ fn research_prepare_samples(
                 stability_baseline[1],
                 gain_field[1],
             );
-            // Coordinate hypotheses use fixed full-frame coordinates and remain
-            // independent of the geometry candidate being scored.
             let left = research_apply_coordinate_warp(&left, sample.left_size, coordinate_warp[0]);
             let right =
                 research_apply_coordinate_warp(&right, sample.right_size, coordinate_warp[1]);
@@ -4361,8 +4254,6 @@ fn photometric_distance(left: PhotometricCorrection, right: PhotometricCorrectio
 }
 
 fn geometry_from_params(baseline: [MlGeometry; 2], params: SearchParams) -> [MlGeometry; 2] {
-    // Preserve the fallback byte-for-byte. Besides making rollback exact, this avoids
-    // tiny float reconstruction differences becoming a false candidate in reports.
     if params == SearchParams::default() {
         return baseline;
     }
@@ -4375,14 +4266,10 @@ fn geometry_from_params(baseline: [MlGeometry; 2], params: SearchParams) -> [MlG
         let base_cy = base.crop_top + height * 0.5;
         let inward_sign = if eye == 0 { 1.0 } else { -1.0 };
         let scale = 1.0 + size * 0.15;
-        // A wider window cannot coexist with the fixed inner LED exclusion while
-        // remaining inside the physical frame. Limit horizontal size accordingly.
         let width = (width * scale).clamp(0.20, 1.0 - XR5_MIN_INNER_CROP);
         let height = (height * scale).clamp(0.20, 0.90);
         let requested_cx = base_cx + inward_sign * inward * 0.08;
         let requested_cy = base_cy + vertical * 0.08;
-        // Intersect the physical frame bounds with the promised local neighbourhood.
-        // Independent edge clamps would silently change window size near an edge.
         let hardware_min_cx = if eye == 0 {
             width * 0.5
         } else {
@@ -5910,10 +5797,6 @@ mod tests {
         let cases = audit_case_specs(baseline);
         assert_eq!(cases[0].name, "active reference");
         assert_eq!(cases[0].geometry, baseline);
-        // The preset already touches the outer frame edge and the fixed inner LED crop;
-        // probes that collapse onto the reference are intentionally deduplicated.
-        // Horizontal inward motion has no legal room at the maximum 60%-wide preset;
-        // it becomes available only together with a smaller-window candidate.
         for axis in 1..5 {
             assert!(
                 cases.iter().any(|case| case.axis == Some(axis)),

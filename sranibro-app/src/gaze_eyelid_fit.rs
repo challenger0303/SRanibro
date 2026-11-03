@@ -1,9 +1,3 @@
-//! Holdout-validated gaze-direction compensation for raw eyelid openness.
-//!
-//! Categorical targets are labels only. EyeNet is replayed to measure openness,
-//! while the HMD's recorded native gaze supplies the continuous runtime coordinate.
-//! The fitted model can add a bounded lift to a repeatable relaxed-open droop; it
-//! cannot lower openness, alter gaze output, or change image preprocessing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -209,8 +203,6 @@ impl Fitter {
             .spawn(move || {
                 #[cfg(windows)]
                 unsafe {
-                    // Replaying thousands of EyeNet frames is bulk calibration work.
-                    // Keep live camera/inference and the compositor ahead of it.
                     let thread = windows_sys::Win32::System::Threading::GetCurrentThread();
                     let _ = windows_sys::Win32::System::Threading::SetThreadPriority(
                         thread,
@@ -258,10 +250,6 @@ fn lock(shared: &Arc<Mutex<Shared>>) -> MutexGuard<'_, Shared> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The gaze surface is trained and validated only from instructed open-gaze
-/// blocks. Close frames are replayed solely as untouched validation safety
-/// evidence; endpoint, wink, half-open, and fit-split close frames belong to
-/// their dedicated fitters and must not consume EyeNet work here.
 fn is_gaze_fit_evidence(label: EvidenceLabel) -> bool {
     label.action == EvidenceAction::GazeOpen
         || (label.split == EvidenceSplit::Validation
@@ -985,8 +973,6 @@ mod tests {
         ] {
             contaminated.push(Observation {
                 target: Some(GazeTarget::Left),
-                // Deliberately collide with a real gaze block. The fitter's
-                // semantic guards must make this observation invisible.
                 phase_index: 1,
                 family,
                 holdout: false,

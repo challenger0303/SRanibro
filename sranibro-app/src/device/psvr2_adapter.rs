@@ -1,7 +1,3 @@
-//! Read-only PSVR2Toolkit acquisition, isolated from the UI and inference process.
-//! Native initialization, reads and destruction may block or crash. A supervised
-//! child owns that entire lifetime; only copied, validated data crosses the pipe.
-//! Camera A/B and native gaze mapping remain the recorded PSVR2 hardware mapping.
 #![cfg(any(windows, target_os = "linux"))]
 
 use std::io;
@@ -32,8 +28,6 @@ fn supervisor_slot() -> &'static Arc<AtomicBool> {
     SUPERVISOR_OCCUPIED.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
 
-/// Also excludes replacement if an application callback, rather than native
-/// code, gets stuck. Detaching a timed-out thread must never create two owners.
 struct SupervisorLease(Arc<AtomicBool>);
 impl SupervisorLease {
     fn acquire(slot: &Arc<AtomicBool>) -> io::Result<Self> {
@@ -112,8 +106,6 @@ impl Psvr2Adapter {
     }
 }
 
-/// A cached first frame is not proof that the producer is alive. Require two
-/// distinct native updates, and age each stream independently after that.
 struct StreamEvidence<K> {
     key: Option<K>,
     last_fresh: Option<Instant>,
@@ -140,8 +132,6 @@ impl<K: PartialEq + Copy> StreamEvidence<K> {
         self.confirmations >= 2
     }
     fn invalidate(&mut self) {
-        // Retain the old sequence key: replaying a cached sample after a driver
-        // transition must not count as a new update.
         self.last_fresh = None;
         self.confirmations = 0;
     }
@@ -293,7 +283,6 @@ fn eye_sample(native: WearableEye) -> EyeSample {
             native.gaze_dir_norm.z,
         ],
         gaze_valid: native.gaze_valid(),
-        // The status block always contains an explicit per-eye gaze validity bit.
         gaze_reported: true,
         origin_mm: [
             native.gaze_origin_mm.x,
@@ -308,11 +297,7 @@ fn eye_sample(native: WearableEye) -> EyeSample {
             native.pupil_pos_in_sensor_area.y,
         ],
         pupil_pos_valid: native.pupil_position_valid(),
-        // Invalidity is explicit and must clear a stale pupil position.
         pupil_pos_reported: true,
-        // PSVR2 exposes a binary native blink classifier, not continuous
-        // openness. Feed it only as the absolute open/closed classifier used by
-        // SRanibro's blink latch. Camera ML remains the continuous eyelid signal.
         openness: if blink { 0.0 } else { 1.0 },
         openness_valid: blink_reported && !blink,
         openness_reported: blink_reported,
@@ -462,7 +447,6 @@ fn supervise(
                         }
                     }
                     if health.update_stability(now) {
-                        // A single successful frame never resets a crash-loop budget.
                         attempts = 0;
                     }
                     if let Some(reason) = health.failure(now) {
@@ -479,8 +463,6 @@ fn supervise(
                         }
                     }
                 };
-                // Native deinit can hang too. The child owns it; bounded stop
-                // kills/reaps that child before any replacement is considered.
                 if let Err(error) = worker.stop() {
                     report_failure(
                         &mut ready,
@@ -529,7 +511,6 @@ impl HmdAdapter for Psvr2Adapter {
                 "PSVR2 adapter is already running",
             ));
         }
-        // Do not revive a detached thread by clearing its stop flag.
         let lease = SupervisorLease::acquire(supervisor_slot())?;
         self.stop.store(false, Ordering::Release);
         let stop = self.stop.clone();

@@ -1,9 +1,3 @@
-//! Candidate-independent XR5 landmark measurements for offline research.
-//!
-//! This module intentionally accepts only mapped raw 200x200 grayscale frames. It has
-//! no access to EyeNet, geometry candidates, pose labels, or native gaze. Until quality
-//! has been calibrated on independently annotated real users, every non-abstained result
-//! is `DiagnosticOnly` and cannot be used to drive a production warp.
 
 use std::collections::VecDeque;
 
@@ -51,7 +45,6 @@ impl GrayFrame<'_> {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PupilEllipse {
     pub center_px: [f32; 2],
-    /// Semi-axis radii, largest first.
     pub radii_px: [f32; 2],
     pub angle_deg: f32,
     pub boundary_coverage: f32,
@@ -90,7 +83,6 @@ pub struct PhotometricFeatures {
     pub median: f32,
     pub p90: f32,
     pub mad: f32,
-    /// Least-squares gray-level change over normalized sensor X/Y in [-1, 1].
     pub horizontal_gradient: f32,
     pub vertical_gradient: f32,
     pub vertical_curvature: f32,
@@ -98,8 +90,6 @@ pub struct PhotometricFeatures {
     pub glint_fraction: f32,
     pub fixed_ir_flare_fraction: f32,
     pub pupil_minus_global: Option<f32>,
-    /// Row-major 3x3 medians/P90/saturation over the safe eye evidence region. These
-    /// preserve local illumination evidence without selecting or applying a correction.
     pub local_median_3x3: [f32; 9],
     pub local_p90_3x3: [f32; 9],
     pub local_saturation_3x3: [f32; 9],
@@ -116,7 +106,6 @@ pub enum AbstentionReason {
     LidEvidenceInsufficient,
     CurveCrossing,
     SessionAnchorInvalid,
-    /// A measurement exists, but real-image confidence has not been calibrated.
     UncalibratedRealImage,
 }
 
@@ -138,8 +127,6 @@ pub enum LandmarkDecision<T> {
 }
 
 impl<T> LandmarkDecision<T> {
-    /// Returns any measured value, including explicitly uncalibrated diagnostics.
-    /// Production decisions must use [`Self::calibrated_value`] instead.
     pub fn value(&self) -> Option<&T> {
         match self {
             Self::Accepted { value, .. } | Self::DiagnosticOnly { value, .. } => Some(value),
@@ -170,7 +157,6 @@ pub struct EyeLandmarkReport {
     pub pupil: LandmarkDecision<PupilEllipse>,
     pub lids: LandmarkDecision<LidProfile>,
     pub photometric: PhotometricFeatures,
-    /// Conservative diagnostic proxy; this is not an absolute occlusion probability.
     pub occlusion_fraction: f32,
 }
 
@@ -227,8 +213,6 @@ pub fn detect_eye_landmarks(frame: GrayFrame<'_>, side: EyeSide) -> EyeLandmarkR
         },
         Err((quality, reason)) => LandmarkDecision::Abstained { quality, reason },
     };
-    // Pupil-local photometry is invalid until pupil identity has been calibrated on
-    // annotated real XR5 frames.  Global/local-plane features remain candidate-independent.
     let photometric = photometric_features(frame, side, glint_fraction, pupil.calibrated_value());
     let evidence_quality = pupil.quality().min(lids.quality());
     let occlusion_fraction = (1.0 - evidence_quality)
@@ -299,7 +283,6 @@ fn glint_mask(frame: GrayFrame<'_>, side: EyeSide, integral: &[u64]) -> (Vec<boo
             }
         }
     }
-    // Two-pixel dilation keeps a bright hole from fragmenting a dark pupil component.
     let mut dilated = raw.clone();
     for y in 1..frame.height - 1 {
         for x in 1..frame.width - 1 {
@@ -945,7 +928,6 @@ mod tests {
                 }
             }
         }
-        // Reproduce the saturated inner XR5 hardware zone. It must never become evidence.
         match side {
             EyeSide::Left => {
                 for y in 45..155 {

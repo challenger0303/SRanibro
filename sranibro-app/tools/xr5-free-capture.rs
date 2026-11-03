@@ -1,4 +1,3 @@
-//! Recorder-only free movement capture. No inferred pose labels or random split.
 use sranibro_rs::gaze_residual_calib::Status;
 use sranibro_rs::recorder_fixation::{self, Feedback, FixationPair, WorldGuide};
 use std::fmt::Write as _;

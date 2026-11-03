@@ -1,9 +1,3 @@
-//! Preregistered Phase 1.4 XR5 real-recording transfer audit core.
-//!
-//! This module deliberately owns no command-line or publication code.  Its public
-//! API separates privacy-safe, JSON-ready artifacts from runtime-only source paths,
-//! and returns complete file payloads to the publisher.  It never writes the input
-//! tree or the application configuration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -376,10 +370,6 @@ fn os_name_sort_key(name: &OsStr) -> Vec<u8> {
     format!("{name:?}").into_bytes()
 }
 
-/// Enumerate a directory without requiring every source name to be UTF-8.
-/// Valid UTF-8 names retain the preregistered byte ordering. Non-UTF-8 names
-/// sort deterministically after them using a runtime-only OS representation;
-/// that raw key is never serialized or included in an error.
 fn sorted_dir(path: &Path) -> Result<Vec<SortedDirEntry>, HardInputError> {
     let iter = fs::read_dir(path).map_err(|e| hard("enumerate directory", e))?;
     let mut entries = Vec::new();
@@ -689,7 +679,6 @@ fn parse_completed_csv(
             cases.len()
         ));
     }
-    // The source directory is deliberately used only for runtime path construction.
     let _ = session_source_dir;
     if errors.is_empty() {
         Ok(cases)
@@ -777,11 +766,6 @@ fn inventory_anonymized_root_entry(
     Ok(())
 }
 
-/// Enumerate, hash, and non-pixel-validate an XR5 `wide_data` tree.
-///
-/// Only inability to enumerate or read the tree returns `Err`.  Every fully
-/// enumerable schema problem is represented by an `InputInvalid` plan, so the
-/// caller can publish the preregistered sealed invalid-input artifact.
 pub fn build_input_plan(wide_data_root: &Path) -> Result<BuiltInputPlan, HardInputError> {
     let sessions_root = wide_data_root.join("sessions");
     let mut errors = Vec::new();
@@ -1075,9 +1059,6 @@ struct DecodedPreparedCase {
 pub struct PassFailure {
     pub case_key: String,
     pub reason: String,
-    /// A sealed file vanished, could not be read, or no longer matched its
-    /// sealed length/hash.  This is an untrusted recording-tree mutation and
-    /// the caller must not publish even a reduced artifact.
     pub untrusted_input_change: bool,
 }
 
@@ -1139,9 +1120,6 @@ fn decode_gray8_200(bytes: &[u8]) -> Result<Vec<u8>, String> {
     }
     let buffer_size = frame.buffer_size();
     output.truncate(buffer_size);
-    // `next_frame` can finish after IDAT/fdAT. `finish` is what consumes and
-    // validates through IEND, so a truncated/corrupt tail cannot enter the
-    // preregistered audit as if it were a complete PNG.
     reader.finish().map_err(|e| format!("png_finish:{e}"))?;
     Ok(output)
 }
@@ -1299,8 +1277,6 @@ fn preprocess_decoded_case(
         return Err("decoded_pixel_count".into());
     }
     let left_native = left_stored.to_vec();
-    // Capture mirrors right on save.  Undo that exactly once before the ordinary
-    // live right-eye geometry, whose frozen mirror remains enabled.
     let right_native = mirror_gray_horizontal(right_stored, INPUT_SIDE, INPUT_SIDE);
     let despeckle = DespeckleParams::default();
     let left_post = preprocess::despeckle(&left_native, INPUT_SIDE, INPUT_SIDE, &despeckle);
@@ -1646,11 +1622,7 @@ pub enum AnalysisTerminalStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ModelLoaderErrorKind {
-    /// The model could not be opened, read, or assigned an ordinary-file
-    /// identity. This is a trusted reduced `INCONCLUSIVE_ARTIFACT` outcome.
     ReadOrIdentityFailure,
-    /// Metadata or content changed while the loader was reading. The caller
-    /// must not publish any artifact for this invocation.
     ChangedDuringRead,
 }
 
@@ -1875,13 +1847,9 @@ pub struct DiagnosticArtifact {
 pub struct AnalysisOutcome {
     pub terminal_status: AnalysisTerminalStatus,
     pub high_open_annotation: Option<HighOpenAnnotation>,
-    /// Exact bytes for the complete or reduced stage-specific allowlist, excluding
-    /// `manifest.json`, which is assembled and published last by the output module.
     pub payloads: BTreeMap<String, Vec<u8>>,
     pub metadata: AnalysisMetadata,
     pub diagnostic: Option<DiagnosticArtifact>,
-    /// `true` means an input file changed/disappeared during one of the four
-    /// passes.  The CLI must return a hard error without creating an artifact.
     pub publication_forbidden: bool,
 }
 
@@ -3290,9 +3258,6 @@ fn run_checked_preflights(plan: &BuiltInputPlan) -> Result<CheckedPreflights, An
     })
 }
 
-/// Production orchestration. The loader is invoked exactly once, and only after
-/// two complete sealed PNG decode/preprocess passes have matched case-for-case.
-/// It must return bytes read under the caller's ordinary-file identity guard.
 pub fn analyze_with_model_loader<F>(plan: &BuiltInputPlan, loader: F) -> AnalysisOutcome
 where
     F: FnOnce() -> Result<Vec<u8>, ModelLoaderError>,

@@ -1,9 +1,3 @@
-//! Natural-blink evidence and the visible-bottom timing profile.
-//!
-//! The image recording is replayed through the exact live EyeNet preprocessing
-//! path. Train and untouched holdout must both contain repeated, bilateral,
-//! short close/open episodes. The fitted value changes only how long an already
-//! confirmed fast bilateral blink remains visibly at zero.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -454,9 +448,6 @@ fn evidence(
         observation.evidence.action == EvidenceAction::NaturalBlink
             && observation.evidence.split == split
     }) {
-        // `phase_time_s` restarts for every capture block. Never let an
-        // unfinished close in one block become a synthetic blink when the next
-        // block begins open.
         if block_id != Some(observation.evidence.block_id) {
             active = None;
             block_id = Some(observation.evidence.block_id);
@@ -524,7 +515,6 @@ fn evidence(
                     }
                     active = None;
                 } else if observation.phase_time_s - current.start_s > 0.45 {
-                    // A held close/squint is not a natural blink.
                     active = None;
                 }
             }

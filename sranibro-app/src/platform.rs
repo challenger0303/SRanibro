@@ -1,5 +1,3 @@
-//! Runtime intervention is deliberately excluded from this public checkout.
-//! No service state, process, DLL or device ownership is changed here.
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum TobiiMode { Custom, BrokenEye, Unknown }
 pub fn detect_mode() -> TobiiMode { TobiiMode::Unknown }

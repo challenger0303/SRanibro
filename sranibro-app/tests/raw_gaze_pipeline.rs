@@ -1,5 +1,3 @@
-//! Exercises the real pipeline's native gaze tap using only an in-memory adapter
-//! and local UDP receivers. No device, model, GPU, UI, or installed config is used.
 
 use std::io;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -24,8 +22,6 @@ fn isolated_state() {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        // This integration test is its own process. Every test passes through
-        // this OnceLock before the library resolves its cached state directory.
         std::env::set_var("APPDATA", &root);
         std::env::set_var("LOCALAPPDATA", &root);
         std::env::set_var("XDG_CONFIG_HOME", &root);
@@ -70,8 +66,6 @@ impl HmdAdapter for FakeAdapter {
     }
 
     fn stop(&mut self) {
-        // Retain callbacks deliberately: tests also simulate a late callback
-        // after stop and verify that the pipeline's output guard suppresses it.
         self.stopped.store(true, Ordering::Release);
     }
 }
@@ -271,7 +265,6 @@ fn psvr2_exports_native_coordinates_and_binary_blink_without_ml() {
     sample.left.openness_reported = true;
     sample.left.openness_valid = true;
     sample.left.openness = 1.0;
-    // This is the actual PSVR2 adapter's known-closed classifier representation.
     sample.right.openness_reported = true;
     sample.right.openness_valid = false;
     sample.right.openness = 0.0;
@@ -282,8 +275,6 @@ fn psvr2_exports_native_coordinates_and_binary_blink_without_ml() {
     assert_eq!((left.valid, right.valid), (1, 1));
     assert_eq!((left.openness, right.openness), (1.0, 0.0));
     assert_ne!(left.counter as u64, sample.timestamp_us);
-    // Loss of PSVR2's explicit blink-valid bit is not an auxiliary-only gap:
-    // both formerly open and formerly closed values become unknown immediately.
     sample.left.openness_reported = false;
     sample.right.openness_reported = false;
     harness.regular(sample);
@@ -372,8 +363,6 @@ fn invalid_or_unreported_eye_never_reuses_merged_last_good_gaze() {
     assert_eq!(left.valid, 0);
     assert_eq!(left.direction, [0.0; 3]);
     assert_eq!(right.valid, 1);
-    // The ordinary telemetry merge intentionally retains an auxiliary-unreported
-    // eye. The raw datagram must not borrow that retained valid sample.
     assert!(harness.pipeline.tele.gaze.lock().unwrap().left.gaze_valid);
 
     let mut invalid = stereo();
@@ -398,8 +387,6 @@ fn auxiliary_native_openness_does_not_duplicate_gaze_packets() {
     auxiliary.right.openness = 0.75;
     harness.raw(auxiliary);
     quiet(&socket);
-    // Refresh after the quiet check, so assertion is not sensitive to a slow
-    // scheduler crossing the sender's native-openness freshness deadline.
     harness.raw(auxiliary);
     harness.raw(stereo());
     let [left, right] = pair(&socket);
@@ -462,8 +449,6 @@ fn pause_and_stop_suppress_even_late_callbacks() {
 fn every_native_callback_emits_once_without_a_postprocess_tick_or_rate_cap() {
     let socket = receiver();
     let harness = Harness::new("psvr2", false, DeviceMap::default(), Some(port(&socket)));
-    // No wall-clock sleep or device-timestamp change between callbacks. A paced,
-    // timestamp-deduplicated, or latest-only emit loop cannot pass this assertion.
     for _ in 0..16 {
         harness.regular(stereo());
     }
@@ -498,8 +483,6 @@ fn optional_gaze_smoothing_survives_live_osc_enable_and_swap_without_rate_limiti
         let (_, init) = sranibro_rs::engine::pipeline_start_settings(&config, "pimax_vr4");
         let harness = Harness::with_init("pimax_vr4", true, DeviceMap::default(), init);
         let socket = receiver();
-        // The output was OFF at startup; a later Output toggle must retain the
-        // applied smoothing choice, as must a port change/re-enable.
         for _ in 0..2 {
             harness
                 .pipeline
@@ -577,8 +560,6 @@ fn crystal_source_choice_reaches_avatar_input_and_dedicated_osc_without_mixing()
         combined: [0.0, 0.0, 1.0],
         ..Default::default()
     };
-    // Reconstruct both pipeline and router as Apply & reload does, including
-    // switching back. No process environment override, sensor, ML or GPU needed.
     for source in [Vr4GazeSource::V1, Vr4GazeSource::V2, Vr4GazeSource::V1] {
         let mut config = Config::default();
         config.hmd.vr4_gaze_source = source;

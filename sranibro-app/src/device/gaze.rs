@@ -1,22 +1,7 @@
-//! Decode the raw TTP gaze stream (pid 1289) into per-eye gaze directions.
-//!
-//! Faithful port of `tobii_usb_direct.py::decode_gaze_packet`. The packet is a
-//! row/column TLV structure: a row prologue gives the row count; each row is a
-//! column prologue (magic 134073), a column id, and a column value. Vector
-//! columns (gaze directions) arrive as a sub-prologue followed by 3 floats.
-//!
-//! Column ids: 1=timestamp, 2=status, 3=right-eye gaze, 4=left-eye gaze,
-//! 5=combined gaze, 6=convergence. This decoder preserves the chip's raw vector;
-//! per-device handedness and the one canonical output sign conversion happen later
-//! in the pipeline/sinks.
-//!
-//! This module decodes raw gaze stream 1289 and wearable-advanced stream 1285
-//! (native pupil diameter, pupil position, and native openness).
 
 use super::ttp::{decode_value, Value, GAZE_COLUMN_MAGIC};
 use crate::core::types::{Eye, EyeSample, GazeSample};
 
-/// Per-frame gaze, as recovered from a 1289 packet.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GazeData {
     pub timestamp: i64,
@@ -41,14 +26,6 @@ impl Default for GazeData {
 }
 
 impl GazeData {
-    /// Map the direct EyeChip 1289 stream to the core contract. 1289 carries only
-    /// gaze (openness comes from the ML on the camera images); pupil/origin are
-    /// left invalid.
-    ///
-    /// The packet-level `status` is not a per-eye validity bit. Real VR4 and XR5
-    /// firmware both emit usable directions with status 0, while startup packets
-    /// may carry a non-zero status alongside the all-zero sentinel. Validate each
-    /// direction itself so one missing eye cannot invalidate the other.
     pub fn to_gaze_sample(&self) -> GazeSample {
         let mk = |g: [f32; 3]| EyeSample {
             gaze: g,
@@ -63,16 +40,10 @@ impl GazeData {
         }
     }
 
-    /// Back-compatible name retained for the XR5 caller. Direct VR4 and XR5 now
-    /// intentionally share the same per-vector validity rule.
     pub fn to_xr5_gaze_sample(&self) -> GazeSample {
         self.to_gaze_sample()
     }
 
-    /// Shape the EyeChip's fused/cyclopean direction as an ordinary stereo sample.
-    /// Both eyes intentionally receive the same native vector; the existing per-eye
-    /// centre/range/static-vergence correction remains downstream. There is no
-    /// per-frame fallback to columns 3/4, so source disagreement cannot cause flapping.
     pub fn to_xr5_combined_gaze_sample(&self) -> GazeSample {
         let valid = plausible_gaze_direction(self.combined);
         let eye = EyeSample {
@@ -97,7 +68,6 @@ fn plausible_gaze_direction(g: [f32; 3]) -> bool {
     (0.25..=2.25).contains(&norm_sq) && g[0].abs() <= 1.5 && g[1].abs() <= 1.5 && g[2] <= 1.5
 }
 
-/// Per-frame wearable advanced data, as recovered from stream 1285.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WearableData {
     pub timestamp_us: u64,
@@ -162,10 +132,6 @@ impl WearableData {
         }
     }
 
-    /// Convert wearable stream 1285 to its auxiliary contribution only. Stream
-    /// 1289 is the canonical gaze source; accepting the duplicate 1285 gaze into
-    /// the same latest-value slot made the two differently timed/LR-mapped streams
-    /// alternate and produced large apparent gaze jumps on XR5.
     pub fn to_aux_sample(&self) -> GazeSample {
         let mut sample = self.to_gaze_sample();
         sample.timestamp_us = 0;
@@ -238,9 +204,6 @@ fn decode_tlv_columns(msg: &[u8]) -> Option<Vec<(u32, ColumnPayload)>> {
     Some(columns)
 }
 
-/// Decode pid-1285 wearable advanced data. This first tries the 160-byte VR4
-/// callback payload layout seen in prior DLL captures, then the observed direct
-/// TTP row/column layout from the EyeChip's wearable-advanced stream.
 pub fn decode_wearable_1285(msg: &[u8]) -> Option<WearableData> {
     decode_wearable_struct_payload(msg).or_else(|| decode_wearable_tlv_layout(msg))
 }
@@ -306,8 +269,6 @@ fn read_tlv_eye(
     out: &mut WearableData,
 ) {
     if let Some(gaze) = struct_vec3(columns, cols.gaze) {
-        // RAW gaze. The single canonical sign is applied once downstream in the
-        // output sink (BrokenEyeSink), per the adapter contract — never here.
         out.gaze[idx] = gaze;
         out.gaze_valid[idx] = scalar_u32(columns, cols.gaze_valid) == Some(1);
     }
@@ -525,8 +486,6 @@ fn read_f32_le(bytes: &[u8], pos: usize) -> Option<f32> {
         .map(|s| f32::from_le_bytes(s.try_into().unwrap()))
 }
 
-/// First three sub-values as a RAW vector (lenient: missing -> 0.0). The single
-/// canonical gaze sign is applied once downstream in the output sink, not here.
 fn vec3_lenient(subs: &[Value]) -> [f32; 3] {
     let f = |i: usize| match subs.get(i) {
         Some(Value::F32(x)) => *x,
@@ -535,8 +494,6 @@ fn vec3_lenient(subs: &[Value]) -> [f32; 3] {
     [f(0), f(1), f(2)]
 }
 
-/// Decode a deframed pid-1289 message. The TLV payload begins at offset 26
-/// (the 8-byte USB header is already stripped by `Deframer`).
 pub fn decode_gaze_1289(msg: &[u8]) -> Option<GazeData> {
     let mut g = GazeData::default();
     let mut pos = 26;
@@ -552,14 +509,12 @@ pub fn decode_gaze_1289(msg: &[u8]) -> Option<GazeData> {
         if pos + 10 >= msg.len() {
             break;
         }
-        // Column prologue (must match the gaze magic).
         let (cp, np) = decode_value(msg, pos)?;
         pos = np;
         match cp {
             Value::Pro(GAZE_COLUMN_MAGIC) => {}
             _ => break,
         }
-        // Column id, then the column value.
         let (col_id_v, np) = decode_value(msg, pos)?;
         pos = np;
         let col_id = match col_id_v {
@@ -643,47 +598,38 @@ mod tests {
 
     #[test]
     fn decodes_left_gaze_status_and_timestamp() {
-        // 5 rows: left-eye gaze vector, status, timestamp, combined, convergence.
-        let mut tlv = enc_pro(5 << 16); // row_count = 5
+        let mut tlv = enc_pro(5 << 16);
 
-        // Row 1: left eye (col 3) = vector [0.5, -0.25, 1.0].
         tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
         tlv.extend(enc_u32(3));
-        tlv.extend(enc_pro(3 << 16)); // sub_count = 3
-        tlv.extend(enc_f(32768)); //  0.5
-        tlv.extend(enc_f(-16384)); // -0.25
-        tlv.extend(enc_f(65536)); //  1.0
+        tlv.extend(enc_pro(3 << 16));
+        tlv.extend(enc_f(32768));
+        tlv.extend(enc_f(-16384));
+        tlv.extend(enc_f(65536));
 
-        // Row 2: status (col 2) = 7.
         tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
         tlv.extend(enc_u32(2));
         tlv.extend(enc_u32(7));
 
-        // Row 3: timestamp (col 1) = 123456789.
         tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
         tlv.extend(enc_u32(1));
         tlv.extend(enc_i64(123_456_789));
 
-        // Row 4: EyeChip fused gaze (col 5).
         tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
         tlv.extend(enc_u32(5));
         tlv.extend(enc_pro(3 << 16));
-        tlv.extend(enc_f(16384)); //  0.25
-        tlv.extend(enc_f(-8192)); // -0.125
-        tlv.extend(enc_f(65536)); //  1.0
+        tlv.extend(enc_f(16384));
+        tlv.extend(enc_f(-8192));
+        tlv.extend(enc_f(65536));
 
-        // Row 5: convergence scalar (col 6). Its physical unit is intentionally
-        // not interpreted by SRanibro until verified on hardware.
         tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
         tlv.extend(enc_u32(6));
-        tlv.extend(enc_f(131072)); // 2.0 raw scalar
+        tlv.extend(enc_f(131072));
 
-        // Prepend a 26-byte TTP header (contents irrelevant to the decoder).
         let mut msg = vec![0u8; 26];
         msg.extend(tlv);
 
         let g = decode_gaze_1289(&msg).expect("decodes");
-        // RAW (decoder no longer negates; sink applies the sign once): [0.5, -0.25, 1.0].
         assert!((g.l_gaze[0] - 0.5).abs() < 1e-3, "lx {}", g.l_gaze[0]);
         assert!((g.l_gaze[1] - (-0.25)).abs() < 1e-3, "ly {}", g.l_gaze[1]);
         assert!((g.l_gaze[2] - 1.0).abs() < 1e-3, "lz {}", g.l_gaze[2]);
@@ -704,9 +650,9 @@ mod tests {
         tlv.extend(enc_pro(GAZE_COLUMN_MAGIC));
         tlv.extend(enc_u32(4));
         tlv.extend(enc_pro(3 << 16));
-        tlv.extend(enc_f(-24576)); // -0.375
-        tlv.extend(enc_f(8192)); //  0.125
-        tlv.extend(enc_f(57344)); //  0.875
+        tlv.extend(enc_f(-24576));
+        tlv.extend(enc_f(8192));
+        tlv.extend(enc_f(57344));
 
         let mut msg = vec![0u8; 26];
         msg.extend(tlv);
@@ -723,7 +669,7 @@ mod tests {
     #[test]
     fn bad_column_magic_stops_cleanly() {
         let mut tlv = enc_pro(1 << 16);
-        tlv.extend(enc_pro(999)); // wrong magic -> break
+        tlv.extend(enc_pro(999));
         let mut msg = vec![0u8; 26];
         msg.extend(tlv);
         let g = decode_gaze_1289(&msg).expect("returns default-ish");

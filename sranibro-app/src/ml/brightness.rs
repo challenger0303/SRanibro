@@ -1,23 +1,12 @@
-//! Fixed manual brightness plus legacy adaptive-normalization helpers.
-//!
-//! Production composes only `manual_gain`; it never adapts brightness from live images.
-//! The older adaptive functions remain isolated here for config compatibility and research
-//! tests, but the ML pipeline does not call them.
 
 use crate::core::types::BrightnessNorm;
 
-/// Central fraction of the frame used for the robust stats (skips the dark periphery / mask).
 const ROI: f32 = 0.625;
-/// Frames (~60Hz ML) the baseline settles before the target is auto-captured (~1.5s).
 pub const WARMUP: u32 = 90;
 
-/// Bounded manual exposure range. This is intentionally wider on the bright side because
-/// a larger lens-to-eye distance can make the whole IR image substantially dimmer.
 pub const MANUAL_GAIN_MIN: f32 = 0.5;
 pub const MANUAL_GAIN_MAX: f32 = 2.0;
 
-/// Resolve a persisted manual exposure value safely. Missing and non-finite values use
-/// the current standard from [`BrightnessNorm::default`].
 pub fn sanitize_manual_gain(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(MANUAL_GAIN_MIN, MANUAL_GAIN_MAX)
@@ -26,10 +15,6 @@ pub fn sanitize_manual_gain(value: f32) -> f32 {
     }
 }
 
-/// Compose the fixed manual exposure after the adaptive affine. If adaptive correction
-/// produced `a*x + b`, the actual model input becomes `gain * (a*x + b)`. Keeping the
-/// composed affine in the shared snapshot makes previews and calibration recordings match
-/// live inference exactly.
 pub fn compose_manual_gain(affine: &mut [(f32, f32); 2], value: f32) {
     let gain = sanitize_manual_gain(value);
     for (a, b) in affine {
@@ -38,25 +23,16 @@ pub fn compose_manual_gain(affine: &mut [(f32, f32); 2], value: f32) {
     }
 }
 
-/// Runtime (non-persisted) per-eye baseline the normalizer adapts — the SOURCE. The
-/// persisted target + params live in [`BrightnessNorm`] (config); this is transient state
-/// owned by the ML thread.
 #[derive(Clone, Copy)]
 pub struct BrightState {
     base_level: f32,
     base_spread: f32,
     warm: u32,
     init: bool,
-    /// Whether the last frame's brightness sat in the relaxed band (not a wink/wide).
     in_band: bool,
-    /// Running MAX of the raw model openness (with slow decay) — the eye's own open peak,
-    /// used to gate the target capture on "the eye is actually open".
     omax: f32,
     omax_init: bool,
-    /// Consecutive frames this eye has been a GOOD capture frame (open + relaxed brightness).
     good_streak: u32,
-    /// The runtime has observed a captured target. A later `captured = false` is therefore
-    /// an explicit recapture request and must also clear this otherwise-stale baseline.
     target_seen: bool,
 }
 
@@ -76,13 +52,8 @@ impl Default for BrightState {
     }
 }
 
-/// Both eyes must be a GOOD frame (relaxed + open) for this many consecutive frames before
-/// the target is captured (~0.75s @60Hz) — so the reference is a genuinely good frame, not a
-/// blind post-warmup snapshot.
 const GOOD_CAP: u32 = 45;
 
-/// Robust (level, spread) of the central ROI via a 256-bin histogram: level = median,
-/// spread = half the p16..p84 range (~1 std for a normal). O(n) + O(256).
 fn roi_stats(frame: &[u8], w: usize, h: usize) -> (f32, f32) {
     let mx = (w as f32 * (1.0 - ROI) * 0.5) as usize;
     let my = (h as f32 * (1.0 - ROI) * 0.5) as usize;
@@ -116,7 +87,6 @@ fn roi_stats(frame: &[u8], w: usize, h: usize) -> (f32, f32) {
     (level, spread)
 }
 
-/// Advance one eye's baseline from a frame (slow EMA). Call once per ML frame.
 pub fn update(st: &mut BrightState, frame: &[u8], w: usize, h: usize, adapt: f32) {
     if w == 0 || h == 0 || frame.len() < w * h {
         return;
@@ -129,14 +99,6 @@ pub fn update(st: &mut BrightState, frame: &[u8], w: usize, h: usize, adapt: f32
         st.warm = 1;
         return;
     }
-    // Gate the adaptation on how far this frame's level sits from the settled baseline.
-    // Relaxed jitter (in-band) adapts normally; a WINK (much darker) or a WIDE (much
-    // brighter) is an EXPRESSION, not a lens-distance change — adapt ~200x slower so a held
-    // expression can't drag the baseline. Without this, the baseline chased the wink/wide and
-    // the affine then BRIGHTENED a closed eye (openness spiked up while shut) or DIMMED a wide
-    // eye (wide stopped firing after a few tries) — the two reported regressions. A genuine
-    // reseat is a PERSISTENT shift, so the slow out-of-band rate still re-anchors it over ~a
-    // minute (or use "Recapture reference" to rebuild a fresh baseline in ~2s).
     let dev = lvl - st.base_level;
     let gate = (0.8 * st.base_spread).clamp(6.0, 22.0);
     st.in_band = dev.abs() <= gate;
@@ -146,22 +108,15 @@ pub fn update(st: &mut BrightState, frame: &[u8], w: usize, h: usize, adapt: f32
     st.warm = st.warm.saturating_add(1);
 }
 
-/// Whether this eye's baseline has settled enough to capture a target.
 pub fn warmed(st: &BrightState) -> bool {
     st.init && st.warm >= WARMUP
 }
 
-/// This eye's current baseline (level, spread) — the value latched as the target.
 pub fn capture(st: &BrightState) -> (f32, f32) {
     (st.base_level, st.base_spread)
 }
 
-/// The affine `(a, b)` mapping the current baseline onto `(tgt_level, tgt_spread)`, blended
-/// by `strength`. `out = a*in + b` (identity at strength 0). Gain is clamped so a bad
-/// estimate can't blow the image out.
 pub fn affine(st: &BrightState, tgt_level: f32, tgt_spread: f32, strength: f32) -> (f32, f32) {
-    // A corrupt persisted target/strength could be non-finite; fall back to identity so it
-    // can never NaN the ML input.
     if !tgt_level.is_finite() || !tgt_spread.is_finite() {
         return (1.0, 0.0);
     }
@@ -175,8 +130,6 @@ pub fn affine(st: &BrightState, tgt_level: f32, tgt_spread: f32, strength: f32) 
     (1.0 + s * (gain - 1.0), s * off)
 }
 
-/// Apply an affine `(a, b)` to a grayscale frame: `out = clamp(a*in + b, 0, 255)`. Returns
-/// a plain copy for the identity `(1, 0)`.
 pub fn apply(frame: &[u8], a: f32, b: f32) -> Vec<u8> {
     if (a - 1.0).abs() < 1e-4 && b.abs() < 1e-3 {
         return frame.to_vec();
@@ -187,11 +140,6 @@ pub fn apply(frame: &[u8], a: f32, b: f32) -> Vec<u8> {
         .collect()
 }
 
-/// One ML-frame step for BOTH eyes: update baselines, capture the target from GOOD frames,
-/// and return the per-eye affine `[(aL,bL),(aR,bR)]`. `prev_open` is the PREVIOUS frame's raw
-/// model openness per eye (s[1]/s[2]); it gates the capture so the reference is a genuinely
-/// relaxed-open frame, not a blind post-warmup snapshot. `norm` is the shared params+target
-/// (mutated on capture). Identity per eye until a target exists / when disabled.
 pub fn step(
     states: &mut [BrightState; 2],
     frames: [(&[u8], usize, usize); 2],
@@ -201,18 +149,12 @@ pub fn step(
     if !norm.enabled {
         return [(1.0, 0.0), (1.0, 0.0)];
     }
-    // The UI requests a recapture by clearing `captured`. Previously this kept the old
-    // runtime baseline, so a genuine reseat was classified as a held expression and could
-    // remain outside the capture band for minutes. Reset transient evidence exactly once.
     if !norm.captured && states.iter().any(|state| state.target_seen) {
         *states = [BrightState::default(); 2];
     }
     for i in 0..2 {
         let (f, w, h) = frames[i];
         update(&mut states[i], f, w, h, norm.adapt);
-        // Track the eye's own openness peak (slow decay) and flag GOOD capture frames:
-        // OPEN (openness within 80% of its peak -> not a blink) AND relaxed brightness
-        // (in-band -> not a wide/wink). Both eyes must stay GOOD for GOOD_CAP frames.
         let o = prev_open[i];
         let st = &mut states[i];
         if o.is_finite() {
@@ -223,9 +165,6 @@ pub fn step(
                 st.omax = (st.omax * 0.999).max(o);
             }
         }
-        // `omax >= 0.5` = the eye has genuinely reached an OPEN level at some point (the
-        // model's raw openness is ~0.66 open / ~0.39 closed), so an all-closed session can't
-        // capture a closed reference; `o > 0.8*omax` = currently near that open peak.
         let good = warmed(st) && st.in_band && o.is_finite() && st.omax >= 0.5 && o > 0.8 * st.omax;
         st.good_streak = if good {
             st.good_streak.saturating_add(1)
@@ -233,7 +172,6 @@ pub fn step(
             0
         };
     }
-    // Capture ONCE, only after BOTH eyes have been relaxed-open for a sustained stretch.
     if norm.auto_learn
         && !norm.captured
         && states[0].good_streak >= GOOD_CAP
@@ -279,8 +217,6 @@ mod tests {
 
     #[test]
     fn affine_preserves_darkening() {
-        // With a captured baseline, the baseline maps ~to the target level, and a DARKER
-        // frame (a blink) maps below it — the affine never cancels the darkening.
         let st = BrightState {
             base_level: 160.0,
             base_spread: 40.0,
@@ -303,8 +239,6 @@ mod tests {
 
     #[test]
     fn dim_frame_is_brightened_toward_target() {
-        // A user whose eye is systematically DIM (level ~90) gets pulled up toward a
-        // brighter target (~140), i.e. gain>1 / positive offset.
         let st = BrightState {
             base_level: 90.0,
             base_spread: 30.0,
@@ -354,16 +288,12 @@ mod tests {
         assert!(states.iter().all(|state| state.warm == 1));
         assert!(states.iter().all(|state| !state.target_seen));
 
-        // The next frame advances normally instead of resetting on every frame.
         step(&mut states, pair, [0.8, 0.8], &mut norm);
         assert!(states.iter().all(|state| state.warm == 2));
     }
 
     #[test]
     fn baseline_resists_held_expression() {
-        // The regression fix: after a relaxed baseline settles, HOLDING a wink (much darker)
-        // must barely move the baseline — otherwise the affine brightens the closed eye and
-        // openness spikes up while shut.
         let mut st = BrightState::default();
         let mut relaxed = vec![0u8; 200 * 200];
         for (i, p) in relaxed.iter_mut().enumerate() {
@@ -373,7 +303,7 @@ mod tests {
             update(&mut st, &relaxed, 200, 200, 0.05);
         }
         let base_before = st.base_level;
-        let dark = vec![30u8; 200 * 200]; // held wink (much darker than baseline)
+        let dark = vec![30u8; 200 * 200];
         for _ in 0..180 {
             update(&mut st, &dark, 200, 200, 0.05);
         }
@@ -391,7 +321,6 @@ mod tests {
             ..BrightnessNorm::default()
         };
         let mut st = [BrightState::default(); 2];
-        // Steady gradient-ish frame so spread is non-degenerate (relaxed brightness = in-band).
         let mut frame = vec![0u8; 200 * 200];
         for (i, p) in frame.iter_mut().enumerate() {
             *p = ((i % 200) as u8).wrapping_add(40);
@@ -400,12 +329,10 @@ mod tests {
             (&frame[..], 200usize, 200usize),
             (&frame[..], 200usize, 200usize),
         ];
-        // (a) Warmed but eyes CLOSED (low openness) -> must NOT capture.
         for _ in 0..WARMUP + GOOD_CAP + 20 {
             step(&mut st, f, [0.2, 0.2], &mut norm);
         }
         assert!(!norm.captured, "closed eyes must not trigger a capture");
-        // (b) Now the eyes are OPEN (high openness) for a sustained stretch -> capture.
         let mut last = [(1.0, 0.0); 2];
         for _ in 0..GOOD_CAP + 5 {
             last = step(&mut st, f, [0.8, 0.8], &mut norm);
@@ -414,7 +341,6 @@ mod tests {
             norm.captured,
             "target captured from sustained good open frames"
         );
-        // Right after capture, baseline == target, so the affine is ~identity.
         assert!(
             (last[0].0 - 1.0).abs() < 0.15 && last[0].1.abs() < 8.0,
             "near-identity at capture: {:?}",

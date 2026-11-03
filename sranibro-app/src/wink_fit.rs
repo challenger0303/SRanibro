@@ -1,8 +1,3 @@
-//! Per-eye held-wink calibration.
-//!
-//! A wink floor is distinct from the ordinary bilateral closed endpoint. The
-//! labelled eye must close while its partner remains open, repeated twice for
-//! training and once in untouched holdout. Each eye is accepted independently.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

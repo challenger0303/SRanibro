@@ -1,4 +1,4 @@
-"""Local-only SRanibro gaze child. No camera/network/settings access."""
+""
 import hashlib
 import importlib.util
 import json
@@ -71,8 +71,8 @@ class Processor:
             ray = self.mapper.emit(eye=eye, pupil_xy=result['centers'][i], timestamp_s=times[i], scope=self.scope,
                                    state=('invalid','observed','partner_estimated')[state])
             x, y, z = ray['direction'] or (0.,0.,0.)
-            # Personal mapping orientation, before centering and every output sink.
-            # Eye identity, vertical axis, pupil inference and validity stay intact.
+
+
             packet.extend(struct.pack('<Bfff', state, self.horizontal_sign*x if state else 0., y, z))
         self.last = seq, gens, times
         return packet
@@ -82,7 +82,7 @@ def main(path, backend, profile_prefix=None):
     package = json.loads(Path(path).read_text(encoding='utf-8'))
     if package['schema'] != 'sranibro-xr5-gaze-local-v1' or backend not in ('auto','cpu'):
         raise ValueError('unsupported package/backend')
-    # Explicit local package. Not a sandbox or a format for untrusted models.
+
     for filename, expected in package['verified_files'].items():
         if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != expected:
             raise ValueError('gaze dependency hash mismatch: '+filename)
@@ -92,7 +92,7 @@ def main(path, backend, profile_prefix=None):
     expected_device = 'pimax_xr5:'+package['device_serial']+':preflight'
     if mapping['source_identity']['device_id'] != expected_device:
         raise ValueError('mapping device differs')
-    # Keep stdout exclusively binary, including during model imports/inference.
+
     output = sys.stdout.buffer
     sys.stdout = sys.stderr
     model_type = load('integrated_blur', goal/'fixed-roi-blur-v1/model.py').BlurModel

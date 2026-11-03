@@ -1,4 +1,3 @@
-//! Opt-in research gaze worker. SRanibro alone owns the cameras.
 use crate::{core::types::EyeResult, pipeline::Telemetry};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -33,7 +32,6 @@ impl Snapshot {
             e.gaze_valid = fresh && (self.states[i] == 1 || (allow_partner && self.states[i] == 2));
             e.gaze_yoked = e.gaze_valid && self.states[i] == 2;
             if e.gaze_valid {
-                // Worker OpenVR: +X right,+Y up,-Z forward. Existing sinks negate X.
                 let [x, y, z] = self.directions[i];
                 e.gaze = [-x, y, -z];
             } else {
@@ -234,7 +232,6 @@ impl Worker {
                     let _ = replies.try_send(Reply::Error(e.to_string()));
                 }
                 owner.kill();
-                // Never wait for process/driver cleanup while holding the kill lock.
                 let child = owner.child.lock().ok().and_then(|mut slot| slot.take());
                 if let Some(mut c) = child {
                     let _ = c.wait();
@@ -519,7 +516,6 @@ mod tests {
     fn lifecycle_frame_reply_then_hang_times_out() {
         let code="import sys,struct,time\nr=sys.stdin.buffer;w=sys.stdout.buffer\nw.write(b'XRGZ0001');w.flush()\nh=r.read(40);r.read(80000)\nn=struct.unpack('<Q',h[:8])[0]\nw.write(struct.pack('<4sQB',b'XGZ1',n,0)+struct.pack('<Bfff',1,0.,0.,-1.)*2);w.flush()\nr.read(40);r.read(80000);time.sleep(60)";
         let (worker, tele) = fixture(code);
-        // Keep only newest test frame fresh while the child starts.
         let mut n = 0;
         wait(|| {
             n += 1;

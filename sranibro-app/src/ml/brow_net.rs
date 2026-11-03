@@ -1,29 +1,9 @@
-//! TinyBrowNet — pure-Rust forward pass for the eyebrow model ported from the
-//! `vr_eyebrow` project. The eyebrow is NOT in the eye-camera FOV; this CNN infers
-//! brow expression from eye-shape / upper-eyelid deformation, on a per-user calibrated
-//! model. Input is 1x64x64 grayscale (per-frame z-scored); output is 1 or 3 continuous
-//! brow values ([brow] or [brow, inner, outer]).
-//!
-//! Architecture (PyTorch `TinyBrowNet`, model.py):
-//!   input [1,64,64]
-//!   4x { Conv2d(3x3, pad 1) -> BatchNorm -> ReLU -> MaxPool2 }
-//!       channels 1->16->32->64->64, spatial 64->32->16->8->4
-//!   flatten [1024]
-//!   fc1 Linear(1024,128) -> BatchNorm1d -> ReLU -> Dropout(inference no-op)
-//!   fc2 Linear(128, OUT)  (linear, NOT relu — final unclamped output)
-//!
-//! BatchNorm is FOLDED into the preceding conv/linear at bake time (see
-//! tools/bake_brow_weights.py), so this runs just conv+bias+relu / linear. Convs use
-//! the same im2col+GEMM (matrixmultiply) approach as [`super::eye_net`], with an added
-//! zero-pad-by-1 so the 3x3 convs keep their spatial size. Weights load from a flat
-//! little-endian binary; nothing proprietary ships — the user bakes their own model.
 
 use std::io::Read;
 use std::path::Path;
 
-/// Per-stage (in_ch, out_ch) for the 4 conv stages; kernel is 3x3 pad-1 throughout.
 const CONV: [(usize, usize); 4] = [(1, 16), (16, 32), (32, 64), (64, 64)];
-const FC1_IN: usize = 64 * 4 * 4; // 1024
+const FC1_IN: usize = 64 * 4 * 4;
 const FC1_OUT: usize = 128;
 
 pub struct BrowNet {
@@ -34,7 +14,6 @@ pub struct BrowNet {
     fc1_b: Vec<f32>,
     fc2_w: Vec<f32>,
     fc2_b: Vec<f32>,
-    // Reusable scratch (steady-state zero-alloc): pad buffer, im2col, two ping-pongs.
     pad: Vec<f32>,
     col: Vec<f32>,
     a: Vec<f32>,
@@ -42,17 +21,10 @@ pub struct BrowNet {
 }
 
 impl BrowNet {
-    /// Number of model outputs (1 = brow only, 3 = [brow, inner, outer]).
     pub fn out_dim(&self) -> usize {
         self.out_dim
     }
 
-    /// Load a baked weights file. Format (little-endian):
-    ///   magic "BROWNET1" (8 bytes), u32 out_dim, then f32 arrays in order:
-    ///   conv1_w[16,1,3,3] conv1_b[16] conv2_w[32,16,3,3] conv2_b[32]
-    ///   conv3_w[64,32,3,3] conv3_b[64] conv4_w[64,64,3,3] conv4_b[64]
-    ///   fc1_w[128,1024] fc1_b[128] fc2_w[out,128] fc2_b[out]
-    /// (BatchNorm already folded into the conv/fc weights+biases.)
     pub fn load(path: &Path) -> Result<Self, String> {
         let mut bytes = Vec::new();
         std::fs::File::open(path)
@@ -69,7 +41,6 @@ impl BrowNet {
         if out_dim != 1 && out_dim != 3 {
             return Err(format!("brow out_dim {out_dim}, expected 1 or 3"));
         }
-        // Cursor over the f32 payload.
         let mut off = 12usize;
         let mut take = |n: usize| -> Result<Vec<f32>, String> {
             let end = off + n * 4;
@@ -102,8 +73,6 @@ impl BrowNet {
                 bytes.len() - off
             ));
         }
-        // Reject NaN/Inf weights up front — a non-finite weight would silently poison
-        // every inference (NaN survives clamp and reads as full brow-down downstream).
         let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
         if !(conv_w.iter().all(|w| finite(w))
             && conv_b.iter().all(|b| finite(b))
@@ -129,16 +98,10 @@ impl BrowNet {
         })
     }
 
-    /// Run the (frozen) conv+maxpool backbone on one 64x64 z-scored frame, leaving the
-    /// 1024-d flatten in `self.b[..FC1_IN]` — the exact tensor that feeds fc1. Shared by
-    /// [`Self::forward_one`] and [`Self::brow_features`] so inference and the per-user head
-    /// trainer ([`crate::ml::brow_fit`]) see byte-identical features.
     fn conv_features(&mut self, input64: &[f32]) {
         debug_assert_eq!(input64.len(), 64 * 64);
         let mut h = 64;
         let mut w = 64;
-        // Stage 1 reads `input64`; later stages ping-pong a <-> b. After each conv the
-        // activation is in `a`; maxpool writes to `b`; next conv reads `b`.
         conv_relu_pad(
             input64,
             1,
@@ -174,14 +137,11 @@ impl BrowNet {
             h = hh;
             w = ww;
         }
-        debug_assert_eq!(64 * h * w, FC1_IN); // 64x4x4 = 1024, now in self.b
+        debug_assert_eq!(64 * h * w, FC1_IN);
     }
 
-    /// Forward one 64x64 grayscale frame (already z-scored), row-major [h][w].
-    /// Returns `out_dim` brow values (raw, unclamped — the caller clips/post-processes).
     pub fn forward_one(&mut self, input64: &[f32]) -> Vec<f32> {
-        self.conv_features(input64); // conv backbone -> 1024-d flatten in self.b
-                                     // fc1+relu (b -> a), fc2 linear (a -> b).
+        self.conv_features(input64);
         linear(
             &self.b,
             &self.fc1_w,
@@ -203,26 +163,15 @@ impl BrowNet {
         self.b[..self.out_dim].to_vec()
     }
 
-    /// The 1024-d flatten (frozen conv-backbone output) for one 64x64 z-scored frame — the
-    /// exact input fc1 consumes. This is what the per-user head trainer
-    /// ([`crate::ml::brow_fit`]) caches and regresses on; running the SAME conv path as
-    /// [`Self::forward_one`] keeps train-time and inference-time features identical.
     pub fn brow_features(&mut self, input64: &[f32]) -> Vec<f32> {
         self.conv_features(input64);
         self.b[..FC1_IN].to_vec()
     }
 
-    /// Serialize this net's FROZEN conv backbone + a freshly-fitted `head` (fc1 + fc2) into
-    /// the exact [`Self::from_bytes`] `BROWNET1` layout, ready to write as a `brow.bin`. The
-    /// conv weights are reused byte-for-byte (the backbone is frozen); only the head is
-    /// swapped in. Every head tensor's shape is checked against this net's dims and any
-    /// non-finite value (conv OR head) is rejected, so a corrupt file is never emitted — the
-    /// loader would refuse a NaN/Inf weight anyway, so we catch it at the source.
     pub fn to_bytes_with_head(
         &self,
         head: &crate::ml::brow_fit::HeadWeights,
     ) -> Result<Vec<u8>, String> {
-        // Head shapes must match the frozen layout exactly (fc1 fan-in is FC1_IN=1024).
         if head.fc1_w.len() != FC1_OUT * FC1_IN {
             return Err(format!(
                 "fc1_w len {} != {}",
@@ -257,7 +206,6 @@ impl BrowNet {
         {
             return Err("brow weights contain NaN/Inf".into());
         }
-        // magic (8) + u32 out_dim + f32 payload in from_bytes order.
         let n_f32 = self.conv_w.iter().map(|w| w.len()).sum::<usize>()
             + self.conv_b.iter().map(|b| b.len()).sum::<usize>()
             + head.fc1_w.len()
@@ -279,7 +227,6 @@ impl BrowNet {
     }
 }
 
-/// Append `v`'s f32 values to `out` as little-endian bytes (the `BROWNET1` payload encoding).
 fn push_f32_le(out: &mut Vec<u8>, v: &[f32]) {
     for &x in v {
         out.extend_from_slice(&x.to_le_bytes());
@@ -292,7 +239,6 @@ fn ensure(v: &mut Vec<f32>, n: usize) {
     }
 }
 
-/// Zero-pad [ic][ih][iw] by 1 on all sides into `out` -> [ic][ih+2][iw+2].
 fn pad1(inp: &[f32], ic: usize, ih: usize, iw: usize, out: &mut Vec<f32>) {
     let (ph, pw) = (ih + 2, iw + 2);
     ensure(out, ic * ph * pw);
@@ -308,7 +254,6 @@ fn pad1(inp: &[f32], ic: usize, ih: usize, iw: usize, out: &mut Vec<f32>) {
     }
 }
 
-/// im2col (k=3 valid) into `col`; inp [ic][ih][iw]; col [ic*9, oh*ow] row-major.
 fn im2col3(inp: &[f32], ic: usize, ih: usize, iw: usize, col: &mut Vec<f32>) -> (usize, usize) {
     let (k, oh, ow) = (3usize, ih - 2, iw - 2);
     let n = oh * ow;
@@ -329,8 +274,6 @@ fn im2col3(inp: &[f32], ic: usize, ih: usize, iw: usize, col: &mut Vec<f32>) -> 
     (oh, ow)
 }
 
-/// Conv2d 3x3 stride-1 SAME (pad 1) + bias + ReLU. `w` is [oc, ic*9] row-major (PyTorch
-/// conv weight [oc,ic,3,3] flattens to exactly this). Output [oc][ih][iw] in `out`.
 #[allow(clippy::too_many_arguments)]
 fn conv_relu_pad(
     inp: &[f32],
@@ -345,7 +288,7 @@ fn conv_relu_pad(
     out: &mut Vec<f32>,
 ) {
     pad1(inp, ic, ih, iw, pad);
-    let (oh, ow) = im2col3(pad, ic, ih + 2, iw + 2, col); // -> (ih, iw)
+    let (oh, ow) = im2col3(pad, ic, ih + 2, iw + 2, col);
     let kdim = ic * 9;
     let n = oh * ow;
     ensure(out, oc * n);
@@ -376,7 +319,6 @@ fn conv_relu_pad(
     }
 }
 
-/// 2x2 max pool, stride 2, [c][h][w] -> [c][h/2][w/2] into `out`.
 fn maxpool2(inp: &[f32], c: usize, h: usize, w: usize, out: &mut Vec<f32>) -> (usize, usize) {
     let (oh, ow) = (h / 2, w / 2);
     ensure(out, c * oh * ow);
@@ -396,7 +338,6 @@ fn maxpool2(inp: &[f32], c: usize, h: usize, w: usize, out: &mut Vec<f32>) -> (u
     (oh, ow)
 }
 
-/// y = W x + b, with optional ReLU. W is [out_dim, in_dim] row-major (PyTorch Linear).
 fn linear(
     inp: &[f32],
     w: &[f32],
@@ -440,8 +381,6 @@ mod tests {
         assert!(BrowNet::from_bytes(b"nope").is_err());
     }
 
-    /// Deterministic finite f32s in [-0.5, 0.5) from a seed (splitmix-ish LCG) — for
-    /// synthetic weights/heads without pulling in `rand`.
     fn det_f32s(n: usize, seed: u64) -> Vec<f32> {
         let mut st = seed | 1;
         (0..n)
@@ -460,9 +399,6 @@ mod tests {
         }
     }
 
-    /// A synthetic `BROWNET1` blob (magic + out_dim + conv backbone + head). Conv weights are
-    /// scaled small so the untrained backbone's activations stay O(0.1) — that keeps the
-    /// f32-vs-f64 head comparison in `to_bytes_with_head_roundtrips` well inside tolerance.
     fn synth_backbone_bytes(out_dim: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"BROWNET1");
@@ -489,15 +425,11 @@ mod tests {
         bytes
     }
 
-    /// Writing a frozen backbone + a fresh head, then reloading, must (a) preserve the conv
-    /// backbone byte-for-byte and (b) apply the head in the correct layout — so the reloaded
-    /// net's forward equals the head applied to the base net's features.
     #[test]
     fn to_bytes_with_head_roundtrips() {
         let base_blob = synth_backbone_bytes(3);
         let mut base = BrowNet::from_bytes(&base_blob).expect("base loads");
 
-        // A DIFFERENT head (deterministic, correct shapes).
         let new_head = crate::ml::brow_fit::HeadWeights {
             fc1_w: det_f32s(FC1_OUT * FC1_IN, 0xA1),
             fc1_b: det_f32s(FC1_OUT, 0xB2),
@@ -509,12 +441,10 @@ mod tests {
         let mut reloaded = BrowNet::from_bytes(&bytes).unwrap();
         assert_eq!(reloaded.out_dim(), 3);
 
-        // Sample input; features come from the (shared, frozen) conv backbone.
         let x: Vec<f32> = (0..64 * 64).map(|i| (i % 37) as f32 * 0.03 - 0.5).collect();
         let feats = base.brow_features(&x);
         assert_eq!(feats.len(), FC1_IN);
 
-        // Apply new_head to feats by hand (fc1 row-major + ReLU, then fc2), f64 accumulation.
         let mut h = vec![0.0f64; FC1_OUT];
         for o in 0..FC1_OUT {
             let mut s = new_head.fc1_b[o] as f64;
@@ -545,7 +475,6 @@ mod tests {
             "head/backbone roundtrip diff {max_diff:e} (got {got:?}, want {expected:?})"
         );
 
-        // Frozen backbone: the conv byte-region must be byte-identical to the base blob.
         let conv_f32: usize = CONV.iter().map(|(ic, oc)| oc * ic * 9 + oc).sum();
         let conv_end = 12 + conv_f32 * 4;
         assert_eq!(
@@ -555,14 +484,11 @@ mod tests {
         );
     }
 
-    /// Numerical parity against PyTorch. Skipped unless the bake tool has written a
-    /// fixture (set BROW_FIXTURE_DIR to the folder holding brow.bin + brow_in.f32 +
-    /// brow_out.f32). Run after `python tools/bake_brow_weights.py ...`.
     #[test]
     fn pytorch_parity() {
         let dir = match std::env::var("BROW_FIXTURE_DIR") {
             Ok(d) => d,
-            Err(_) => return, // no fixture -> skip (normal `cargo test` stays green)
+            Err(_) => return,
         };
         let p = std::path::Path::new(&dir);
         let read_f32 = |name: &str| -> Vec<f32> {

@@ -1,20 +1,7 @@
-//! SRanibro app entry — first-run / startup view.
-//!
-//! Loads `sranibro.toml`, validates user-selectable models, and reports readiness.
-//! Device connection support is discovered automatically by the normal GUI path.
-//!
-//! Double-clicking the exe (no args) launches the GUI. In a *release* build we use the
-//! Windows GUI subsystem so no console window pops up; the diagnostic CLI subcommands
-//! (`status`, `mlcheck`, `capture`, …) still print because `main` re-attaches to the
-//! parent terminal's console when launched from one. Debug builds keep the console.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use sranibro_rs::config::Config;
 
-/// Append a diagnostic line to the app-dir log AND stderr, so failures are visible on
-/// another machine even when launched by double-click (no console) under panic="abort".
-/// Append a line to the app-dir log file (best-effort, NEVER panics — no eprintln here,
-/// so it is safe to call from inside the panic hook without double-panicking).
 fn append_log(msg: &str) {
     use std::io::Write;
     let path = sranibro_rs::config::base_dir().join("sranibro.log");
@@ -27,16 +14,11 @@ fn append_log(msg: &str) {
     }
 }
 
-/// Log a diagnostic to the file AND stderr, so failures are visible on another machine
-/// even when launched by double-click (no console) under panic="abort".
 fn log_diag(msg: &str) {
-    append_log(msg); // file first (survives a broken-stdio eprintln)
+    append_log(msg);
     eprintln!("{msg}");
 }
 
-/// Route panics to the log file — the hook runs before `panic="abort"` terminates, so a
-/// crash on another machine leaves a breadcrumb. The hook writes ONLY the file (no
-/// eprintln) so it can't double-panic, then chains the previous hook for the stderr print.
 fn install_diagnostics() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -48,23 +30,16 @@ fn install_diagnostics() {
 fn main() {
     #[cfg(all(any(windows, target_os = "linux"), feature = "external-eyelid-model"))]
     if sranibro_rs::ml::external_eyelid::worker_entrypoint() { return; }
-    // Native Toolkit calls run only in a supervised child, before logging,
-    // configuration, graphics or hardware handoff can initialize in that child.
     #[cfg(any(windows, target_os = "linux"))]
     {
         if sranibro_rs::device::psvr2_worker::worker_entrypoint() { return; }
         sranibro_rs::device::psvr2_worker::enable_worker_host();
     }
-    // This child must never start tracking, touch user configuration, attach a
-    // console or redirect its binary protocol through the application's log UI.
     #[cfg(any(windows, target_os = "linux"))]
     {
         if sranibro_rs::ml::gpu_worker_entrypoint() { return; }
         sranibro_rs::ml::enable_gpu_worker_host();
     }
-    // Under the windowed subsystem (release) there is no console of our own. If we were
-    // launched FROM a terminal, re-attach to it so CLI subcommands' stdout/stderr are
-    // visible; a no-op (no parent console) when double-clicked, so the GUI stays clean.
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
@@ -72,15 +47,11 @@ fn main() {
     }
 
     install_diagnostics();
-    // Device-handoff subcommands: free / restore the EyeChip from the Tobii
-    // Platform Runtime (self-elevating via UAC). `mode` just reports.
     match std::env::args().nth(1).as_deref() {
         #[cfg(all(target_os = "linux", feature = "xr5-only"))]
         Some("xr5-check") => {
             std::process::exit(if xr5_connection_check() { 0 } else { 1 });
         }
-        // Console asset/readiness report (was the old no-arg default; the GUI is now the
-        // default, so this is opt-in via `sranibro status` / `check`).
         Some("status") | Some("check") => {
             run_status_report();
             return;
@@ -110,36 +81,26 @@ fn main() {
             println!("{:?}", sranibro_rs::platform::detect_mode());
             return;
         }
-        // VPE eyechip native-wake validator (diagnostic): dumps the device/interface
-        // layout + runs the RE'd keepalive to test if SRanibro can hold the VPE eyechip
-        // without SRanipal running in the background. Windows-only.
         #[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
         Some("vpetest") => {
             sranibro_rs::device::vpe_probe::run();
             return;
         }
-        // VPE read-only interface/driver map (no service changes) — run it WITH and
-        // WITHOUT SRanipal to see which interface is always present.
         #[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
         Some("vpescan") => {
             sranibro_rs::device::vpe_probe::scan();
             return;
         }
-        // VPE eyechip wake via the HID API (the always-present 0BB4:0309 HidUsb interface).
         #[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
         Some("vpewake") => {
             sranibro_rs::device::vpe_hid::run();
             return;
         }
         Some("mlcheck") => {
-            // Optional label -> short labeled CSV capture (e.g. `mlcheck wide`);
-            // no label -> 120s stdout stream.
             run_mlcheck(std::env::args().nth(2));
             return;
         }
         Some("capture") => {
-            // Dedicated single-session acquisition: chip opened ONCE, spacebar
-            // drives labeled segments. Args after `capture` override the labels.
             run_capture(std::env::args().skip(2).collect());
             return;
         }
@@ -159,25 +120,20 @@ fn main() {
         _ => {}
     }
 
-    // `vr4` subcommand: live hardware acquisition test (Windows + VR4 only).
     #[cfg(not(any(feature = "psvr2-only", feature = "xr5-only")))]
     if std::env::args().nth(1).as_deref() == Some("vr4") {
         run_vr4();
         return;
     }
-    // `run` subcommand: full chain (acquisition -> ML -> SRanipalState -> sinks).
     if std::env::args().nth(1).as_deref() == Some("run") {
         run_full();
         return;
     }
-    // `ui` subcommand: in-process egui dashboard over the live pipeline.
     if std::env::args().nth(1).as_deref() == Some("ui") {
         run_ui_mode();
         return;
     }
 
-    // Default (double-click / no subcommand): launch the GUI. First-run still drops a
-    // commented starter sranibro.toml so the file is discoverable next to the app.
     let cfg_path = sranibro_rs::config::config_path();
     let _ = Config::write_template_if_absent(&cfg_path);
     #[cfg(any(windows, target_os = "linux"))]
@@ -186,7 +142,6 @@ fn main() {
     run_status_report();
 }
 
-/// Explicit camera-only bring-up diagnostic: no model inference, OSC or files.
 #[cfg(all(target_os = "linux", feature = "xr5-only"))]
 fn xr5_connection_check() -> bool {
     use sranibro_rs::{core::types::Eye, device::HmdAdapter};
@@ -222,9 +177,6 @@ fn xr5_connection_check() -> bool {
     passed
 }
 
-/// Console asset/readiness report (the `status` / `check` subcommand). Loads the config,
-/// writes a starter template on first run, and prints each asset's presence + what it
-/// gates — the "what's missing and why" view, without launching the GUI.
 fn run_status_report() {
     #[cfg(feature = "psvr2-only")]
     println!("SRanibro PSVR2 Beta v{}", env!("CARGO_PKG_VERSION"));
@@ -301,8 +253,6 @@ fn run_status_report() {
     }
 }
 
-/// Live VR4 acquisition test: stream over WinUSB and print per-second rates.
-/// Requires the platform service stopped: `net stop "Tobii VR4PIMAXP3B Platform Runtime"`.
 #[cfg(all(windows, not(any(feature = "psvr2-only", feature = "xr5-only"))))]
 fn merge_sample(
     dst: &mut sranibro_rs::core::types::GazeSample,
@@ -365,7 +315,6 @@ fn run_vr4() {
     let r_img = Arc::new(AtomicU64::new(0));
     let latest = Arc::new(Mutex::new(GazeSample::default()));
 
-    // Free the EyeChip from the Tobii runtime before opening it.
     sranibro_rs::platform::ensure_capture_ready();
 
     let (gn, ln, rn, lt) = (gaze_n.clone(), l_img.clone(), r_img.clone(), latest.clone());
@@ -418,7 +367,6 @@ fn run_vr4() {
     eprintln!("vr4 mode is Windows-only.");
 }
 
-/// Horizontal mirror of a `w`x`w` grayscale image (matches the pipeline's flip).
 #[cfg(windows)]
 fn mirror_h(src: &[u8], w: usize) -> Vec<u8> {
     let h = src.len() / w;
@@ -432,9 +380,6 @@ fn mirror_h(src: &[u8], w: usize) -> Vec<u8> {
     out
 }
 
-/// 5-channel ML diagnostic: stream ALL raw model outputs per eye (~10Hz) so we
-/// can map which channel encodes which expression. Frees the EyeChip first, then
-/// the user performs/holds expressions on cue while this records.
 #[cfg(windows)]
 fn run_mlcheck(label: Option<String>) {
     use std::sync::{Arc, Mutex};
@@ -480,7 +425,6 @@ fn run_mlcheck(label: Option<String>) {
         return;
     }
 
-    // Labeled mode -> short capture to a CSV; unlabeled -> 120s stdout stream.
     let cap_secs = if label.is_some() { 8.0 } else { 120.0 };
     if let Some(lbl) = label.as_deref() {
         println!("[mlcheck] hold expression '{lbl}' — capturing {cap_secs:.0}s, starting in 3s...");
@@ -511,7 +455,6 @@ fn run_mlcheck(label: Option<String>) {
             if l.len() >= sz && r.len() >= sz {
                 let lo = net.forward_one(&preprocess::vr4_to_input(&l));
                 let ro = net.forward_one(&preprocess::vr4_to_input(&r));
-                // Real SRanipal feeding: one pass with L in ch0, R in ch1.
                 let so = net.forward_one(&preprocess::vr4_to_input_stereo(&l, &r));
                 if let Some(lbl) = label.as_deref() {
                     rows.push(format!(
@@ -556,13 +499,6 @@ fn run_mlcheck(_label: Option<String>) {
     eprintln!("mlcheck mode is Windows-only.");
 }
 
-/// Dedicated interactive acquisition pipeline. Opens the EyeChip ONCE and keeps
-/// it streaming for the whole session — re-opening per expression is unstable
-/// (the WinUSB pipe goes stale: 1st open works, 2nd yields no frames, 3rd dies
-/// with ReadPipe error 31). You drive timing with the SPACEBAR: SPACE starts the
-/// current label's segment, SPACE again stops it and advances; ESC ends early.
-/// Everything lands in one `ml_captures/cap_session_stereo.csv` with per-eye L/R
-/// (duplicated feed) and interleaved S (the real SRanipal L-in-ch0 / R-in-ch1 feed).
 #[cfg(windows)]
 fn run_capture(labels: Vec<String>) {
     use std::sync::{Arc, Mutex};
@@ -575,17 +511,13 @@ fn run_capture(labels: Vec<String>) {
 
     const VK_SPACE: i32 = 0x20;
     const VK_ESC: i32 = 0x1B;
-    // Global key state (no console focus / message loop needed).
     fn key_down(vk: i32) -> bool {
         unsafe {
             (windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk) as u16 & 0x8000)
                 != 0
         }
     }
-    // Wait for a fresh SPACE press; false if ESC pressed instead.
     fn wait_space() -> bool {
-        // Drain only SPACE — an ESC held/tapped at the prompt must still register
-        // and end capture, so don't wait it out here.
         while key_down(VK_SPACE) {
             std::thread::sleep(Duration::from_millis(15));
         }
@@ -642,7 +574,7 @@ fn run_capture(labels: Vec<String>) {
         eprintln!("[capture] start failed: {e}");
         return;
     }
-    std::thread::sleep(Duration::from_millis(500)); // let the stream come up
+    std::thread::sleep(Duration::from_millis(500));
 
     println!("\nControls: SPACE = start/stop a segment, ESC = finish.");
     println!("Sequence: {}", labels.join(" -> "));
@@ -655,15 +587,13 @@ fn run_capture(labels: Vec<String>) {
             break;
         }
         while key_down(VK_SPACE) {
-            std::thread::sleep(Duration::from_millis(15)); // release the START press
+            std::thread::sleep(Duration::from_millis(15));
         }
         println!("[{lbl}] RECORDING — press SPACE to stop & advance");
         let mut n = 0u64;
         let t0 = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(40));
-            // Don't unwrap: a poisoned lock (adapter thread panic) must not crash
-            // the capture before adapter.stop() runs.
             let (l, r) = match frames.lock() {
                 Ok(f) => (f[0].clone(), f[1].clone()),
                 Err(_) => (None, None),
@@ -735,9 +665,6 @@ fn run_capture(_labels: Vec<String>) {
     eprintln!("capture mode is Windows-only.");
 }
 
-/// Full end-to-end chain on real hardware: VR4 acquisition -> ML openness ->
-/// SRanipalState post-process -> debug sink. Requires the platform service
-/// stopped and `[assets].sranipal_dir` set in sranibro.toml.
 #[cfg(windows)]
 fn run_full() {
     use std::time::Duration;
@@ -793,14 +720,11 @@ fn run_full() {
         }
     }
 
-    // Brow needs the eye net's blink signal; only load it when the eye net is present.
     let brow = if net.is_some() {
         sranibro_rs::engine::load_brow_net(&cfg)
     } else {
         None
     };
-    // The custom Wide model is XR5-only. Load it even while SRanipal remains the
-    // selected source so the diagnostic path can compare both on the same frame.
     let wide = if device_key == "pimax_xr5" && net.is_some() {
         sranibro_rs::engine::load_wide_net(&cfg)
     } else {
@@ -868,7 +792,6 @@ fn run_full() {
     eprintln!("run mode is Windows-only.");
 }
 
-/// Per-unit camera/auxiliary and gaze mapping from config.
 fn device_map_for(cfg: &Config, device_key: &str) -> sranibro_rs::pipeline::DeviceMap {
     let m = cfg.mapping_for(device_key);
     sranibro_rs::pipeline::DeviceMap {
@@ -878,39 +801,25 @@ fn device_map_for(cfg: &Config, device_key: &str) -> sranibro_rs::pipeline::Devi
     }
 }
 
-/// Mapping helper for the fixed-VR4 diagnostic commands, which do not run the adapter
-/// auto-selector used by the product pipeline.
 fn device_map() -> sranibro_rs::pipeline::DeviceMap {
     let (cfg, _) = Config::load(&sranibro_rs::config::config_path());
     let key = sranibro_rs::config::canonical_device_key(&cfg.hmd.device);
     device_map_for(&cfg, &key)
 }
 
-/// Load the EyePrediction net from the configured weights path (None if absent).
-/// Thin wrapper over [`sranibro_rs::engine::load_net`] so both entrypoints and the
-/// UI build the net identically.
 fn load_net() -> Option<sranibro_rs::ml::eye_net::EyeNet> {
     let (cfg, _) = Config::load(&sranibro_rs::config::config_path());
     sranibro_rs::engine::load_net(&cfg)
 }
 
-/// Launch the egui dashboard over a live pipeline (rebuilt in-process when the
-/// user edits asset paths in Settings — see `ui::App::apply_and_reload`).
 #[cfg(any(windows, target_os = "linux"))]
 fn run_ui_mode() {
-    // Redirect our own stdout/stderr into the in-app Console tab's ring buffer BEFORE the
-    // engine/UI print anything. Only on the UI path, so CLI subcommands still print to the
-    // terminal. Trade-off: a terminal launch of the UI now shows its logs in-app, not in
-    // the console (AttachConsole'd earlier) — that is the intended behaviour.
     sranibro_rs::logcap::init();
     let (cfg, _) = Config::load(&sranibro_rs::config::config_path());
     if let Err(e) = sranibro_rs::ui::run_ui_from_config(cfg) {
-        // Most likely a graphics-init failure (no usable GPU adapter / driver) — log it
-        // so a blank-window launch on another machine is diagnosable, not a silent flash.
         log_diag(&format!(
             "ui error: {e} — the UI renderer could not initialize or continue; check your GPU driver and [ui:renderer]/[ui:gpu] log (no automatic renderer restart was attempted)"
         ));
-        // Let desktop launchers report a genuine graphics/startup failure.
         #[cfg(target_os = "linux")]
         std::process::exit(1);
     }

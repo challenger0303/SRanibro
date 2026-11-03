@@ -1,4 +1,4 @@
-"""Generate basic deterministic reports from a synthetic-eye-lab output directory."""
+""
 
 from __future__ import annotations
 
@@ -145,8 +145,8 @@ def plot_stretch(run: Path, rows: list[dict[str, object]]) -> None:
 
 
 def plot_correlations(run: Path, grouped: dict[str, list[dict[str, object]]]) -> None:
-    # Never pool heterogeneous interventions into one correlation matrix. Each plot is
-    # descriptive only within one preregistered suite.
+
+
     for experiment, rows in grouped.items():
         usable = [
             row

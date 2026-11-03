@@ -1,8 +1,3 @@
-//! Preregistered Phase 1.3 synthetic EyeNet study entry point.
-//!
-//! This feature-gated binary accepts only the sealed renderer atlas, the frozen
-//! model, and a new artifact destination. It has no recording or production-state
-//! input.
 
 mod model;
 mod phase13;
@@ -113,9 +108,6 @@ fn execute_with_core(
             )
         }
     };
-    // A mismatch with the already sealed decision is invalid/tampered input,
-    // not a new confirmation-side renderer result.  It must not publish an
-    // artifact under the total renderer-failure procedure.
     if let Some(decision) = decision.as_ref() {
         require_decision_plan(decision, &prepared)?;
     }
@@ -835,10 +827,6 @@ fn require_analysis_model_state(
     {
         return Err("loaded-model decision identity is inconsistent".into());
     }
-    // Length, ID, nonfinite, and repeat failures are themselves legitimate
-    // INCONCLUSIVE_ARTIFACT evidence under the frozen protocol. Preserve those
-    // failing arrays rather than reclassifying the scientific failure as
-    // decision-artifact tampering.
     if analysis.status == StageStatus::InconclusiveArtifact {
         if analysis.artifact_error.as_deref().is_none_or(str::is_empty) || analysis.eyes.is_some() {
             return Err("artifact-inconclusive analysis lacks its error state".into());
@@ -1150,7 +1138,6 @@ struct FrozenModels {
     sha256: String,
 }
 
-/// This is intentionally called only after the renderer preparation gate.
 fn load_frozen_models(path: &Path) -> Result<FrozenModels, Box<dyn Error>> {
     let bytes = std::fs::read(path)?;
     if bytes.len() != FROZEN_MODEL_BYTES {
