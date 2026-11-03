@@ -1715,6 +1715,18 @@ impl Config {
     /// automatically and are therefore not represented as user configuration.
     pub fn check_assets(&self) -> Vec<AssetStatus> {
         let exists = |p: &Option<PathBuf>| p.as_ref().map(|p| p.is_file()).unwrap_or(false);
+        #[cfg(all(target_os = "linux", feature = "xr5-only", feature = "external-eyelid-model"))]
+        if matches!(canonical_device_key(&self.hmd.device).as_str(), "auto" | "pimax_xr5") {
+            if !self.ui.inference_enabled { return Vec::new(); }
+            if self.xr5_research.enabled && self.xr5_research.avatar {
+                let model = Some(crate::ml::external_eyelid::resolve(self.xr5_research.model_file()));
+                let runtime = crate::ml::external_eyelid::runtime_library_path().ok();
+                return vec![
+                    AssetStatus { label: "XR5 eyelid model", present: exists(&model), path: model, required: true, gates: "Restore the models folder from the XR5 Linux package.".into() },
+                    AssetStatus { label: "XR5 model runtime", present: exists(&runtime), path: runtime, required: true, gates: "Restore the model-runtime folder from the XR5 Linux package.".into() },
+                ];
+            }
+        }
 
         let ml = self.ml_params_path();
 
@@ -1971,7 +1983,34 @@ pub fn restore_state_backup(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Commented first-run template. Hand-authored (toml serialize drops comments).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "xr5-only"))]
+pub const TEMPLATE: &str = r#"# SRanibro XR5 Linux configuration.
+# Native USB capture; the distributed XR5 model runs locally on CPU.
+[hmd]
+device = "auto"
+
+[xr5_research]
+enabled = true
+avatar = true
+model_file = "models/XR5-Eyelid-Balanced-20260928.sranimodel"
+gpu = false
+
+[ui]
+eyelid_inference_backend = "cpu"
+eye_camera_preview = false
+
+[output]
+vrchat_eye_osc = true
+osc_host = "127.0.0.1"
+osc_port = 9000
+brokeneye = true
+brokeneye_port = 5555
+osc = false
+eyebrow_osc = false
+eye_image_http = false
+"#;
+
+#[cfg(all(target_os = "linux", not(feature = "xr5-only")))]
 pub const TEMPLATE: &str = r#"# SRanibro Linux / PSVR2 configuration.
 # Requires SteamVR + Ignition + PSVR2Toolkit configured on this PC.
 # SRanipal is not executed: only its EyePrediction model file is read.
@@ -2364,7 +2403,9 @@ mod tests {
     fn missing_assets_reported_not_panicked() {
         // Device runtimes are automatic; only the user-supplied eye model is
         // represented as a missing configurable asset.
-        let c = Config::default();
+        let mut c = Config::default();
+        #[cfg(all(target_os = "linux", feature = "xr5-only", feature = "external-eyelid-model"))]
+        { c.xr5_research.enabled = false; c.xr5_research.avatar = false; }
         let missing = c.missing_required();
         assert_eq!(missing.len(), 1, "only the eye model is user-configurable");
         let labels: Vec<&str> = missing.iter().map(|a| a.label).collect();
@@ -2373,6 +2414,18 @@ mod tests {
             "ML required: {labels:?}"
         );
         assert!(missing.iter().all(|a| !a.present));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "xr5-only", feature = "external-eyelid-model"))]
+    #[test]
+    fn linux_xr5_readiness_uses_its_native_assets_and_camera_only_needs_none() {
+        let mut config = Config::default();
+        let assets = config.check_assets();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].label, "XR5 eyelid model");
+        assert_eq!(assets[1].label, "XR5 model runtime");
+        config.ui.inference_enabled = false;
+        assert!(config.missing_required().is_empty());
     }
 
     #[test]

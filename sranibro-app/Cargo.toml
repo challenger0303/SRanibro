@@ -122,8 +122,10 @@ ab_glyph = "0.2"
 wgpu = "22"
 libloading = "0.8"
 libc = "0.2"
+rusb = "=0.9.4"
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "load-dynamic", "api-24"] }
 
-# WinUSB direct transport to the EyeChip — no libusb, no patched DLL. Windows-only.
+# WinUSB transport on Windows.
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "load-dynamic", "directml", "api-24"] }
 # Include DX12 for the isolated compute worker and the opt-in Wgpu UI diagnostic.

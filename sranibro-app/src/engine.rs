@@ -259,6 +259,7 @@ fn resolved_config_device_key(cfg: &Config) -> String {
 #[cfg(target_os = "linux")]
 fn resolved_config_device_key(cfg: &Config) -> String {
     let configured = crate::config::canonical_device_key(&cfg.hmd.device);
+    if crate::config::XR5_ONLY_BUILD { return "pimax_xr5".into(); }
     if crate::config::PSVR2_ONLY_BUILD || configured == "auto" {
         "psvr2".into()
     } else {
@@ -369,14 +370,14 @@ fn build_engine_once(
     let device_key = crate::config::running_device_key(&cfg.hmd.device, adapter.name());
     #[cfg(any(feature = "xr5-research-model", feature = "external-eyelid-model"))]
     let is_xr5 = crate::config::canonical_device_key(&device_key) == "pimax_xr5";
-    #[cfg(all(windows, feature = "external-eyelid-model", not(feature = "xr5-only")))]
+    #[cfg(all(feature = "external-eyelid-model", any(all(windows, not(feature = "xr5-only")), all(target_os = "linux", feature = "xr5-only"))))]
     if is_xr5 && cfg.ui.inference_enabled && cfg.xr5_research.enabled && cfg.xr5_research.avatar {
         if cfg.xr5_research.model_file().is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
                 "Choose an XR5 eyelid model file in Tracking settings, then Apply + Reload"));
         }
         crate::ml::external_eyelid::Package::read(&crate::ml::external_eyelid::resolve(cfg.xr5_research.model_file()))?;
-        let runtime = std::env::current_exe()?.with_file_name("model-runtime").join("onnxruntime.dll");
+        let runtime = crate::ml::external_eyelid::runtime_library_path()?;
         if !runtime.is_file() { return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
             "Model runtime missing; restore the model-runtime folder from the app ZIP")); }
     }

@@ -6,8 +6,9 @@
 //! images (1291) to the callbacks.
 //! Requires the platform service stopped: `net stop "Tobii VR4PIMAXP3B Platform Runtime"`.
 
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "linux"))]
 
+#[cfg(windows)]
 use std::ffi::{c_void, CString};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::FreeLibrary;
+#[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::LoadLibraryA;
 
 use super::gaze::{decode_gaze_1289, decode_wearable_1285};
@@ -223,7 +226,9 @@ fn set_status(s: &Arc<Mutex<String>>, msg: impl Into<String>) {
 
 /// RAII handle to the loaded Tobii DLL: FreeLibrary on drop (at the pump thread's
 /// end). Created and dropped on the same thread, so it never crosses threads.
+#[cfg(windows)]
 struct DllGuard(*mut c_void);
+#[cfg(windows)]
 impl Drop for DllGuard {
     fn drop(&mut self) {
         unsafe { FreeLibrary(self.0) };
@@ -233,6 +238,7 @@ impl Drop for DllGuard {
 /// Distribution gate: load the user-supplied Tobii DLL, returning a guard that frees
 /// it when the connection ends. `None` (with a status message) means "no DLL -> do
 /// not connect". The DLL is the user's licensed component; SRanibro bundles nothing.
+#[cfg(windows)]
 fn load_required_dll(
     dll_path: &Option<String>,
     status: &Arc<Mutex<String>>,
@@ -269,6 +275,15 @@ fn load_required_dll(
     }
     Some(DllGuard(hmod))
 }
+
+#[cfg(target_os = "linux")]
+struct DllGuard;
+#[cfg(target_os = "linux")]
+fn load_required_dll(_: &Option<String>, status: &Arc<Mutex<String>>, _: &str) -> Option<DllGuard> {
+    set_status(status, "Windows runtime loading is unavailable on Linux");
+    None
+}
+
 
 /// Subscribe-command payload for a stream id.
 fn subscribe_payload(stream_id: u32) -> Vec<u8> {

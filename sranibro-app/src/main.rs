@@ -46,7 +46,7 @@ fn install_diagnostics() {
 }
 
 fn main() {
-    #[cfg(all(windows, feature = "external-eyelid-model"))]
+    #[cfg(all(any(windows, target_os = "linux"), feature = "external-eyelid-model"))]
     if sranibro_rs::ml::external_eyelid::worker_entrypoint() { return; }
     // Native Toolkit calls run only in a supervised child, before logging,
     // configuration, graphics or hardware handoff can initialize in that child.
@@ -75,6 +75,10 @@ fn main() {
     // Device-handoff subcommands: free / restore the EyeChip from the Tobii
     // Platform Runtime (self-elevating via UAC). `mode` just reports.
     match std::env::args().nth(1).as_deref() {
+        #[cfg(all(target_os = "linux", feature = "xr5-only"))]
+        Some("xr5-check") => {
+            std::process::exit(if xr5_connection_check() { 0 } else { 1 });
+        }
         // Console asset/readiness report (was the old no-arg default; the GUI is now the
         // default, so this is opt-in via `sranibro status` / `check`).
         Some("status") | Some("check") => {
@@ -182,6 +186,42 @@ fn main() {
     run_status_report();
 }
 
+/// Explicit camera-only bring-up diagnostic: no model inference, OSC or files.
+#[cfg(all(target_os = "linux", feature = "xr5-only"))]
+fn xr5_connection_check() -> bool {
+    use sranibro_rs::{core::types::Eye, device::HmdAdapter};
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::time::{Duration, Instant};
+    let counts: Arc<[AtomicUsize; 4]> = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+    let frames = counts.clone();
+    let gaze = counts.clone();
+    let mut adapter = sranibro_rs::device::xr5_adapter::Xr5Adapter::new(&sranibro_rs::config::Config::default());
+    let status = adapter.status_arc();
+    let result = adapter.start(Box::new(move |eye, width, height, bytes| {
+        if width == 200 && height == 200 && bytes.len() == 40000 {
+            frames[if eye == Eye::Left { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+        }
+    }), Box::new(move |sample| {
+        if sample.left.gaze_valid { gaze[2].fetch_add(1, Ordering::Relaxed); }
+        if sample.right.gaze_valid { gaze[3].fetch_add(1, Ordering::Relaxed); }
+    }));
+    if let Err(error) = result { eprintln!("XR5 check: {error}"); return false; }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        if counts[0].load(Ordering::Relaxed) >= 120 && counts[1].load(Ordering::Relaxed) >= 120
+            && counts[2].load(Ordering::Relaxed) >= 30 && counts[3].load(Ordering::Relaxed) >= 30 { break; }
+        if status.lock().map(|s| s.contains("connection failed") || s.contains("stream error")).unwrap_or(false) { break; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    adapter.stop();
+    let counts = counts.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let passed = counts.into_iter().all(|count| count > 0);
+    println!("XR5_CHECK={} left_frames={} right_frames={} left_gaze={} right_gaze={} hardware_streaming_verified={}",
+        if passed { "PASS" } else { "FAIL" }, counts[0], counts[1], counts[2], counts[3], passed);
+    if !passed { eprintln!("XR5 status: {}", status.lock().map(|s| s.clone()).unwrap_or_default()); }
+    passed
+}
+
 /// Console asset/readiness report (the `status` / `check` subcommand). Loads the config,
 /// writes a starter template on first run, and prints each asset's presence + what it
 /// gates — the "what's missing and why" view, without launching the GUI.
@@ -234,8 +274,10 @@ fn run_status_report() {
     if missing.is_empty() {
         #[cfg(feature = "psvr2-only")]
         println!("Ready: required model assets present. Launch SRanibro with PSVR2Toolkit active.");
-        #[cfg(feature = "xr5-only")]
+        #[cfg(all(feature = "xr5-only", not(target_os = "linux")))]
         println!("Ready: XR5 research variant assets present.");
+        #[cfg(all(feature = "xr5-only", target_os = "linux"))]
+        println!("Ready: XR5 model assets present. Run `./sranibro-xr5 xr5-check` to check the headset connection.");
         #[cfg(all(
             not(target_os = "linux"),
             not(any(feature = "psvr2-only", feature = "xr5-only"))

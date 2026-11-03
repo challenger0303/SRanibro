@@ -34,7 +34,7 @@
 //!     Python bridge and VR4's `region_to_eye`). Confirm on hardware from the logged
 //!     first-few-frames region→eye lines.
 
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "linux"))]
 
 use super::vr4_adapter::Vr4Adapter;
 use crate::config::GazeSource;
@@ -73,7 +73,7 @@ impl Xr5Adapter {
             // region 1 → LEFT, region 0 → RIGHT (see vr4_adapter::region_to_eye); the
             // pair's "slot A" is the LEFT eye, matching the Python XR5 bridge.
             slot_a_eye: Eye::Left,
-            transport: "WinUSB + native TTP".into(),
+            transport: if cfg!(target_os = "linux") { "libusb + native TTP" } else { "WinUSB + native TTP" }.into(),
             streams: "TTP image 1291 + wearable 1285".into(),
             gaze_src: match gaze_source {
                 GazeSource::PerEye => "per-eye gaze · pupil · openness (Tobii)".into(),
@@ -90,16 +90,14 @@ impl Xr5Adapter {
         // The option is XR5-only and always lives in the canonical XR5 bucket,
         // including when the active device selector is `auto`.
         let gaze_source = cfg.gaze_source_for("pimax_xr5");
-        let dll_path = cfg
-            .tobii_runtime_path()
-            .map(|p| p.to_string_lossy().into_owned());
+        let dll_path = if cfg!(windows) { cfg.tobii_runtime_path().map(|p| p.to_string_lossy().into_owned()) } else { None };
         Self(Vr4Adapter::with_profile(
             Self::profile(gaze_source),
             "pimax-xr5",
             "[xr5]",
             dll_path,
-            // require_dll = true: same distribution stance as the VR4 product path.
-            true,
+            // Linux uses its native USB transport; never load a Windows library there.
+            cfg!(windows),
             // 1289 is the sole source. XR5 validates each eye's direction vector
             // because this firmware can emit usable vectors with packet status 0.
             false,
@@ -140,7 +138,7 @@ impl super::HmdAdapter for Xr5Adapter {
     /// over WinUSB — the Python launcher kills `platform_runtime_XR5EYECHIP` before
     /// connecting. Same handoff requirement as the DLL-free VR4 path.
     fn needs_eyechip_handoff(&self) -> bool {
-        true
+        cfg!(windows)
     }
 }
 
@@ -175,7 +173,7 @@ mod tests {
 
         assert!(!a.0.uses_combined_gaze());
         // DLL-free WinUSB path claims the EyeChip directly → runtime must be stopped.
-        assert!(a.needs_eyechip_handoff());
+        assert_eq!(a.needs_eyechip_handoff(), cfg!(windows));
     }
 
     #[test]

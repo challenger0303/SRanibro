@@ -154,7 +154,7 @@ impl Profile {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod native {
     use super::*;
     use crate::ml::xr5_research::EyePrediction;
@@ -199,10 +199,7 @@ mod native {
     impl Runner {
         pub fn new(package: Package, gpu: bool) -> io::Result<Self> {
             // Never load a library named by a model or found via CWD/PATH.
-            let dll = std::env::current_exe()?
-                .parent()
-                .ok_or_else(|| invalid("No application folder"))?
-                .join("model-runtime/onnxruntime.dll");
+            let dll = runtime_library_path()?;
             if !dll.is_file() {
                 return Err(invalid(
                     "Model runtime missing; restore the model-runtime folder from the app ZIP",
@@ -220,6 +217,9 @@ mod native {
                 .map_err(invalid)?
                 .with_memory_pattern(false)
                 .map_err(invalid)?;
+            #[cfg(target_os = "linux")]
+            if gpu { return Err(invalid("XR5 Linux model inference currently uses CPU")); }
+            #[cfg(windows)]
             if gpu {
                 builder = builder
                     .with_execution_providers([ort::ep::DirectML::default()
@@ -456,13 +456,22 @@ mod native {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn worker_entrypoint() -> bool {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--xr5-model-worker")) {
         return false;
     }
     let result = (|| {
+        #[cfg(target_os = "linux")]
+        {
+            // Match the Windows worker's parent-lifetime ownership.
+            let parent = unsafe { libc::getppid() };
+            if parent <= 1 || unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+                return Err(invalid("Could not bind XR5 worker to its parent"));
+            }
+            if unsafe { libc::getppid() } != parent { return Err(invalid("XR5 worker parent exited")); }
+        }
         let path = args.next().ok_or_else(|| invalid("Missing model file"))?;
         let backend = args
             .next()
@@ -565,4 +574,11 @@ mod tests {
         p.references[0].central_interval = [10.0, 0.0];
         assert!(p.validate().is_err());
     }
+}
+
+
+/// Resolve only the runtime shipped beside this executable, independent of CWD.
+pub fn runtime_library_path() -> io::Result<PathBuf> {
+    let name = if cfg!(target_os = "linux") { "libonnxruntime.so" } else { "onnxruntime.dll" };
+    Ok(std::env::current_exe()?.parent().ok_or_else(|| invalid("No application folder"))?.join("model-runtime").join(name))
 }

@@ -1,0 +1,2 @@
+# Dream Air / XR5 EyeChip only. Grant the active local desktop user USB access.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2104", ATTR{idProduct}=="0561", ATTR{serial}=="XR5*", TAG+="uaccess"

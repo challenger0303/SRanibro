@@ -21,9 +21,12 @@ pub mod psvr2_worker;
 pub mod starvr_adapter;
 #[cfg(windows)]
 pub mod usb;
+#[cfg(all(target_os = "linux", feature = "xr5-only"))]
+#[path = "usb_linux.rs"]
+pub mod usb;
 #[cfg(windows)]
 pub mod varjo_adapter;
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "linux", feature = "xr5-only")))]
 pub mod vr4_adapter;
 // Native Varjo SDK path RE-ENABLED 2026-06-29: the crash-dump analysis cleared it (the
 // MEMORY_MANAGEMENT BSODs were attributed to RAM/an ImDisk RAM disk, no Varjo driver in the
@@ -40,7 +43,7 @@ pub mod vpe_hid;
 /// `vpetest`/`vpescan` diagnostics — validate the native VPE eyechip wake (USB keepalive).
 #[cfg(windows)]
 pub mod vpe_probe;
-#[cfg(all(windows, any(feature = "xr5-only", feature = "external-eyelid-model")))]
+#[cfg(any(all(windows, any(feature = "xr5-only", feature = "external-eyelid-model")), all(target_os = "linux", feature = "xr5-only")))]
 pub mod xr5_adapter;
 
 use std::sync::{Arc, Mutex};
@@ -140,11 +143,17 @@ pub fn make_adapter(cfg: &crate::config::Config) -> std::io::Result<Box<dyn HmdA
 }
 
 #[cfg(all(target_os = "linux", feature = "xr5-only", not(feature = "psvr2-only")))]
-pub fn make_adapter(_cfg: &crate::config::Config) -> std::io::Result<Box<dyn HmdAdapter>> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "XR5 acquisition is not supported on Linux",
-    ))
+pub fn make_adapter(cfg: &crate::config::Config) -> std::io::Result<Box<dyn HmdAdapter>> {
+    Ok(Box::new(xr5_adapter::Xr5Adapter::new(cfg)))
+}
+
+#[cfg(all(test, target_os = "linux", feature = "xr5-only", not(feature = "psvr2-only")))]
+#[test]
+fn linux_xr5_build_constructs_native_adapter_without_windows_handoff() {
+    let adapter = make_adapter(&crate::config::Config::default()).unwrap();
+    assert_eq!(adapter.name(), "pimax-xr5");
+    assert!(adapter.profile().transport.contains("libusb"));
+    assert!(!adapter.needs_eyechip_handoff());
 }
 
 #[cfg(all(windows, feature = "xr5-only", not(feature = "psvr2-only")))]

@@ -15,3 +15,12 @@ The result is `target/release/sranibro-rs.exe`. Available tracking paths depend 
 The recorder defaults to a fixed point in SteamVR space while the user moves their head, and saves native Tobii reference directions/status/timing when available. Reference availability is not ground-truth fixation confidence. Hardware eye assignment, coordinate alignment and live accuracy remain separate checks.
 
 Recorder **v0.4.2** adds Squint, Eyebrow up and Eyebrow down prompts. Eyebrow up keeps eye opening unchanged or permits slow relaxed blinks. See the [recording guide](tools/XR5-RECORDER-V042.md) and [Windows recorder release](https://github.com/challenger0303/SRanibro/releases/tag/xr5-recorder-v0.4.2).
+
+## Ubuntu 24.04 XR5 preview
+
+The dedicated Linux target uses `--features xr5-only`. See [Linux package setup and verification limits](packaging/linux-xr5/README-LINUX.md). The ready-to-run preview includes the existing XR5 model and a Linux CPU runtime.
+
+```sh
+cargo test --locked --features xr5-only --lib --bin sranibro-rs --message-format short
+cargo build --locked --release --features xr5-only --bin sranibro-rs --message-format short
+```

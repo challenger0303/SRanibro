@@ -35,8 +35,8 @@ impl Default for Settings {
         Self {
             response: ResponseSettings::default(),
             model_file: String::new(),
-            enabled: cfg!(all(windows, feature = "external-eyelid-model", not(feature = "xr5-only"))),
-            avatar: cfg!(all(windows, feature = "external-eyelid-model", not(feature = "xr5-only"))),
+            enabled: cfg!(all(feature = "external-eyelid-model", any(all(windows, not(feature = "xr5-only")), all(target_os = "linux", feature = "xr5-only")))),
+            avatar: cfg!(all(feature = "external-eyelid-model", any(all(windows, not(feature = "xr5-only")), all(target_os = "linux", feature = "xr5-only")))),
             bundle: "model".into(),
             python: "python.exe".into(),
             python_path: String::new(),
@@ -49,7 +49,7 @@ impl Settings {
     /// An unset selection uses the distributed model, but never replaces an
     /// explicit model selection. Explicit backend selections survive deserialization.
     pub fn model_file(&self) -> &str {
-        #[cfg(all(feature = "external-eyelid-model", not(feature = "xr5-only")))]
+        #[cfg(all(feature = "external-eyelid-model", any(not(feature = "xr5-only"), target_os = "linux")))]
         if self.model_file.is_empty() {
             return "models/XR5-Eyelid-Balanced-20260928.sranimodel";
         }
@@ -595,7 +595,7 @@ impl Bridge {
 }
 
 fn model_command(settings: &Settings) -> io::Result<Command> {
-    #[cfg(all(windows, feature = "external-eyelid-model"))]
+    #[cfg(all(any(windows, target_os = "linux"), feature = "external-eyelid-model"))]
     if !settings.model_file().is_empty() {
         let path = super::external_eyelid::resolve(settings.model_file());
         super::external_eyelid::Package::read(&path)?;
@@ -742,6 +742,17 @@ impl Drop for Bridge {
 mod tests {
     use super::*;
     use crate::core::types::Eye;
+    #[cfg(all(target_os = "linux", feature = "external-eyelid-model", feature = "xr5-only"))]
+    #[test]
+    fn linux_xr5_uses_native_model_and_preserves_explicit_disable() {
+        let settings = Settings::default();
+        assert!(settings.enabled && settings.avatar);
+        assert_eq!(settings.model_file(), "models/XR5-Eyelid-Balanced-20260928.sranimodel");
+        assert!(!settings.gpu);
+        let explicit: Settings = toml::from_str("enabled = false\navatar = false\nmodel_file = '/tmp/custom.sranimodel'").unwrap();
+        assert!(!explicit.enabled && !explicit.avatar);
+        assert_eq!(explicit.model_file(), "/tmp/custom.sranimodel");
+    }
     #[cfg(all(feature = "external-eyelid-model", not(feature = "xr5-only")))]
     #[test]
     fn unset_model_uses_bundle_without_enabling_tracking_or_changing_custom_path() {

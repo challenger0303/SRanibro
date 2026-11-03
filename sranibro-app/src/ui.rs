@@ -17060,7 +17060,7 @@ impl App {
                              });
                      });
 
-                     #[cfg(all(windows, feature = "external-eyelid-model", not(feature = "xr5-only")))]
+                     #[cfg(all(feature = "external-eyelid-model", any(all(windows, not(feature = "xr5-only")), all(target_os = "linux", feature = "xr5-only"))))]
                      if crate::config::running_device_key(&self.edit.device, &self.pipeline.device_key) == "pimax_xr5" {
                          let mut native = self.config.xr5_research.enabled && self.config.xr5_research.avatar;
                          let before = native;
@@ -17662,7 +17662,7 @@ impl App {
     /// engine (frees the EyeChip + TCP port), and rebuild it in-process from the
     /// new config. On failure the message is shown and the user can fix + retry.
     fn apply_and_reload(&mut self) {
-        #[cfg(all(windows, feature = "external-eyelid-model", not(feature = "xr5-only")))]
+        #[cfg(all(feature = "external-eyelid-model", any(all(windows, not(feature = "xr5-only")), all(target_os = "linux", feature = "xr5-only"))))]
         if self.config.ui.inference_enabled && self.config.xr5_research.enabled && self.config.xr5_research.avatar
             && crate::config::running_device_key(&self.edit.device, &self.pipeline.device_key) == "pimax_xr5" {
             // Do not tear down a working tracker when its selected model was
@@ -17673,7 +17673,7 @@ impl App {
                 self.reload_msg = Some((format!("Model not loaded: {error}. Choose an XR5 model file."), ERR));
                 return;
             }
-            let runtime = std::env::current_exe().ok().map(|p| p.with_file_name("model-runtime").join("onnxruntime.dll"));
+            let runtime = crate::ml::external_eyelid::runtime_library_path().ok();
             if !runtime.is_some_and(|p| p.is_file()) {
                 self.reload_msg = Some(("Restore the model-runtime folder from the app ZIP before reloading.".into(), ERR));
                 return;

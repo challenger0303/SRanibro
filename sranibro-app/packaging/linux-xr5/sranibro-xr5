@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+app_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$app_dir"
+export LD_LIBRARY_PATH="$app_dir/model-runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$app_dir/sranibro-rs" "$@"
