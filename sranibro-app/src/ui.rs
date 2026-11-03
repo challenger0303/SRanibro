@@ -17971,7 +17971,9 @@ fn sranipal_path_row(
     value: &mut String,
     searching: bool,
 ) -> Option<SranipalPathAction> {
-    ui.label(label("SRanipal model folder"));
+    ui.label(label(if cfg!(feature = "xr5-only") {
+        "SRanipal model folder (image transform only)"
+    } else { "SRanipal model folder" }));
     let mut outcome = None;
     ui.horizontal(|ui| {
         let find_width = 116.0 * S;
@@ -18031,9 +18033,11 @@ fn sranipal_path_row(
             }
         }
     });
-    ui.label(label(
-        "Uses your existing SRanipal/model/EyePrediction weights only. No sr_runtime.exe or Windows DLL is needed.",
-    ));
+    ui.label(label(if cfg!(feature = "xr5-only") {
+        "Only needed when SRanipal + image transform is selected above."
+    } else {
+        "Uses your existing SRanipal/model/EyePrediction weights only. No sr_runtime.exe or Windows DLL is needed."
+    }));
     ui.add_space(4.0 * S);
     outcome
 }
