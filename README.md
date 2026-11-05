@@ -8,9 +8,9 @@ Eye and eyelid tracking for VR. Bring gaze, blinks, EyeWide and eyebrows to VRCF
 | --- | --- | --- |
 | **Windows 10 / 11 x64** | **[v0.1.11-beta — download ZIP](https://github.com/challenger0303/SRanibro/releases/download/v0.1.11-beta/SRanibro-v0.1.11-beta-Windows.zip)** | Tobii-equipped, hot-mirror headsets, PSVR2, and Dream Air / SE (XR5 beta) |
 | **Linux x86_64** | **[v0.1.9-beta — download tar.gz](https://github.com/challenger0303/SRanibro/releases/download/v0.1.9-beta/SRanibro-PSVR2-0.1.9-beta-linux-x86_64.tar.gz)** | **PSVR2 only · experimental** · glibc 2.39+ |
-| **Linux x86_64 — XR5 preview** | **[v0.1.11-beta — download](https://github.com/challenger0303/SRanibro/releases/tag/xr5-linux-v0.1.11-beta)** | **Dream Air / SE (XR5) · experimental** · Ubuntu 24.04 |
+| **Linux x86_64 — XR5** | **[v0.1.11-beta.1 — download](https://github.com/challenger0303/SRanibro/releases/tag/xr5-linux-v0.1.11-beta.1)** | **Dream Air / SE (XR5)** · glibc 2.39+ |
 
-**Windowsはv0.1.11-beta。Linuxは既存のPSVR2版に加え、Ubuntu 24.04向けXR5専用試験版があります。**
+**Windowsはv0.1.11-beta。LinuxのXR5版はv0.1.11-beta.1です。**
 
 [English guide](USER_GUIDE.md) · [日本語ガイド](USER_GUIDE.ja.md) · [Release notes](https://github.com/challenger0303/SRanibro/releases/tag/v0.1.11-beta)
 
@@ -22,7 +22,7 @@ Extract the whole Windows ZIP. It includes the XR5 eyelid model, eyebrow model a
 - **PSVR2:** requires PSVR2Toolkit and SteamVR, plus your SRanipal model.
 - **Dream Air / SE (XR5):** new settings use the bundled native model for openness and EyeWide, without Python or SRanipal. Squeeze is not supported by this model. The SRanipal + image-transform option remains available; existing selections are kept.
 
-The **[XR5 Linux preview guide](sranibro-app/packaging/linux-xr5/README-LINUX.md)** covers USB access, the bundled CPU eyelid model and a camera/gaze connection check. Linux-attached XR5 hardware streaming and end-to-end VRChat operation still require validation.
+The **[XR5 Linux guide](sranibro-app/packaging/linux-xr5/README-LINUX.md)** covers USB access, the bundled CPU eyelid model, VRCFaceTracking and a camera/gaze connection check. The VRCFT module has been reported working on Linux. The latest XR5 Linux build disables blocking OpenGL VSync to address hidden-window responsiveness.
 
 ## Latest Windows update
 
